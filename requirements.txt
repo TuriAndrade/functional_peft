@@ -1,0 +1,13 @@
+tensorflow 
+tensorflow-datasets 
+torch 
+torchvision 
+pillow
+scipy
+numpy
+pandas
+matplotlib
+python-dotenv
+pytest
+ml-collections
+huggingface_hub
