@@ -2,11 +2,9 @@
 slurm/
 logs/
 
-# Experiments
-experiments/
-aggregate_experiment_results.py
-build_experiment_args.py
-build_experiment_results.py 
+# Experiment results
+experiments/vpt/top1_acc_ft/
+
 
 # Checkpoints
 third_party/vit_pytorch/ckpts/ViT-B_16.npz
