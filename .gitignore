@@ -3,6 +3,7 @@ slurm/
 logs/
 
 # Experiment results
+experiments/linear_probe/top1_acc_ft/
 experiments/vpt/top1_acc_ft/
 
 
