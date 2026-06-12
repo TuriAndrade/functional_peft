@@ -50,6 +50,11 @@ def _build_parser():
         help="Type of prompt to use.",
     )
     parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="Don't train the backbone.",
+    )
+    parser.add_argument(
         "--load-model-path",
         type=str,
         default=None,
@@ -271,6 +276,7 @@ def _train_seed(args, run_seed: int, save_ckpt: bool):
         n_classes=n_classes,
         prompt_length=args.prompt_length,
         prompt_mode=args.prompt_mode,
+        freeze_backbone=args.freeze_backbone,
     )
 
     if args.load_model_path:

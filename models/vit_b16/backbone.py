@@ -56,6 +56,10 @@ class ViTB16Backbone(nn.Module):
         for p in self.vit.parameters():
             p.requires_grad = False
 
+    def unfreeze(self):
+        for p in self.vit.parameters():
+            p.requires_grad = True
+
     def get_patch_tokens(self, x: torch.Tensor) -> torch.Tensor:
         """
         Returns patch tokens before CLS and before positional embeddings.

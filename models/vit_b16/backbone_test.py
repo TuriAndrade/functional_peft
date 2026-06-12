@@ -1,5 +1,6 @@
 import pytest
 import torch
+
 from .backbone import ViTB16Backbone
 
 
@@ -25,11 +26,26 @@ def test_get_patch_tokens_shape(model):
     assert patch_tokens.shape == (2, 196, 768)
 
 
+def test_get_cls_token_shape(model):
+    cls_token = model.get_cls_token(batch_size=2)
+
+    assert cls_token.shape == (2, 1, 768)
+
+
 def test_positional_embeddings_shape(model):
     cls_pos, patch_pos = model.get_positional_embeddings()
 
     assert cls_pos.shape == (1, 1, 768)
     assert patch_pos.shape == (1, 196, 768)
+
+
+def test_encode_tokens_shape(model):
+    tokens = torch.randn(2, 197, 768)
+
+    with torch.no_grad():
+        encoded = model.encode_tokens(tokens)
+
+    assert encoded.shape == (2, 197, 768)
 
 
 def test_forward_features_shape(model):
@@ -45,4 +61,12 @@ def test_forward_features_shape(model):
 
 def test_freeze_backbone(model):
     model.freeze()
+
     assert all(not p.requires_grad for p in model.vit.parameters())
+
+
+def test_unfreeze_backbone(model):
+    model.freeze()
+    model.unfreeze()
+
+    assert all(p.requires_grad for p in model.vit.parameters())

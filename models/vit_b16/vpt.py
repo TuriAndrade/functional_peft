@@ -18,6 +18,7 @@ class ViTB16VPT(nn.Module):
         n_classes: int,
         prompt_length: int = 0,
         prompt_mode: str = "shallow",
+        freeze_backbone: bool = True,
     ):
         super().__init__()
 
@@ -25,11 +26,12 @@ class ViTB16VPT(nn.Module):
         self.n_classes = n_classes
         self.prompt_length = prompt_length
         self.prompt_mode = prompt_mode
+        self.is_backbone_frozen = freeze_backbone
 
         # Backbone
         self.backbone = ViTB16Backbone(img_size=img_size)
-        self.backbone.eval()
-        self.backbone.freeze()
+        if freeze_backbone:
+            self.freeze_backbone()
 
         # Head
         self.head = nn.Linear(self.backbone.embed_dim, n_classes)
@@ -44,6 +46,27 @@ class ViTB16VPT(nn.Module):
         )
         self.prompt_dropout_layer = nn.Dropout(0.0 if prompt_mode == "shallow" else 0.1)
         self._init_prompt()
+
+    def freeze_backbone(self):
+        self.backbone.freeze()
+        self.backbone.eval()
+        self.is_backbone_frozen = True
+
+    def unfreeze_backbone(self):
+        self.backbone.unfreeze()
+        self.backbone.train(self.training)
+        self.is_backbone_frozen = False
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+
+        if self.is_backbone_frozen:
+            self.backbone.eval()
+
+        return self
+
+    def eval(self):
+        return self.train(False)
 
     def _init_prompt(self):
         if self.prompt_length == 0:

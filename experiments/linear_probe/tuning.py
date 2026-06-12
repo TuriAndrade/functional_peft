@@ -7,6 +7,7 @@ _SUFFIX = "tuning"
 _TUNING_SEED = 0
 
 _COMMON_ARGS = {
+    "freeze_backbone": True,
     "batch_size": 64,
     "gpu_batch_size": 64,
     "epochs": 100,

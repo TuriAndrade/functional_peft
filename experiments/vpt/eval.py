@@ -9,6 +9,7 @@ from .tuning import _TUNING_SEED
 _EVAL_SEEDS = [0, 1, 2]
 
 _COMMON_ARGS = {
+    "freeze_backbone": True,
     "save_ckpt": True,
     "save_ckpt_all_seeds": False,
     "early_stopping": False,

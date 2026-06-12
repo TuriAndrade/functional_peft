@@ -11,6 +11,7 @@ from .tuning import _TUNING_SEED
 _EVAL_SEEDS = [0, 1, 2]
 
 _COMMON_ARGS = {
+    "freeze_backbone": True,
     "save_ckpt": True,
     "save_ckpt_all_seeds": False,
     "early_stopping": False,
@@ -87,9 +88,7 @@ def build_args(
             "final_lr": best_config["final_lr"],
             "warmup_epochs": best_config["warmup_epochs"],
             "epochs": best_config["best_epoch"],
-            "save_name": (
-                f"lr-{best_config['ref_lr']}_wd-{best_config['ref_wd']}"
-            ),
+            "save_name": (f"lr-{best_config['ref_lr']}_wd-{best_config['ref_wd']}"),
             "prompt_length": 0,
             "ref_lr": best_config["ref_lr"],
             "ref_wd": best_config["ref_wd"],

@@ -1,7 +1,8 @@
 import torch
 import pytest
-from .vpt import ViTB16VPT
 import torch.nn.functional as F
+
+from .vpt import ViTB16VPT
 
 IMG_SIZE = 224
 N_CLASSES = 10
@@ -124,11 +125,89 @@ def test_prompt_receives_gradients(prompt_mode):
     target = torch.randint(0, N_CLASSES, (batch_size,))
 
     logits = model(x)
-    loss = torch.nn.functional.cross_entropy(logits, target)
+    loss = F.cross_entropy(logits, target)
     loss.backward()
 
     assert model.prompt.grad is not None
     assert model.prompt.grad.shape == model.prompt.shape
+
+
+@pytest.mark.parametrize("prompt_mode", ["shallow", "deep"])
+def test_frozen_backbone_receives_no_gradients(prompt_mode):
+    model = ViTB16VPT(
+        img_size=IMG_SIZE,
+        n_classes=N_CLASSES,
+        prompt_length=4,
+        prompt_mode=prompt_mode,
+        freeze_backbone=True,
+    )
+    model.train()
+
+    batch_size = 2
+    x = torch.randn(batch_size, 3, IMG_SIZE, IMG_SIZE)
+    target = torch.randint(0, N_CLASSES, (batch_size,))
+
+    logits = model(x)
+    loss = F.cross_entropy(logits, target)
+    loss.backward()
+
+    assert all(p.grad is None for p in model.backbone.parameters())
+    assert all(not p.requires_grad for p in model.backbone.parameters())
+
+
+def test_train_keeps_frozen_backbone_in_eval_mode():
+    model = ViTB16VPT(
+        img_size=IMG_SIZE,
+        n_classes=N_CLASSES,
+        prompt_length=4,
+        prompt_mode="shallow",
+        freeze_backbone=True,
+    )
+
+    model.train()
+
+    assert model.training
+    assert model.head.training
+    assert model.prompt_dropout_layer.training
+    assert not model.backbone.training
+    assert model.is_backbone_frozen
+    assert all(not p.requires_grad for p in model.backbone.parameters())
+
+
+def test_unfreeze_backbone_restores_train_mode():
+    model = ViTB16VPT(
+        img_size=IMG_SIZE,
+        n_classes=N_CLASSES,
+        prompt_length=4,
+        prompt_mode="shallow",
+        freeze_backbone=True,
+    )
+
+    model.train()
+    model.unfreeze_backbone()
+
+    assert model.training
+    assert model.backbone.training
+    assert not model.is_backbone_frozen
+    assert all(p.requires_grad for p in model.backbone.parameters())
+
+
+def test_freeze_backbone_sets_eval_mode_and_disables_gradients():
+    model = ViTB16VPT(
+        img_size=IMG_SIZE,
+        n_classes=N_CLASSES,
+        prompt_length=4,
+        prompt_mode="shallow",
+        freeze_backbone=False,
+    )
+
+    model.train()
+    model.freeze_backbone()
+
+    assert model.training
+    assert not model.backbone.training
+    assert model.is_backbone_frozen
+    assert all(not p.requires_grad for p in model.backbone.parameters())
 
 
 def test_invalid_prompt_mode_raises():
