@@ -14,7 +14,7 @@ _COMMON_ARGS = {
     "early_stopping": False,
     "start_lr": 1e-6,
     "final_lr": 1e-5,
-    "warmup_epochs": 10,
+    "warmup_epochs": 5,
     "save_ckpt": False,
     "run_seeds": [_TUNING_SEED],
     "eval_on_test": False,
@@ -22,8 +22,8 @@ _COMMON_ARGS = {
     "prompt_length": 0,
 }
 
-_LR_SEARCH = [1e-3, 1e-2]
-_WD_SEARCH = [1e-4, 1e-3]
+_LR_SEARCH = [1e-5, 3e-5, 1e-4]
+_WD_SEARCH = [0.0, 1e-2]
 
 
 def build_args(
