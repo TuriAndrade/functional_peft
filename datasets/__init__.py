@@ -22,6 +22,7 @@ from .fgvc_nabirds import FGVCNABirdsDataset
 from .fgvc_oxford_flowers import FGVCOxfordFlowersDataset
 from .fgvc_stanford_dogs import FGVCStanfordDogsDataset
 from .fgvc_stanford_cars import FGVCStanfordCarsDataset
+from .imagenet_val import ImageNetValDataset
 
 datasets = {
     "vtab_caltech101": VTABCaltech101Dataset,
@@ -48,4 +49,5 @@ datasets = {
     "fgvc_oxford_flowers": FGVCOxfordFlowersDataset,
     "fgvc_stanford_dogs": FGVCStanfordDogsDataset,
     "fgvc_stanford_cars": FGVCStanfordCarsDataset,
+    "imagenet_val": ImageNetValDataset,
 }

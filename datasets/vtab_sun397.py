@@ -53,6 +53,7 @@ class VTABSun397Dataset(IterableDataset):
 
     IMG_SIZE = 224
     N_CLASSES = 397
+    TRAIN_SPLIT_FRAC = 0.9
     N_TRAIN_SAMPLES = 800
     N_VAL_SAMPLES = 200
     SPLIT_SEED = 0
@@ -76,6 +77,9 @@ class VTABSun397Dataset(IterableDataset):
         split: str,
         rank: int = 0,
         world_size: int = 1,
+        n_train: Optional[int] = None,
+        n_val: Optional[int] = None,
+        n_test: Optional[int] = None,
     ):
         super().__init__()
 
@@ -111,42 +115,53 @@ class VTABSun397Dataset(IterableDataset):
 
         train_samples = self._collect_split_samples(self.train_root)
         test_samples = self._collect_split_samples(self.test_root)
+        train_count = int(self.TRAIN_SPLIT_FRAC * len(train_samples))
+
+        n_train = self.N_TRAIN_SAMPLES if n_train is None else n_train
+        n_val = self.N_VAL_SAMPLES if n_val is None else n_val
+        n_test = len(test_samples) if n_test is None else n_test
+
+        assert (
+            0 < n_train <= train_count
+        ), f"n_train={n_train} is invalid. Must be in [1, {train_count}]"
+        assert (
+            0 < n_val <= len(train_samples) - train_count
+        ), f"n_val={n_val} is invalid. Must be in [1, {len(train_samples) - train_count}]"
+        assert (
+            0 < n_test <= len(test_samples)
+        ), f"n_test={n_test} is invalid. Must be in [1, {len(test_samples)}]"
+
+        self.split_counts = {
+            "train": n_train,
+            "val": n_val,
+            "train+val": n_train + n_val,
+            "test": n_test,
+        }
 
         if self.split == "train":
-            self.samples = train_samples[: self.N_TRAIN_SAMPLES]
-
-            if len(self.samples) < self.N_TRAIN_SAMPLES:
-                raise RuntimeError(
-                    f"SUN397 local train split has only {len(self.samples)} samples, "
-                    f"but VTAB train requires {self.N_TRAIN_SAMPLES}."
-                )
+            self.samples = train_samples[:n_train]
 
         elif self.split == "val":
-            val_start = self.N_TRAIN_SAMPLES
-            val_end = self.N_TRAIN_SAMPLES + self.N_VAL_SAMPLES
+            val_start = train_count
+            val_end = train_count + n_val
 
             self.samples = train_samples[val_start:val_end]
 
-            if len(self.samples) < self.N_VAL_SAMPLES:
-                raise RuntimeError(
-                    f"SUN397 local train split has only {len(train_samples)} samples. "
-                    f"Need at least {val_end} to build local val split."
-                )
-
         elif self.split == "train+val":
-            n_total = self.N_TRAIN_SAMPLES + self.N_VAL_SAMPLES
-            self.samples = train_samples[:n_total]
-
-            if len(self.samples) < n_total:
-                raise RuntimeError(
-                    f"SUN397 local train split has only {len(self.samples)} samples, "
-                    f"but local VTAB train+val requires {n_total}."
-                )
+            val_start = train_count
+            val_end = train_count + n_val
+            self.samples = train_samples[:n_train] + train_samples[val_start:val_end]
 
         else:  # test
-            self.samples = test_samples
+            self.samples = test_samples[:n_test]
 
         self.num_examples = len(self.samples)
+
+    def get_split(self):
+        return self.split
+
+    def get_split_counts(self):
+        return self.split_counts
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch

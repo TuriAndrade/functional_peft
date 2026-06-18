@@ -97,6 +97,9 @@ class FGVCNABirdsDataset(IterableDataset):
         split: str,
         rank: int = 0,
         world_size: int = 1,
+        n_train: Optional[int] = None,
+        n_val: Optional[int] = None,
+        n_test: Optional[int] = None,
     ):
         super().__init__()
 
@@ -144,14 +147,38 @@ class FGVCNABirdsDataset(IterableDataset):
 
         train_samples, val_samples = self._split_train_val(official_train_samples)
 
+        n_train = self.N_TRAIN_SAMPLES if n_train is None else n_train
+        n_val = self.N_VAL_SAMPLES if n_val is None else n_val
+        n_test = self.N_TEST_SAMPLES if n_test is None else n_test
+
+        assert (
+            0 < n_train <= len(train_samples)
+        ), f"n_train={n_train} is invalid. Must be in [1, {len(train_samples)}]"
+        assert (
+            0 < n_val <= len(val_samples)
+        ), f"n_val={n_val} is invalid. Must be in [1, {len(val_samples)}]"
+        assert (
+            0 < n_test <= len(official_test_samples)
+        ), f"n_test={n_test} is invalid. Must be in [1, {len(official_test_samples)}]"
+
+        self.split_counts = {
+            "train": n_train,
+            "val": n_val,
+            "train+val": n_train + n_val,
+            "test": n_test,
+        }
+
         if self.split == "train":
-            self.samples = train_samples
+            self.samples = train_samples[:n_train]
+
         elif self.split == "val":
-            self.samples = val_samples
+            self.samples = val_samples[:n_val]
+
         elif self.split == "train+val":
-            self.samples = official_train_samples
-        else:
-            self.samples = official_test_samples
+            self.samples = train_samples[:n_train] + val_samples[:n_val]
+
+        else:  # test
+            self.samples = official_test_samples[:n_test]
 
         self.num_examples = len(self.samples)
 
@@ -160,6 +187,12 @@ class FGVCNABirdsDataset(IterableDataset):
             if self.split in {"train", "train+val"}
             else self.EVAL_TRANSFORM
         )
+
+    def get_split(self):
+        return self.split
+
+    def get_split_counts(self):
+        return self.split_counts
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch

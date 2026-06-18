@@ -7,6 +7,7 @@ from torch.utils.data import IterableDataset, DataLoader, get_worker_info
 from torchvision import transforms
 from PIL import Image
 from huggingface_hub import hf_hub_download
+from typing import Optional
 
 
 class VTABDMLabDataset(IterableDataset):
@@ -40,6 +41,7 @@ class VTABDMLabDataset(IterableDataset):
 
     IMG_SIZE = 224
     N_CLASSES = 6
+    TRAIN_SPLIT_FRAC = 0.9
     N_TRAIN_SAMPLES = 800
     N_VAL_SAMPLES = 200
     N_TRAINVAL_SAMPLES = 1000
@@ -63,6 +65,9 @@ class VTABDMLabDataset(IterableDataset):
         split: str,
         rank: int = 0,
         world_size: int = 1,
+        n_train: Optional[int] = None,
+        n_val: Optional[int] = None,
+        n_test: Optional[int] = None,
     ):
         super().__init__()
 
@@ -76,45 +81,78 @@ class VTABDMLabDataset(IterableDataset):
 
         os.makedirs(self.DATA_DIR, exist_ok=True)
 
-        if self.split == "train":
-            self.hf_base_split = "train"
-            self.start_idx = 0
-            self.end_idx = self.N_TRAIN_SAMPLES
+        train_parquet_filename = f"{self.HF_SUBDIR}/train-00000-of-00001.parquet"
+        test_parquet_filename = f"{self.HF_SUBDIR}/test-00000-of-00001.parquet"
 
-        elif self.split == "val":
-            self.hf_base_split = "train"
-            self.start_idx = self.N_TRAIN_SAMPLES
-            self.end_idx = self.N_TRAIN_SAMPLES + self.N_VAL_SAMPLES
-
-        elif self.split == "train+val":
-            self.hf_base_split = "train"
-            self.start_idx = 0
-            self.end_idx = self.N_TRAINVAL_SAMPLES
-
-        else:  # test
-            self.hf_base_split = "test"
-            self.start_idx = None
-            self.end_idx = None
-
-        parquet_filename = (
-            f"{self.HF_SUBDIR}/{self.hf_base_split}-00000-of-00001.parquet"
-        )
-
-        self.parquet_path = hf_hub_download(
+        self.train_parquet_path = hf_hub_download(
             repo_id=self.HF_REPO_ID,
-            filename=parquet_filename,
+            filename=train_parquet_filename,
             repo_type="dataset",
             cache_dir=self.DATA_DIR,
             token=self.HF_TOKEN,
         )
 
-        self.dataframe = pd.read_parquet(self.parquet_path)
+        self.test_parquet_path = hf_hub_download(
+            repo_id=self.HF_REPO_ID,
+            filename=test_parquet_filename,
+            repo_type="dataset",
+            cache_dir=self.DATA_DIR,
+            token=self.HF_TOKEN,
+        )
 
-        if self.start_idx is not None or self.end_idx is not None:
-            self.dataframe = self.dataframe.iloc[self.start_idx : self.end_idx]
+        train_dataframe = pd.read_parquet(self.train_parquet_path)
+        test_dataframe = pd.read_parquet(self.test_parquet_path)
+
+        train_count = int(self.TRAIN_SPLIT_FRAC * len(train_dataframe))
+        test_count = len(test_dataframe)
+
+        n_train = self.N_TRAIN_SAMPLES if n_train is None else n_train
+        n_val = self.N_VAL_SAMPLES if n_val is None else n_val
+        n_test = test_count if n_test is None else n_test
+
+        assert (
+            0 < n_train <= train_count
+        ), f"n_train={n_train} is invalid. Must be in [1, {train_count}]"
+        assert (
+            0 < n_val <= len(train_dataframe) - train_count
+        ), f"n_val={n_val} is invalid. Must be in [1, {len(train_dataframe) - train_count}]"
+        assert (
+            0 < n_test <= test_count
+        ), f"n_test={n_test} is invalid. Must be in [1, {test_count}]"
+
+        self.split_counts = {
+            "train": n_train,
+            "val": n_val,
+            "train+val": n_train + n_val,
+            "test": n_test,
+        }
+
+        if self.split == "train":
+            self.dataframe = train_dataframe.iloc[:n_train]
+
+        elif self.split == "val":
+            val_start = train_count
+            val_end = train_count + n_val
+            self.dataframe = train_dataframe.iloc[val_start:val_end]
+
+        elif self.split == "train+val":
+            val_start = train_count
+            val_end = train_count + n_val
+            self.dataframe = pd.concat(
+                [train_dataframe.iloc[:n_train], train_dataframe.iloc[val_start:val_end]]
+            )
+
+        else:  # test
+            self.dataframe = test_dataframe.iloc[:n_test]
 
         self.dataframe = self.dataframe.reset_index(drop=True)
         self.num_examples = len(self.dataframe)
+
+    def get_split(self):
+        return self.split
+
+    def get_split_counts(self):
+        return self.split_counts
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch

@@ -1,5 +1,5 @@
 import os
-from typing import Optional, Callable
+from typing import Optional
 
 import numpy as np
 import tensorflow as tf
@@ -76,6 +76,9 @@ class VTABDSpritesLocationDataset(IterableDataset):
         split: str,
         rank: int = 0,
         world_size: int = 1,
+        n_train: Optional[int] = None,
+        n_val: Optional[int] = None,
+        n_test: Optional[int] = None,
     ):
         super().__init__()
 
@@ -107,31 +110,59 @@ class VTABDSpritesLocationDataset(IterableDataset):
         trainval_count = train_count + val_count
         test_count = total_count - trainval_count
 
+        n_train = self.N_TRAIN_SAMPLES if n_train is None else n_train
+        n_val = self.N_VAL_SAMPLES if n_val is None else n_val
+        n_test = test_count if n_test is None else n_test
+
+        assert (
+            0 < n_train <= train_count
+        ), f"n_train={n_train} is invalid. Must be in [1, {train_count}]"
+        assert (
+            0 < n_val <= val_count
+        ), f"n_val={n_val} is invalid. Must be in [1, {val_count}]"
+        assert (
+            0 < n_test <= test_count
+        ), f"n_test={n_test} is invalid. Must be in [1, {test_count}]"
+
+        self.split_counts = {
+            "train": n_train,
+            "val": n_val,
+            "train+val": n_train + n_val,
+            "test": n_test,
+        }
+
         if self.split == "train":
-            self.tfds_split = f"train[:{self.N_TRAIN_SAMPLES}]"
-            self.num_examples = self.N_TRAIN_SAMPLES
+            self.tfds_split = f"train[:{n_train}]"
+            self.num_examples = n_train
 
         elif self.split == "val":
             val_start = train_count
-            val_end = train_count + self.N_VAL_SAMPLES
+            val_end = train_count + n_val
 
             self.tfds_split = f"train[{val_start}:{val_end}]"
-            self.num_examples = self.N_VAL_SAMPLES
+            self.num_examples = n_val
 
         elif self.split == "train+val":
             val_start = train_count
-            val_end = train_count + self.N_VAL_SAMPLES
+            val_end = train_count + n_val
 
-            self.tfds_split = (
-                f"train[:{self.N_TRAIN_SAMPLES}]" f"+train[{val_start}:{val_end}]"
-            )
-            self.num_examples = self.N_TRAIN_SAMPLES + self.N_VAL_SAMPLES
+            self.tfds_split = f"train[:{n_train}]+train[{val_start}:{val_end}]"
+            self.num_examples = n_train + n_val
 
         else:  # test
-            self.tfds_split = f"train[{trainval_count}:]"
-            self.num_examples = test_count
+            test_start = trainval_count
+            test_end = trainval_count + n_test
+
+            self.tfds_split = f"train[{test_start}:{test_end}]"
+            self.num_examples = n_test
 
         self.class_division_factor = self.ORIGINAL_N_CLASSES / self.N_CLASSES
+
+    def get_split(self):
+        return self.split
+
+    def get_split_counts(self):
+        return self.split_counts
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
