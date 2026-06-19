@@ -24,9 +24,9 @@ class VTABDMLabDataset(IterableDataset):
 
     Exposed VTAB-like splits:
       - split='train'     : HF train[:800]
-      - split='val'       : HF train[800:1000]
-      - split='train+val' : HF train[:1000]
-      - split='test'      : HF test[:]
+      - split='val'       : HF train[train_count:train_count+200]
+      - split='train+val' : HF train[:800] + train[train_count:train_count+200]
+      - split='test'      : HF test
 
     Labels:
       - Labels are already provided in the parquet file.
@@ -41,7 +41,7 @@ class VTABDMLabDataset(IterableDataset):
 
     IMG_SIZE = 224
     N_CLASSES = 6
-    TRAIN_SPLIT_FRAC = 0.9
+    TRAIN_SPLIT_FRAC = 0.8
     N_TRAIN_SAMPLES = 800
     N_VAL_SAMPLES = 200
     N_TRAINVAL_SAMPLES = 1000
@@ -139,7 +139,10 @@ class VTABDMLabDataset(IterableDataset):
             val_start = train_count
             val_end = train_count + n_val
             self.dataframe = pd.concat(
-                [train_dataframe.iloc[:n_train], train_dataframe.iloc[val_start:val_end]]
+                [
+                    train_dataframe.iloc[:n_train],
+                    train_dataframe.iloc[val_start:val_end],
+                ]
             )
 
         else:  # test
