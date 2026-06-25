@@ -4,6 +4,7 @@ logs/
 
 # Experiment results
 experiments/*/top1_acc_ft/
+experiments/task_characterization/mc_fim_estimates
 
 
 # Checkpoints

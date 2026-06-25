@@ -121,3 +121,214 @@ class ViTB16Backbone(nn.Module):
             "cls": encoded[:, 0],  # [B, 768]
             "patch_tokens": encoded[:, 1:],  # [B, 196, 768]
         }
+
+    def get_param_group(self, name: str):
+        """
+        Return parameter group specification for FIM aggregation.
+
+        Exact supported names:
+          - "block"
+          - "attention_qkvo"
+          - "mlp_layer"
+          - "patch_embed_channel"
+        """
+        if name == "block":
+            return self._get_block_param_group()
+
+        if name == "attention_qkvo":
+            return self._get_attention_qkvo_param_group()
+
+        if name == "mlp_layer":
+            return self._get_mlp_layer_param_group()
+
+        if name == "patch_embed_channel":
+            return self._get_patch_embed_channel_param_group()
+
+        raise ValueError(
+            f"Unknown param group: {name}. "
+            "Expected exactly one of: "
+            "'block', 'attention_qkvo', 'mlp_layer', 'patch_embed_channel'."
+        )
+
+    def _get_block_param_group(self):
+        groups = []
+
+        for block_idx, block in enumerate(self.blocks):
+            prefix = f"vit.transformer.encoder.layer.{block_idx}"
+
+            items = []
+            for param_name, param in block.named_parameters(
+                prefix=prefix,
+                recurse=True,
+            ):
+                items.append(
+                    {
+                        "name": param_name,
+                        "param": param,
+                        "index": None,
+                    }
+                )
+
+            groups.append(
+                {
+                    "name": f"block_{block_idx}",
+                    "index": (block_idx,),
+                    "items": items,
+                }
+            )
+
+        return {
+            "name": "block",
+            "shape": (len(self.blocks),),
+            "groups": groups,
+        }
+
+    def _get_attention_qkvo_param_group(self):
+        groups = []
+
+        role_names = ["query", "key", "value", "out"]
+
+        for block_idx, block in enumerate(self.blocks):
+            attn = block.attn
+            n_heads = attn.num_attention_heads
+            head_dim = attn.attention_head_size
+
+            prefix = f"vit.transformer.encoder.layer.{block_idx}.attn"
+
+            for head_idx in range(n_heads):
+                start = head_idx * head_dim
+                end = (head_idx + 1) * head_dim
+
+                row_slice = slice(start, end)
+                col_slice = slice(start, end)
+
+                groups.append(
+                    {
+                        "name": f"attention_q_{block_idx}_{head_idx}",
+                        "index": (block_idx, head_idx, 0),
+                        "items": [
+                            {
+                                "name": f"{prefix}.query.weight",
+                                "param": attn.query.weight,
+                                "index": (row_slice, slice(None)),
+                            }
+                        ],
+                    }
+                )
+
+                groups.append(
+                    {
+                        "name": f"attention_k_{block_idx}_{head_idx}",
+                        "index": (block_idx, head_idx, 1),
+                        "items": [
+                            {
+                                "name": f"{prefix}.key.weight",
+                                "param": attn.key.weight,
+                                "index": (row_slice, slice(None)),
+                            }
+                        ],
+                    }
+                )
+
+                groups.append(
+                    {
+                        "name": f"attention_v_{block_idx}_{head_idx}",
+                        "index": (block_idx, head_idx, 2),
+                        "items": [
+                            {
+                                "name": f"{prefix}.value.weight",
+                                "param": attn.value.weight,
+                                "index": (row_slice, slice(None)),
+                            }
+                        ],
+                    }
+                )
+
+                groups.append(
+                    {
+                        "name": f"attention_o_{block_idx}_{head_idx}",
+                        "index": (block_idx, head_idx, 3),
+                        "items": [
+                            {
+                                "name": f"{prefix}.out.weight",
+                                "param": attn.out.weight,
+                                "index": (slice(None), col_slice),
+                            }
+                        ],
+                    }
+                )
+
+        n_blocks = len(self.blocks)
+        n_heads = self.blocks[0].attn.num_attention_heads
+
+        return {
+            "name": "attention_qkvo",
+            "shape": (n_blocks, n_heads, len(role_names)),
+            "roles": role_names,
+            "groups": groups,
+        }
+
+    def _get_mlp_layer_param_group(self):
+        groups = []
+
+        for block_idx, block in enumerate(self.blocks):
+            prefix = f"vit.transformer.encoder.layer.{block_idx}.ffn"
+
+            groups.append(
+                {
+                    "name": f"mlp_layer_{block_idx}",
+                    "index": (block_idx,),
+                    "items": [
+                        {
+                            "name": f"{prefix}.fc1.weight",
+                            "param": block.ffn.fc1.weight,
+                            "index": None,
+                        },
+                        {
+                            "name": f"{prefix}.fc2.weight",
+                            "param": block.ffn.fc2.weight,
+                            "index": None,
+                        },
+                    ],
+                }
+            )
+
+        return {
+            "name": "mlp_layer",
+            "shape": (len(self.blocks),),
+            "groups": groups,
+        }
+
+    def _get_patch_embed_channel_param_group(self):
+        groups = []
+
+        patch_embed = self.embeddings.patch_embeddings
+        n_channels = patch_embed.weight.shape[0]
+
+        prefix = "vit.transformer.embeddings.patch_embeddings"
+
+        for channel_idx in range(n_channels):
+            groups.append(
+                {
+                    "name": f"patch_embed_channel_{channel_idx}",
+                    "index": (channel_idx,),
+                    "items": [
+                        {
+                            "name": f"{prefix}.weight",
+                            "param": patch_embed.weight,
+                            "index": (
+                                channel_idx,
+                                slice(None),
+                                slice(None),
+                                slice(None),
+                            ),
+                        }
+                    ],
+                }
+            )
+
+        return {
+            "name": "patch_embed_channel",
+            "shape": (n_channels,),
+            "groups": groups,
+        }
