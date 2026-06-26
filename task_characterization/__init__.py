@@ -1,1 +1,2 @@
 from .mc_fim_estimator import MonteCarloFIMEstimator
+from .fim_task_geometry_analyzer import FIMTaskGeometryAnalyzer

@@ -2,7 +2,7 @@ import argparse
 import json
 from pathlib import Path
 
-from task_characterization import MonteCarloFIMEstimator
+from task_characterization import FIMTaskGeometryAnalyzer
 from utils import parse_args_json
 
 
@@ -147,18 +147,22 @@ def main():
     if save_dir is None:
         save_dir = representations_path / "distance_analysis"
 
+    if args.save_name is not None:
+        save_dir = save_dir / args.save_name
+
     dataset_names, dataset_fim_paths = _get_dataset_fim_paths(
         representations_path=representations_path,
         npz_filename=args.npz_filename,
     )
 
-    result = MonteCarloFIMEstimator.analyze_dataset_fim_distances(
+    analyzer = FIMTaskGeometryAnalyzer(
         dataset_fim_paths=dataset_fim_paths,
         dataset_names=dataset_names,
         save_dir=save_dir,
-        rep_types=args.rep_types,
         npz_filename=args.npz_filename,
-        save_name=args.save_name,
+    )
+    result = analyzer.analyze(
+        rep_types=args.rep_types,
         linkage_method=args.linkage_method,
         cluster_ks=args.cluster_ks,
         eps=args.eps,
