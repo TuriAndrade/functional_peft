@@ -9,6 +9,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
+from scipy.cluster.hierarchy import (
+    linkage,
+    optimal_leaf_ordering,
+    leaves_list,
+    fcluster,
+)
+from scipy.spatial.distance import squareform
 
 
 # ------- MonteCarloFIMEstimator -------
@@ -605,3 +612,384 @@ class MonteCarloFIMEstimator:
             self._plot_all(all_reps)
 
         return all_reps
+
+    @staticmethod
+    def analyze_dataset_fim_distances(
+        dataset_fim_paths: Sequence[str | Path],
+        dataset_names: Sequence[str],
+        save_dir: str | Path,
+        rep_types: str | Sequence[str] = "all",
+        npz_filename: str = "fim_representations.npz",
+        save_name: str = "dataset_fim_distances",
+        linkage_method: str = "average",
+        cluster_ks: Sequence[int] = (2, 3, 4, 5),
+        eps: float = 1e-12,
+    ):
+        from scipy.cluster.hierarchy import (
+            linkage,
+            optimal_leaf_ordering,
+            leaves_list,
+            fcluster,
+        )
+        from scipy.spatial.distance import squareform
+
+        rep_specs = {
+            "block": ("fim_by_transformer_block", None),
+            "block_attn": ("fim_by_attention_block_head_projection", None),
+            "block_attn_q": ("fim_by_attention_block_head_projection", 0),
+            "block_attn_k": ("fim_by_attention_block_head_projection", 1),
+            "block_attn_v": ("fim_by_attention_block_head_projection", 2),
+            "block_attn_o": ("fim_by_attention_block_head_projection", 3),
+            "block_mlp": ("fim_by_mlp_block", None),
+            "patch_embd": ("fim_by_patch_embedding_channel", None),
+        }
+
+        def safe_name(name: str) -> str:
+            return "".join(c if c.isalnum() or c in "-_." else "_" for c in str(name))
+
+        def parse_rep_types(value):
+            if isinstance(value, str):
+                value = value.strip()
+
+                keys = [
+                    item.strip()
+                    for chunk in value.split(",")
+                    for item in chunk.split()
+                    if item.strip()
+                ]
+            else:
+                keys = list(value)
+
+            rep_keys = []
+            for key in keys:
+                key = str(key).strip()
+
+                if key not in rep_specs:
+                    raise ValueError(
+                        f"Unknown rep_type '{key}'. Valid values: {rep_specs.keys()}"
+                    )
+
+                rep_keys.append(key)
+
+            rep_keys = list(dict.fromkeys(rep_keys))
+
+            if len(rep_keys) == 0:
+                raise ValueError("At least one rep_type must be selected.")
+
+            return rep_keys
+
+        def find_npz_path(path: str | Path) -> Path:
+            path = Path(path)
+
+            if path.is_file():
+                return path
+
+            direct_path = path / npz_filename
+            if direct_path.exists():
+                return direct_path
+
+            matches = sorted(path.glob("*representations*.npz"))
+            if len(matches) == 1:
+                return matches[0]
+
+            raise FileNotFoundError(f"Could not find representation npz in {path}")
+
+        def load_dataset_vectors(npz_path: Path, rep_keys: Sequence[str]):
+            parts = []
+
+            with np.load(npz_path) as data:
+                model_names = [str(name) for name in data["model_names"]]
+
+                for rep_key in rep_keys:
+                    array_name, projection_idx = rep_specs[rep_key]
+                    arr = data[array_name]
+
+                    if projection_idx is not None:
+                        arr = arr[..., projection_idx]
+
+                    arr = arr.reshape(arr.shape[0], -1)
+                    parts.append(arr.astype(np.float64))
+
+            return np.concatenate(parts, axis=1), model_names
+
+        def task2vec_distance_matrix(A: np.ndarray, B: np.ndarray):
+            A = np.maximum(A.astype(np.float64), 0.0)
+            B = np.maximum(B.astype(np.float64), 0.0)
+
+            denom = A[:, None, :] + B[None, :, :] + eps
+            A_norm = A[:, None, :] / denom
+            B_norm = B[None, :, :] / denom
+
+            dot = np.sum(A_norm * B_norm, axis=-1)
+            norm = (
+                np.linalg.norm(A_norm, axis=-1) * np.linalg.norm(B_norm, axis=-1) + eps
+            )
+
+            D = 1.0 - dot / norm
+            return np.clip(D, 0.0, 2.0)
+
+        def cluster_distance_matrix(D: np.ndarray):
+            D = np.asarray(D, dtype=np.float64)
+            D = 0.5 * (D + D.T)
+            np.fill_diagonal(D, 0.0)
+
+            condensed = squareform(D, checks=False)
+            Z = linkage(condensed, method=linkage_method)
+            Z = optimal_leaf_ordering(Z, condensed)
+
+            order = leaves_list(Z)
+
+            labels_by_k = {
+                str(k): fcluster(Z, t=k, criterion="maxclust").astype(int).tolist()
+                for k in cluster_ks
+            }
+
+            return Z, order, labels_by_k
+
+        def plot_heatmap(
+            matrix: np.ndarray,
+            row_labels: Sequence[str],
+            col_labels: Sequence[str],
+            title: str,
+            path: Path,
+            diagonal_values: np.ndarray | None = None,
+            diagonal_labels: Sequence[str] | None = None,
+        ):
+            matrix = np.asarray(matrix)
+
+            has_diagonal_panel = (
+                diagonal_values is not None and diagonal_labels is not None
+            )
+
+            fig_w = max(8.0, 0.45 * len(col_labels) + 3.0)
+            fig_h = max(6.0, 0.35 * len(row_labels) + 2.5)
+
+            if has_diagonal_panel:
+                fig_w = fig_w + max(
+                    4.0, 0.18 * max(len(str(x)) for x in diagonal_labels)
+                )
+                fig, axes = plt.subplots(
+                    1,
+                    2,
+                    figsize=(fig_w, fig_h),
+                    gridspec_kw={"width_ratios": [3.2, 1.4]},
+                )
+                ax = axes[0]
+                diag_ax = axes[1]
+            else:
+                fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+                diag_ax = None
+
+            im = ax.imshow(matrix, aspect="auto")
+
+            ax.set_title(title)
+            ax.set_xticks(np.arange(len(col_labels)))
+            ax.set_yticks(np.arange(len(row_labels)))
+            ax.set_xticklabels(col_labels, rotation=90)
+            ax.set_yticklabels(row_labels)
+
+            fig.colorbar(im, ax=ax, label="Task2Vec distance", fraction=0.046, pad=0.04)
+
+            if has_diagonal_panel:
+                diagonal_values = np.asarray(diagonal_values, dtype=np.float64)
+                order = np.argsort(diagonal_values)
+
+                sorted_values = diagonal_values[order]
+                sorted_labels = [diagonal_labels[i] for i in order]
+
+                y = np.arange(len(sorted_values))
+                diag_ax.barh(y, sorted_values)
+                diag_ax.set_title("Same-dataset distance\nsorted")
+                diag_ax.set_xlabel("Distance")
+                diag_ax.set_yticks(y)
+                diag_ax.set_yticklabels(sorted_labels)
+                diag_ax.invert_yaxis()
+                diag_ax.grid(axis="x", alpha=0.3)
+
+            fig.tight_layout()
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(path, bbox_inches="tight")
+            plt.close(fig)
+
+        # ------------------------------------------------------------------
+        # Load FIM vectors
+        # ------------------------------------------------------------------
+        rep_keys = parse_rep_types(rep_types)
+        dataset_fim_paths = [Path(path) for path in dataset_fim_paths]
+        dataset_names = [str(name) for name in dataset_names]
+
+        vectors_per_dataset = []
+        model_names = None
+
+        for path in dataset_fim_paths:
+            npz_path = find_npz_path(path)
+            vectors, file_model_names = load_dataset_vectors(npz_path, rep_keys)
+
+            if model_names is None:
+                model_names = file_model_names
+
+            vectors_per_dataset.append(vectors)
+
+        embedding_vectors = np.stack(vectors_per_dataset, axis=0)
+
+        n_datasets, n_models, embedding_dim = embedding_vectors.shape
+
+        # ------------------------------------------------------------------
+        # Compute per-model and cross-model distances
+        # ------------------------------------------------------------------
+        distance_by_model = np.zeros(
+            (n_models, n_datasets, n_datasets),
+            dtype=np.float64,
+        )
+
+        cross_model_distance = np.zeros(
+            (n_models, n_models, n_datasets, n_datasets),
+            dtype=np.float64,
+        )
+
+        for m1 in range(n_models):
+            X1 = embedding_vectors[:, m1, :]
+
+            for m2 in range(n_models):
+                X2 = embedding_vectors[:, m2, :]
+                D = task2vec_distance_matrix(X1, X2)
+
+                if m1 == m2:
+                    D = 0.5 * (D + D.T)
+                    np.fill_diagonal(D, 0.0)
+                    distance_by_model[m1] = D
+
+                cross_model_distance[m1, m2] = D
+
+        # ------------------------------------------------------------------
+        # Cluster per-model matrices
+        # ------------------------------------------------------------------
+        linkage_by_model = []
+        leaf_order_by_model = []
+        clustering_summary = {}
+
+        for model_idx, model_name in enumerate(model_names):
+            Z, order, labels_by_k = cluster_distance_matrix(
+                distance_by_model[model_idx]
+            )
+
+            linkage_by_model.append(Z)
+            leaf_order_by_model.append(order)
+
+            ordered_dataset_names = [dataset_names[i] for i in order]
+
+            clustering_summary[model_name] = {
+                "leaf_order": order.astype(int).tolist(),
+                "ordered_dataset_names": ordered_dataset_names,
+                "cluster_labels_by_k": labels_by_k,
+            }
+
+        linkage_by_model = np.stack(linkage_by_model, axis=0)
+        leaf_order_by_model = np.stack(leaf_order_by_model, axis=0)
+
+        # ------------------------------------------------------------------
+        # Save matrices
+        # ------------------------------------------------------------------
+        output_dir = Path(save_dir) / save_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        np.savez_compressed(
+            output_dir / "distance_matrices.npz",
+            dataset_names=np.array(dataset_names),
+            model_names=np.array(model_names),
+            rep_keys=np.array(rep_keys),
+            embedding_vectors=embedding_vectors,
+            distance_by_model=distance_by_model,
+            cross_model_distance=cross_model_distance,
+            linkage_by_model=linkage_by_model,
+            leaf_order_by_model=leaf_order_by_model,
+        )
+
+        with open(output_dir / "clustering_summary.json", "w") as f:
+            json.dump(
+                {
+                    "distance_metric": "task2vec_symmetric_cosine",
+                    "distance_formula": (
+                        "cosine_distance(Fa / (Fa + Fb), Fb / (Fa + Fb))"
+                    ),
+                    "linkage_method": linkage_method,
+                    "rep_keys": rep_keys,
+                    "dataset_names": dataset_names,
+                    "model_names": model_names,
+                    "embedding_shape": list(embedding_vectors.shape),
+                    "distance_by_model_shape": list(distance_by_model.shape),
+                    "cross_model_distance_shape": list(cross_model_distance.shape),
+                    "per_model_clustering": clustering_summary,
+                },
+                f,
+                indent=2,
+            )
+
+        # ------------------------------------------------------------------
+        # Plot per-model clustered distance matrices
+        # ------------------------------------------------------------------
+        per_model_dir = output_dir / "per_model"
+
+        for model_idx, model_name in enumerate(model_names):
+            order = leaf_order_by_model[model_idx]
+            ordered_names = [dataset_names[i] for i in order]
+
+            D_ordered = distance_by_model[model_idx][np.ix_(order, order)]
+
+            plot_heatmap(
+                matrix=D_ordered,
+                row_labels=ordered_names,
+                col_labels=ordered_names,
+                title=f"Dataset distances | {model_name}",
+                path=per_model_dir
+                / f"{safe_name(model_name)}_clustered_distance_matrix.png",
+            )
+
+        # ------------------------------------------------------------------
+        # Plot cross-model alignment matrices
+        # ------------------------------------------------------------------
+        cross_model_dir = output_dir / "cross_model"
+
+        for row_model_idx, row_model_name in enumerate(model_names):
+            row_order = leaf_order_by_model[row_model_idx]
+            row_labels = [dataset_names[i] for i in row_order]
+
+            for col_model_idx, col_model_name in enumerate(model_names):
+                if row_model_idx == col_model_idx:
+                    continue
+
+                col_order = leaf_order_by_model[col_model_idx]
+                col_labels = [dataset_names[i] for i in col_order]
+
+                D_cross_raw = cross_model_distance[row_model_idx, col_model_idx]
+                D_cross = D_cross_raw[np.ix_(row_order, col_order)]
+
+                plot_heatmap(
+                    matrix=D_cross,
+                    row_labels=row_labels,
+                    col_labels=col_labels,
+                    title=(
+                        "Cross-model dataset distances | "
+                        f"{row_model_name} vs {col_model_name}"
+                    ),
+                    path=cross_model_dir
+                    / (
+                        f"{safe_name(row_model_name)}_vs_"
+                        f"{safe_name(col_model_name)}_distance_matrix.png"
+                    ),
+                    diagonal_values=np.diag(D_cross_raw),
+                    diagonal_labels=dataset_names,
+                )
+
+        return {
+            "output_dir": output_dir,
+            "dataset_names": dataset_names,
+            "model_names": model_names,
+            "rep_keys": rep_keys,
+            "embedding_vectors": embedding_vectors,
+            "distance_by_model": distance_by_model,
+            "cross_model_distance": cross_model_distance,
+            "linkage_by_model": linkage_by_model,
+            "leaf_order_by_model": leaf_order_by_model,
+        }
