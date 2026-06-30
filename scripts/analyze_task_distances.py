@@ -2,7 +2,7 @@ import argparse
 import json
 from pathlib import Path
 
-from task_characterization import TaskGeometryAnalyzer
+from task_characterization import TaskDistanceAnalyzer
 from utils import parse_args_json
 
 
@@ -31,12 +31,12 @@ def _parse_cluster_ks(value: str):
 
 
 def _build_parser():
-    parser = argparse.ArgumentParser(description="Analyze dataset geometry.")
+    parser = argparse.ArgumentParser(description="Analyze dataset distances.")
 
     parser.add_argument(
         "--representations-path",
         type=str,
-        required=True,
+        default=None,
         help=(
             "Directory containing one subdirectory per dataset. "
             "Each dataset directory must contain exactly one .npz file."
@@ -49,7 +49,7 @@ def _build_parser():
         default=None,
         help=(
             "Where to save outputs. If omitted, saves under "
-            "<representations-path>/geometry_analysis."
+            "<representations-path>/distance_analysis."
         ),
     )
 
@@ -57,7 +57,7 @@ def _build_parser():
         "--save-name",
         type=str,
         default=None,
-        help="Subdirectory name for the saved geometry analysis.",
+        help="Subdirectory name for the saved distance analysis.",
     )
 
     parser.add_argument(
@@ -115,6 +115,9 @@ def _get_dataset_paths(representations_path: Path):
 def main():
     args = _parse_args()
 
+    if args.representations_path is None:
+        raise ValueError("--representations-path is required.")
+
     representations_path = Path(args.representations_path)
     if not representations_path.exists():
         raise FileNotFoundError(f"Missing representations path: {representations_path}")
@@ -122,7 +125,7 @@ def main():
     save_dir = (
         Path(args.save_dir)
         if args.save_dir is not None
-        else representations_path / "geometry_analysis"
+        else representations_path / "distance_analysis"
     )
 
     if args.save_name:
@@ -130,13 +133,13 @@ def main():
 
     dataset_names, dataset_paths = _get_dataset_paths(representations_path)
 
-    geometry = TaskGeometryAnalyzer(
+    distance_analyzer = TaskDistanceAnalyzer(
         dataset_paths=dataset_paths,
         dataset_names=dataset_names,
         save_dir=save_dir,
     )
 
-    result = geometry.compute(
+    result = distance_analyzer.compute(
         rep_types=args.rep_types,
         linkage_method=args.linkage_method,
         cluster_ks=args.cluster_ks,
@@ -145,7 +148,7 @@ def main():
 
     output_dir = Path(result["output_dir"])
 
-    print(f"Saved geometry analysis to: {output_dir}")
+    print(f"Saved distance analysis to: {output_dir}")
     print(f"Saved distance matrices to: {output_dir / 'distance_matrices.npz'}")
     print(f"Saved clustering summary to: {output_dir / 'clustering_summary.json'}")
     print(f"Saved per-model plots to: {output_dir / 'per_model'}")

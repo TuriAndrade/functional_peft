@@ -1,2 +1,3 @@
 from .mc_fim_estimator import MonteCarloFIMEstimator
-from .task_geometry_analyzer import TaskGeometryAnalyzer
+from .task_distance_analyzer import TaskDistanceAnalyzer
+from .task_separation_analyzer import TaskSeparationAnalyzer

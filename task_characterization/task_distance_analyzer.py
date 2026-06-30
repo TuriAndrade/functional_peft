@@ -14,7 +14,7 @@ from scipy.spatial.distance import squareform
 from sklearn.manifold import MDS
 
 
-class TaskGeometryAnalyzer:
+class TaskDistanceAnalyzer:
     REP_SPECS = {
         "fim_block": ("fim_by_transformer_block", None),
         "fim_block_attn": ("fim_by_attention_block_head_projection", None),

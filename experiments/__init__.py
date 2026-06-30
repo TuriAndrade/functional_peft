@@ -35,6 +35,14 @@ from .task_characterization.compute_fim import (
     build_args as task_characterization_compute_fim_ba,
 )
 
+from .task_characterization.analyze_task_distances import (
+    build_args as task_characterization_analyze_task_distances_ba,
+)
+
+from .task_characterization.analyze_task_separation import (
+    build_args as task_characterization_analyze_task_separation_ba,
+)
+
 build_args = {
     "vpt_tuning": vpt_tuning_ba,
     "vpt_eval": vpt_eval_ba,
@@ -42,7 +50,13 @@ build_args = {
     "linear_probe_eval": linear_probe_eval_ba,
     "full_ft_tuning": full_ft_tuning_ba,
     "full_ft_eval": full_ft_eval_ba,
-    "task_characterization_compute_fim_ba": task_characterization_compute_fim_ba,
+    "task_characterization_compute_fim": task_characterization_compute_fim_ba,
+    "task_characterization_analyze_task_distances": (
+        task_characterization_analyze_task_distances_ba
+    ),
+    "task_characterization_analyze_task_separation": (
+        task_characterization_analyze_task_separation_ba
+    ),
 }
 
 build_results = {
