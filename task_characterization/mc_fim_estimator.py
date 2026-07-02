@@ -1,152 +1,145 @@
 import json
+import math
 from pathlib import Path
-from typing import Dict, Any, Sequence
+from typing import Any, Dict, Sequence
 
-from tqdm import tqdm
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import math
+from tqdm import tqdm
 
 
-# ------- MonteCarloFIMEstimator -------
 class MonteCarloFIMEstimator:
+    """
+    Assumed backbone interface:
+
+        backbone.aggregate_fim_grads() -> dict[str, torch.Tensor]
+
+    Returned FIM groups:
+
+        input_patch_channel: [D]
+            FIM per patch-embedding output channel.
+
+        input_pos_grid: [G, G]
+            FIM per learned patch positional embedding, arranged as the image patch grid.
+
+        block_path: [B, 6]
+            FIM per transformer block and computational path.
+            Path axis: [LN1, QK, OV, LN2, MLP key, MLP value].
+
+        attention_circuit_head: [B, H, 2]
+            FIM per block, attention head, and attention circuit.
+            Circuit axis: [QK, OV].
+
+        mlp_memory_group: [B, K, 2]
+            FIM per block, grouped MLP hidden units, and MLP memory role.
+            Role axis: [key, value].
+
+        residual_io_channel: [B, 2, D]
+            FIM per block, residual-stream role, and residual channel.
+            Role axis: [read, write].
+
+        attention_circuit_dim: [B, H, 2, Dh]
+            Fine-grained attention FIM per block, head, circuit, and head dimension.
+            Circuit axis: [QK, OV].
+
+        mlp_memory_unit: [B, M, 2]
+            Fine-grained MLP FIM per block, MLP hidden unit, and memory role.
+            Role axis: [key, value].
+    """
+
     def __init__(
         self,
         models: Sequence[nn.Module],
         save_dir: str | Path,
         model_names: Sequence[str] | None = None,
-        plot_norm: str = "max",  # "max" or "percentile"
+        plot_norm: str = "max",
         plot_percentile: float = 99.0,
     ):
         self.models = list(models)
-
-        if model_names is None:
-            self.model_names = [f"model_{i}" for i in range(len(self.models))]
-        else:
-            self.model_names = list(model_names)
+        self.model_names = (
+            list(model_names)
+            if model_names is not None
+            else [f"model_{i}" for i in range(len(self.models))]
+        )
 
         if len(self.models) != len(self.model_names):
             raise ValueError("models and model_names must have the same length.")
-
         if plot_norm not in {"max", "percentile"}:
-            raise ValueError("plot_norm must be either 'max' or 'percentile'.")
+            raise ValueError("plot_norm must be 'max' or 'percentile'.")
 
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
         self.plot_norm = plot_norm
         self.plot_percentile = plot_percentile
-
-        self.plot_norm_types = [
-            "global",
-            "by_model",
-            "by_row",
-            "by_column",
-        ]
+        self.plot_norms = ["global", "by_model", "by_row", "by_column"]
 
         self.group_names = [
-            "block",
-            "attention_qkvo",
-            "mlp_layer",
-            "patch_embed_channel",
+            "input_patch_channel",
+            "input_pos_grid",
+            "block_path",
+            "attention_circuit_head",
+            "mlp_memory_group",
+            "residual_io_channel",
+            "attention_circuit_dim",
+            "mlp_memory_unit",
         ]
 
-        self.attention_projection_names = ["query", "key", "value", "output"]
-        self.attention_projection_labels = ["Q", "K", "V", "O"]
+        self.labels = {
+            "block_path": ["LN1", "QK", "OV", "LN2", "MLP key", "MLP value"],
+            "attention_circuit": ["QK", "OV"],
+            "mlp_memory": ["key", "value"],
+            "residual_io": ["read", "write"],
+        }
 
-    def _save_json(self, obj: Dict[str, Any], filename: str):
-        with open(self.save_dir / filename, "w") as f:
-            json.dump(obj, f, indent=2)
-
-    def _get_x(self, batch):
+    @staticmethod
+    def _get_x(batch):
         if isinstance(batch, torch.Tensor):
             return batch
+        if isinstance(batch, dict):
+            for k in ("x", "image", "images", "pixel_values"):
+                if k in batch:
+                    return batch[k]
+            return next(iter(batch.values()))
         return batch[0]
 
-    def _get_logits(self, model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _get_logits(model: nn.Module, x: torch.Tensor):
         out = model(x)
+        if isinstance(out, dict):
+            return out["logits"]
+        return out[0] if isinstance(out, (tuple, list)) else out
 
-        # Some ViT implementations return (logits, attn_weights)
-        if isinstance(out, tuple):
-            return out[0]
-
-        return out
-
-    def _get_backbone(self, model: nn.Module):
-        """
-        Supports either:
-          1. model.get_param_group(...)
-          2. model.backbone.get_param_group(...)
-        """
-        if hasattr(model, "get_param_group"):
-            return model
-
-        if hasattr(model, "backbone") and hasattr(model.backbone, "get_param_group"):
-            return model.backbone
-
+    @staticmethod
+    def _get_backbone(model: nn.Module):
+        for m in (model, getattr(model, "module", None)):
+            if m is not None and hasattr(m, "aggregate_fim_grads"):
+                return m
+            b = getattr(m, "backbone", None) if m is not None else None
+            if b is not None and hasattr(b, "aggregate_fim_grads"):
+                return b
         raise AttributeError(
-            "Could not find get_param_group(...). "
-            "Expected either model.get_param_group or model.backbone.get_param_group."
+            "Expected model or model.backbone to implement aggregate_fim_grads()."
         )
 
-    def _snapshot_requires_grad(self, model: nn.Module):
+    @staticmethod
+    def _snapshot_requires_grad(model: nn.Module):
         return {p: p.requires_grad for p in model.parameters()}
 
-    def _restore_requires_grad(self, snapshot):
-        for p, requires_grad in snapshot.items():
-            p.requires_grad = requires_grad
+    @staticmethod
+    def _restore_requires_grad(snapshot):
+        for p, v in snapshot.items():
+            p.requires_grad_(v)
 
-    def _collect_spec_params(self, specs: Dict[str, Dict[str, Any]]):
-        params = set()
-
-        for spec in specs.values():
-            for group in spec["groups"]:
-                for item in group["items"]:
-                    params.add(item["param"])
-
-        return params
-
-    def _prepare_for_fim(self, model: nn.Module, specs: Dict[str, Dict[str, Any]]):
-        """
-        Disable gradients for everything, then enable gradients only for the
-        backbone params used by the FIM groups.
-
-        The head/probe still participates in the forward pass, but its params
-        do not need gradients for Fisher over the backbone.
-        """
+    @staticmethod
+    def _prepare_for_fim(model: nn.Module, backbone: nn.Module):
         for p in model.parameters():
-            p.requires_grad = False
-
-        for p in self._collect_spec_params(specs):
-            p.requires_grad = True
-
-    def _aggregate_grad2(self, spec: Dict[str, Any], device: str):
-        out = torch.zeros(spec["shape"], device=device)
-
-        for group in spec["groups"]:
-            total = torch.tensor(0.0, device=device)
-            count = 0
-
-            for item in group["items"]:
-                grad = item["param"].grad
-
-                if grad is None:
-                    continue
-
-                if item["index"] is not None:
-                    grad = grad[item["index"]]
-
-                grad2 = grad.detach().pow(2)
-                total = total + grad2.sum()
-                count += grad2.numel()
-
-            if count > 0:
-                out[group["index"]] = total / count
-
-        return out
+            p.requires_grad_(False)
+        for p in backbone.parameters():
+            p.requires_grad_(True)
 
     def _compute_one_model(
         self,
@@ -158,32 +151,21 @@ class MonteCarloFIMEstimator:
         mc_samples: int,
     ):
         model.to(device)
+
+        mode_snapshot = {m: m.training for m in model.modules()}
         model.eval()
 
         backbone = self._get_backbone(model)
-        specs = {
-            group_name: backbone.get_param_group(group_name)
-            for group_name in self.group_names
-        }
 
-        requires_grad_snapshot = self._snapshot_requires_grad(model)
-        self._prepare_for_fim(model, specs)
+        grad_snapshot = self._snapshot_requires_grad(model)
+        self._prepare_for_fim(model, backbone)
 
-        fim_sums = {
-            group_name: torch.zeros(spec["shape"], device=device)
-            for group_name, spec in specs.items()
-        }
-
+        sums = None
         n_steps = 0
         n_samples = 0
+        fim_den = 0
 
-        pbar = tqdm(
-            loader,
-            desc=f"[FIM] {model_name}",
-            unit="batch",
-            leave=False,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-        )
+        pbar = tqdm(loader, desc=f"[FIM] {model_name}", unit="batch", leave=False)
 
         try:
             with torch.enable_grad():
@@ -192,149 +174,114 @@ class MonteCarloFIMEstimator:
                         break
 
                     x = self._get_x(batch).to(device, non_blocking=True)
-                    bs = x.size(0)
-                    n_samples += bs
+                    batch_size = x.size(0)
+                    n_samples += batch_size
 
                     for _ in range(mc_samples):
                         model.zero_grad(set_to_none=True)
 
                         logits = self._get_logits(model, x)
 
-                        pseudo_y = torch.distributions.Categorical(
-                            logits=logits
-                        ).sample()
+                        with torch.no_grad():
+                            y = torch.distributions.Categorical(
+                                logits=logits.detach()
+                            ).sample()
 
-                        loss = F.cross_entropy(logits, pseudo_y)
+                        loss = F.cross_entropy(logits, y, reduction="sum")
                         loss.backward()
 
-                        for group_name, spec in specs.items():
-                            fim_sums[group_name] += self._aggregate_grad2(
-                                spec,
-                                device=device,
-                            )
+                        reps = backbone.aggregate_fim_grads()
+
+                        if sums is None:
+                            sums = {
+                                k: torch.zeros_like(reps[k]) for k in self.group_names
+                            }
+
+                        for k in self.group_names:
+                            sums[k].add_(reps[k].detach())
 
                         n_steps += 1
+                        fim_den += batch_size
 
-                    running = {
-                        k: float(v.mean().detach().cpu()) for k, v in fim_sums.items()
-                    }
-
-                    pbar.set_postfix_str(
-                        " • ".join(
-                            f"{k}={v / max(n_steps, 1):.3e}" for k, v in running.items()
-                        )
+                    pbar.set_postfix(
+                        steps=n_steps,
+                        samples=n_samples,
+                        effective=fim_den,
                     )
 
         finally:
-            self._restore_requires_grad(requires_grad_snapshot)
+            model.zero_grad(set_to_none=True)
+            self._restore_requires_grad(grad_snapshot)
 
-        pbar.close()
+            for module, was_training in mode_snapshot.items():
+                module.train(was_training)
+
+            pbar.close()
 
         if n_steps == 0:
             raise RuntimeError("No FIM steps were computed. Check loader/max_batches.")
 
-        reps = {
-            group_name: (fim_sums[group_name] / n_steps).detach().cpu().numpy()
-            for group_name in self.group_names
-        }
+        reps = {k: (sums[k] / fim_den).cpu().numpy() for k in self.group_names}
 
         summary = {
             "model_name": model_name,
             "n_samples_seen": n_samples,
+            "n_effective_fim_samples": fim_den,
             "n_fim_steps": n_steps,
             "mc_samples": mc_samples,
         }
 
-        for group_name, arr in reps.items():
-            summary[group_name] = {
-                "shape": list(arr.shape),
-                "min": float(arr.min()),
-                "max": float(arr.max()),
-                "mean": float(arr.mean()),
-                "l1": float(np.abs(arr).sum()),
-                "l2": float(np.sqrt((arr**2).sum())),
+        for k, a in reps.items():
+            summary[k] = {
+                "shape": list(a.shape),
+                "min": float(a.min()),
+                "max": float(a.max()),
+                "mean": float(a.mean()),
+                "l1": float(np.abs(a).sum()),
+                "l2": float(np.sqrt((a**2).sum())),
             }
 
         tqdm.write(
-            f"FIM done • {model_name} • " f"steps={n_steps} • samples={n_samples}"
+            f"FIM done • {model_name} • steps={n_steps} • "
+            f"samples={n_samples} • effective={fim_den}"
         )
 
         return reps, summary
 
-    def _get_plot_scale(self, arr: np.ndarray):
-        flat = arr.reshape(-1)
+    def _scale(self, x: np.ndarray):
+        x = x.reshape(-1)
+        s = (
+            float(x.max())
+            if self.plot_norm == "max"
+            else float(np.percentile(x, self.plot_percentile))
+        )
+        return s if s > 0 else 1.0
 
-        if self.plot_norm == "max":
-            scale = float(flat.max())
-        elif self.plot_norm == "percentile":
-            scale = float(np.percentile(flat, self.plot_percentile))
-        else:
-            raise ValueError("plot_norm must be either 'max' or 'percentile'.")
-
-        if scale <= 0:
-            scale = 1.0
-
-        return scale
-
-    def _get_axis_plot_scale(self, arr: np.ndarray, axis: int):
-        if self.plot_norm == "max":
-            scale = arr.max(axis=axis, keepdims=True)
-        elif self.plot_norm == "percentile":
-            scale = np.percentile(
-                arr,
-                self.plot_percentile,
-                axis=axis,
-                keepdims=True,
+    def _normalize(self, x: np.ndarray, norm: str, global_scale: float | None):
+        if norm == "global":
+            s = global_scale
+        elif norm == "by_model":
+            s = self._scale(x)
+        elif norm == "by_row":
+            s = (
+                x.max(1, keepdims=True)
+                if self.plot_norm == "max"
+                else np.percentile(x, self.plot_percentile, axis=1, keepdims=True)
+            )
+        elif norm == "by_column":
+            s = (
+                x.max(0, keepdims=True)
+                if self.plot_norm == "max"
+                else np.percentile(x, self.plot_percentile, axis=0, keepdims=True)
             )
         else:
-            raise ValueError("plot_norm must be either 'max' or 'percentile'.")
+            raise ValueError(f"Unknown normalization: {norm}")
 
-        scale = np.asarray(scale, dtype=np.float64)
-        scale = np.where(scale <= 0, 1.0, scale)
-        return scale
+        return np.clip(x / np.where(np.asarray(s) <= 0, 1.0, s), 0.0, 1.0)
 
-    def _normalize_for_plot(
-        self,
-        arr: np.ndarray,
-        norm_type: str,
-        global_scale: float | None = None,
-    ):
-        if norm_type == "global":
-            if global_scale is None:
-                raise ValueError(
-                    "global_scale must be provided for global normalization."
-                )
-            scale = global_scale
-            arr = arr / scale
-
-        elif norm_type == "by_model":
-            scale = self._get_plot_scale(arr)
-            arr = arr / scale
-
-        elif norm_type == "by_row":
-            if arr.ndim != 2:
-                raise ValueError("by_row normalization only applies to 2D arrays.")
-            scale = self._get_axis_plot_scale(arr, axis=1)
-            arr = arr / scale
-
-        elif norm_type == "by_column":
-            if arr.ndim != 2:
-                raise ValueError("by_column normalization only applies to 2D arrays.")
-            scale = self._get_axis_plot_scale(arr, axis=0)
-            arr = arr / scale
-
-        else:
-            raise ValueError(
-                "norm_type must be one of: "
-                "'global', 'by_model', 'by_row', 'by_column'."
-            )
-
-        arr = np.clip(arr, 0.0, 1.0)
-        return arr, scale
-
-    def _get_global_plot_scale(self, arrays: Sequence[np.ndarray]):
-        flat = np.concatenate([arr.reshape(-1) for arr in arrays], axis=0)
-        return self._get_plot_scale(flat)
+    @staticmethod
+    def _safe(x: str):
+        return x.lower().replace(" ", "_").replace("/", "_")
 
     def _plot_arrays(
         self,
@@ -342,207 +289,171 @@ class MonteCarloFIMEstimator:
         title: str,
         filename: str,
         xlabel: str,
-        norm_type: str,
+        norm: str,
         ylabel: str | None = None,
         yticklabels: Sequence[str] | None = None,
     ):
-        if norm_type in {"by_row", "by_column"}:
-            if any(arr.ndim != 2 for arr in arrays):
-                return
-
-        global_scale = None
-        if norm_type == "global":
-            global_scale = self._get_global_plot_scale(arrays)
-
-        n_models = len(self.model_names)
-        ncols = 2 if n_models <= 4 else 3
-        nrows = math.ceil(n_models / ncols)
-
-        first = arrays[0]
-        first_2d = first if first.ndim == 2 else first.reshape(1, -1)
-        subplot_height = 3.5 if first_2d.shape[0] > 1 else 2.2
-
-        fig, axes = plt.subplots(
-            nrows,
-            ncols,
-            figsize=(4.5 * ncols + 0.7, subplot_height * nrows),
-            squeeze=False,
+        arrays = [a if a.ndim == 2 else a.reshape(1, -1) for a in arrays]
+        global_scale = (
+            self._scale(np.concatenate([a.reshape(-1) for a in arrays]))
+            if norm == "global"
+            else None
         )
 
+        ncols = 2 if len(self.model_names) <= 4 else 3
+        nrows = math.ceil(len(self.model_names) / ncols)
+        height = 3.5 if arrays[0].shape[0] > 1 else 2.2
+
+        fig, axes = plt.subplots(
+            nrows, ncols, figsize=(4.5 * ncols + 0.7, height * nrows), squeeze=False
+        )
         im = None
 
         for i, (model_name, arr) in enumerate(zip(self.model_names, arrays)):
             ax = axes[i // ncols, i % ncols]
+            data = self._normalize(arr.astype(np.float64), norm, global_scale)
 
-            data = arr if arr.ndim == 2 else arr.reshape(1, -1)
-            data, scale = self._normalize_for_plot(
-                data,
-                norm_type=norm_type,
-                global_scale=global_scale,
-            )
-
-            im = ax.imshow(
-                data,
-                aspect="auto",
-                vmin=0.0,
-                vmax=1.0,
-            )
-
+            im = ax.imshow(data, aspect="auto", vmin=0.0, vmax=1.0)
             ax.set_title(model_name)
             ax.set_xlabel(xlabel)
 
-            if ylabel is not None:
+            if ylabel:
                 ax.set_ylabel(ylabel)
-
             if yticklabels is not None:
                 ax.set_yticks(np.arange(len(yticklabels)))
                 ax.set_yticklabels(yticklabels)
             elif data.shape[0] == 1:
                 ax.set_yticks([])
 
-        for j in range(n_models, nrows * ncols):
+        for j in range(len(self.model_names), nrows * ncols):
             axes[j // ncols, j % ncols].axis("off")
 
-        fig.suptitle(
-            f"{title} | {norm_type} normalization",
-            y=0.98,
-        )
-
+        fig.suptitle(f"{title} | {norm}", y=0.98)
         fig.subplots_adjust(
-            left=0.08,
-            right=0.88,
-            top=0.88,
-            bottom=0.10,
-            wspace=0.35,
-            hspace=0.55,
+            left=0.08, right=0.88, top=0.88, bottom=0.10, wspace=0.35, hspace=0.55
         )
 
         cbar_ax = fig.add_axes([0.91, 0.18, 0.025, 0.64])
-        fig.colorbar(
-            im,
-            cax=cbar_ax,
-            label=f"Normalized FIM ({norm_type})",
-        )
+        fig.colorbar(im, cax=cbar_ax, label=f"Normalized FIM ({norm})")
 
-        plot_dir = self.save_dir / "plots" / norm_type
-        plot_dir.mkdir(parents=True, exist_ok=True)
-
-        plt.savefig(plot_dir / filename, bbox_inches="tight")
+        out_dir = self.save_dir / "plots" / norm
+        out_dir.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_dir / filename, bbox_inches="tight")
         plt.close(fig)
 
-    def _plot_arrays_all_norms(
-        self,
-        arrays: Sequence[np.ndarray],
-        title: str,
-        filename: str,
-        xlabel: str,
-        ylabel: str | None = None,
-        yticklabels: Sequence[str] | None = None,
+    def _plot_all_norms(
+        self, arrays, title, filename, xlabel, ylabel=None, yticklabels=None
     ):
-        for norm_type in self.plot_norm_types:
+        for norm in self.plot_norms:
             self._plot_arrays(
-                arrays=arrays,
-                title=title,
-                filename=filename,
-                xlabel=xlabel,
-                norm_type=norm_type,
-                ylabel=ylabel,
-                yticklabels=yticklabels,
+                arrays, title, filename, xlabel, norm, ylabel, yticklabels
             )
 
-    def _plot_all(self, all_reps: Dict[str, Dict[str, np.ndarray]]):
-        self._plot_arrays_all_norms(
-            arrays=[all_reps[name]["block"] for name in self.model_names],
-            title="FIM by transformer block",
-            filename="fim_by_transformer_block_heatmaps.png",
-            xlabel="Transformer block",
+    def _plot_all(self, reps: Dict[str, Dict[str, np.ndarray]]):
+        r = lambda k: [reps[m][k] for m in self.model_names]
+
+        self._plot_all_norms(
+            r("input_patch_channel"),
+            "FIM by input patch channel",
+            "input_patch_channel.png",
+            "Patch embedding channel",
+        )
+        self._plot_all_norms(
+            r("input_pos_grid"),
+            "FIM by input positional grid",
+            "input_pos_grid.png",
+            "Patch column",
+            "Patch row",
         )
 
-        for projection_idx, projection_name in enumerate(
-            self.attention_projection_names
-        ):
-            self._plot_arrays_all_norms(
-                arrays=[
-                    all_reps[name]["attention_qkvo"][:, :, projection_idx]
-                    for name in self.model_names
-                ],
-                title=f"FIM by attention {projection_name} projection, block and head",
-                filename=(
-                    f"fim_by_attention_{projection_name}_projection_"
-                    "block_head_heatmaps.png"
-                ),
-                xlabel="Attention head",
-                ylabel="Transformer block",
+        self._plot_all_norms(
+            [reps[m]["block_path"].T for m in self.model_names],
+            "FIM by block path",
+            "block_path.png",
+            "Transformer block",
+            "Path",
+            self.labels["block_path"],
+        )
+
+        for i, label in enumerate(self.labels["attention_circuit"]):
+            self._plot_all_norms(
+                [reps[m]["attention_circuit_head"][:, :, i] for m in self.model_names],
+                f"FIM by attention {label} circuit",
+                f"attention_circuit_head_{self._safe(label)}.png",
+                "Attention head",
+                "Transformer block",
             )
 
-        self._plot_arrays_all_norms(
-            arrays=[
-                all_reps[name]["attention_qkvo"].mean(axis=1).T
-                for name in self.model_names
-            ],
-            title="FIM by attention projection and block, averaged over heads",
-            filename="fim_by_attention_projection_block_mean_over_heads_heatmaps.png",
-            xlabel="Transformer block",
-            ylabel="Attention projection",
-            yticklabels=self.attention_projection_labels,
+        self._plot_all_norms(
+            [reps[m]["attention_circuit_head"].mean(1).T for m in self.model_names],
+            "FIM by attention circuit and block",
+            "attention_circuit_head_block_mean.png",
+            "Transformer block",
+            "Circuit",
+            self.labels["attention_circuit"],
         )
 
-        self._plot_arrays_all_norms(
-            arrays=[
-                all_reps[name]["attention_qkvo"].mean(axis=(1, 2))
-                for name in self.model_names
-            ],
-            title="FIM by attention block, averaged over heads and projections",
-            filename="fim_by_attention_block_mean_over_heads_and_projections_heatmaps.png",
-            xlabel="Transformer block",
+        for i, label in enumerate(self.labels["mlp_memory"]):
+            self._plot_all_norms(
+                [reps[m]["mlp_memory_group"][:, :, i] for m in self.model_names],
+                f"FIM by MLP memory {label}",
+                f"mlp_memory_group_{self._safe(label)}.png",
+                "MLP group",
+                "Transformer block",
+            )
+
+        self._plot_all_norms(
+            [reps[m]["mlp_memory_group"].mean(1).T for m in self.model_names],
+            "FIM by MLP memory role and block",
+            "mlp_memory_group_block_mean.png",
+            "Transformer block",
+            "MLP role",
+            self.labels["mlp_memory"],
         )
 
-        self._plot_arrays_all_norms(
-            arrays=[all_reps[name]["mlp_layer"] for name in self.model_names],
-            title="FIM by MLP block",
-            filename="fim_by_mlp_block_heatmaps.png",
-            xlabel="Transformer block",
+        self._plot_all_norms(
+            [reps[m]["residual_io_channel"].mean(2).T for m in self.model_names],
+            "FIM by residual read/write and block",
+            "residual_io_channel_block_mean.png",
+            "Transformer block",
+            "Residual role",
+            self.labels["residual_io"],
         )
 
-        self._plot_arrays_all_norms(
-            arrays=[all_reps[name]["patch_embed_channel"] for name in self.model_names],
-            title="FIM by patch embedding channel",
-            filename="fim_by_patch_embedding_channel_heatmaps.png",
-            xlabel="Patch embedding output channel",
-        )
+    def _stack(self, reps: Dict[str, Dict[str, np.ndarray]], name: str):
+        return np.stack([reps[m][name] for m in self.model_names], axis=0)
 
-    def _save_npz(self, all_reps: Dict[str, Dict[str, np.ndarray]]):
-        fim_by_transformer_block = np.stack(
-            [all_reps[name]["block"] for name in self.model_names],
-            axis=0,
-        )
+    def _save_json(self, obj: Dict[str, Any], filename: str):
+        with open(self.save_dir / filename, "w") as f:
+            json.dump(obj, f, indent=2)
 
-        fim_by_attention_block_head_projection = np.stack(
-            [all_reps[name]["attention_qkvo"] for name in self.model_names],
-            axis=0,
-        )
-
-        fim_by_mlp_block = np.stack(
-            [all_reps[name]["mlp_layer"] for name in self.model_names],
-            axis=0,
-        )
-
-        fim_by_patch_embedding_channel = np.stack(
-            [all_reps[name]["patch_embed_channel"] for name in self.model_names],
-            axis=0,
-        )
-
+    def _save_npz(self, reps: Dict[str, Dict[str, np.ndarray]]):
         np.savez_compressed(
             self.save_dir / "fim_representations.npz",
             model_names=np.array(self.model_names),
-            attention_projection_names=np.array(self.attention_projection_names),
-            attention_projection_labels=np.array(self.attention_projection_labels),
-            fim_by_transformer_block=fim_by_transformer_block,
-            fim_by_attention_block_head_projection=(
-                fim_by_attention_block_head_projection
-            ),
-            fim_by_mlp_block=fim_by_mlp_block,
-            fim_by_patch_embedding_channel=fim_by_patch_embedding_channel,
+            group_names=np.array(self.group_names),
+            block_path_labels=np.array(self.labels["block_path"]),
+            attention_circuit_labels=np.array(self.labels["attention_circuit"]),
+            mlp_memory_labels=np.array(self.labels["mlp_memory"]),
+            residual_io_labels=np.array(self.labels["residual_io"]),
+            **{k: self._stack(reps, k) for k in self.group_names},
+        )
+
+    def _save_summary(self, reps, summaries):
+        self._save_json(
+            {
+                "estimator": "monte_carlo_diagonal_fisher",
+                "groups": self.group_names,
+                "labels": self.labels,
+                "plot_normalizations": self.plot_norms,
+                "plot_norm": self.plot_norm,
+                "plot_percentile": self.plot_percentile,
+                "saved_arrays": {
+                    k: list(self._stack(reps, k).shape) for k in self.group_names
+                },
+                "models": summaries,
+            },
+            "fim_summary.json",
         )
 
     def compute(
@@ -554,11 +465,10 @@ class MonteCarloFIMEstimator:
         save: bool = True,
         plot: bool = True,
     ):
-        all_reps = {}
-        summaries = []
+        reps, summaries = {}, []
 
         for model, model_name in zip(self.models, self.model_names):
-            reps, summary = self._compute_one_model(
+            model_reps, summary = self._compute_one_model(
                 model=model,
                 loader=loader,
                 device=device,
@@ -566,42 +476,14 @@ class MonteCarloFIMEstimator:
                 max_batches=max_batches,
                 mc_samples=mc_samples,
             )
-
-            all_reps[model_name] = reps
+            reps[model_name] = model_reps
             summaries.append(summary)
 
         if save:
-            self._save_npz(all_reps)
-            self._save_json(
-                {
-                    "estimator": "monte_carlo_diagonal_fisher",
-                    "plot_normalizations": self.plot_norm_types,
-                    "plot_norm": self.plot_norm,
-                    "plot_percentile": self.plot_percentile,
-                    "plot_dirs": {
-                        norm_type: str(Path("plots") / norm_type)
-                        for norm_type in self.plot_norm_types
-                    },
-                    "backbone_param_groups": self.group_names,
-                    "attention_projection_names": self.attention_projection_names,
-                    "attention_projection_labels": self.attention_projection_labels,
-                    "saved_arrays": {
-                        "fim_by_transformer_block": ("[n_models, n_blocks]"),
-                        "fim_by_attention_block_head_projection": (
-                            "[n_models, n_blocks, n_heads, 4] "
-                            "where the last axis is query/key/value/output"
-                        ),
-                        "fim_by_mlp_block": ("[n_models, n_blocks]"),
-                        "fim_by_patch_embedding_channel": (
-                            "[n_models, n_patch_embedding_channels]"
-                        ),
-                    },
-                    "models": summaries,
-                },
-                "fim_summary.json",
-            )
+            self._save_npz(reps)
+            self._save_summary(reps, summaries)
 
         if plot:
-            self._plot_all(all_reps)
+            self._plot_all(reps)
 
-        return all_reps
+        return reps

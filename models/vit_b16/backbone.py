@@ -122,213 +122,175 @@ class ViTB16Backbone(nn.Module):
             "patch_tokens": encoded[:, 1:],  # [B, 196, 768]
         }
 
-    def get_param_group(self, name: str):
-        """
-        Return parameter group specification for FIM aggregation.
+    @staticmethod
+    def _g2(p):
+        if p is None:
+            return None
+        return torch.zeros_like(p) if p.grad is None else p.grad.detach().square()
 
-        Exact supported names:
-          - "block"
-          - "attention_qkvo"
-          - "mlp_layer"
-          - "patch_embed_channel"
-        """
-        if name == "block":
-            return self._get_block_param_group()
+    @staticmethod
+    def _mean(*xs):
+        xs = [x for x in xs if x is not None]
+        return sum(x.sum() for x in xs) / sum(x.numel() for x in xs)
 
-        if name == "attention_qkvo":
-            return self._get_attention_qkvo_param_group()
-
-        if name == "mlp_layer":
-            return self._get_mlp_layer_param_group()
-
-        if name == "patch_embed_channel":
-            return self._get_patch_embed_channel_param_group()
-
-        raise ValueError(
-            f"Unknown param group: {name}. "
-            "Expected exactly one of: "
-            "'block', 'attention_qkvo', 'mlp_layer', 'patch_embed_channel'."
+    @staticmethod
+    def _group_units(x, n_groups=64):
+        # x: [n_blocks, n_units, n_roles]
+        n_groups = min(n_groups, x.shape[1])
+        if x.shape[1] % n_groups == 0:
+            return x.reshape(
+                x.shape[0], n_groups, x.shape[1] // n_groups, x.shape[2]
+            ).mean(2)
+        return torch.stack(
+            [c.mean(1) for c in torch.tensor_split(x, n_groups, dim=1)], 1
         )
 
-    def _get_block_param_group(self):
-        groups = []
+    def _input_fim(self):
+        patch = self.embeddings.patch_embeddings
+        w = self._g2(patch.weight)
 
-        for block_idx, block in enumerate(self.blocks):
-            prefix = f"vit.transformer.encoder.layer.{block_idx}"
+        patch_num = w.flatten(1).sum(1)
+        patch_den = w[0].numel()
 
-            items = []
-            for param_name, param in block.named_parameters(
-                prefix=prefix,
-                recurse=True,
-            ):
-                items.append(
-                    {
-                        "name": param_name,
-                        "param": param,
-                        "index": None,
-                    }
-                )
+        if patch.bias is not None:
+            patch_num = patch_num + self._g2(patch.bias)
+            patch_den += 1
 
-            groups.append(
-                {
-                    "name": f"block_{block_idx}",
-                    "index": (block_idx,),
-                    "items": items,
-                }
-            )
+        pos = self._g2(self.embeddings.position_embeddings)
+        pos = pos[:, 1 : 1 + self.num_patches].mean((0, 2))
 
-        return {
-            "name": "block",
-            "shape": (len(self.blocks),),
-            "groups": groups,
-        }
+        return patch_num / patch_den, pos.reshape(self.grid_size, self.grid_size)
 
-    def _get_attention_qkvo_param_group(self):
-        groups = []
+    def _block_fim(self, block):
+        attn, ffn = block.attn, block.ffn
+        H, Dh = attn.num_attention_heads, attn.attention_head_size
+        D, M = self.embed_dim, ffn.fc1.weight.shape[0]
 
-        role_names = ["query", "key", "value", "out"]
+        qw, kw, vw, ow = [
+            self._g2(m.weight) for m in [attn.query, attn.key, attn.value, attn.out]
+        ]
+        qb, kb, vb, ob = [
+            self._g2(m.bias) if m.bias is not None else None
+            for m in [attn.query, attn.key, attn.value, attn.out]
+        ]
+        fc1w, fc2w = self._g2(ffn.fc1.weight), self._g2(ffn.fc2.weight)
+        fc1b = self._g2(ffn.fc1.bias) if ffn.fc1.bias is not None else None
+        fc2b = self._g2(ffn.fc2.bias) if ffn.fc2.bias is not None else None
 
-        for block_idx, block in enumerate(self.blocks):
-            attn = block.attn
-            n_heads = attn.num_attention_heads
-            head_dim = attn.attention_head_size
+        q = qw.reshape(H, Dh, D)
+        k = kw.reshape(H, Dh, D)
+        v = vw.reshape(H, Dh, D)
+        o = ow.t().reshape(H, Dh, D)
 
-            prefix = f"vit.transformer.encoder.layer.{block_idx}.attn"
+        qk_num, qk_den = q.sum(-1) + k.sum(-1), 2 * D
+        if qb is not None:
+            qk_num, qk_den = qk_num + qb.reshape(H, Dh), qk_den + 1
+        if kb is not None:
+            qk_num, qk_den = qk_num + kb.reshape(H, Dh), qk_den + 1
 
-            for head_idx in range(n_heads):
-                start = head_idx * head_dim
-                end = (head_idx + 1) * head_dim
+        ov_num, ov_den = v.sum(-1) + o.sum(-1), 2 * D
+        if vb is not None:
+            ov_num, ov_den = ov_num + vb.reshape(H, Dh), ov_den + 1
 
-                row_slice = slice(start, end)
-                col_slice = slice(start, end)
+        attention_circuit_dim = torch.stack([qk_num / qk_den, ov_num / ov_den], 1)
 
-                groups.append(
-                    {
-                        "name": f"attention_q_{block_idx}_{head_idx}",
-                        "index": (block_idx, head_idx, 0),
-                        "items": [
-                            {
-                                "name": f"{prefix}.query.weight",
-                                "param": attn.query.weight,
-                                "index": (row_slice, slice(None)),
-                            }
-                        ],
-                    }
-                )
+        mlp_key_num, mlp_key_den = fc1w.sum(1), D
+        if fc1b is not None:
+            mlp_key_num, mlp_key_den = mlp_key_num + fc1b, mlp_key_den + 1
 
-                groups.append(
-                    {
-                        "name": f"attention_k_{block_idx}_{head_idx}",
-                        "index": (block_idx, head_idx, 1),
-                        "items": [
-                            {
-                                "name": f"{prefix}.key.weight",
-                                "param": attn.key.weight,
-                                "index": (row_slice, slice(None)),
-                            }
-                        ],
-                    }
-                )
+        mlp_memory_unit = torch.stack([mlp_key_num / mlp_key_den, fc2w.mean(0)], -1)
 
-                groups.append(
-                    {
-                        "name": f"attention_v_{block_idx}_{head_idx}",
-                        "index": (block_idx, head_idx, 2),
-                        "items": [
-                            {
-                                "name": f"{prefix}.value.weight",
-                                "param": attn.value.weight,
-                                "index": (row_slice, slice(None)),
-                            }
-                        ],
-                    }
-                )
+        read = (qw.sum(0) + kw.sum(0) + vw.sum(0) + fc1w.sum(0)) / (3 * D + M)
 
-                groups.append(
-                    {
-                        "name": f"attention_o_{block_idx}_{head_idx}",
-                        "index": (block_idx, head_idx, 3),
-                        "items": [
-                            {
-                                "name": f"{prefix}.out.weight",
-                                "param": attn.out.weight,
-                                "index": (slice(None), col_slice),
-                            }
-                        ],
-                    }
-                )
+        write_num, write_den = ow.sum(1) + fc2w.sum(1), D + M
+        if ob is not None:
+            write_num, write_den = write_num + ob, write_den + 1
+        if fc2b is not None:
+            write_num, write_den = write_num + fc2b, write_den + 1
 
-        n_blocks = len(self.blocks)
-        n_heads = self.blocks[0].attn.num_attention_heads
+        residual_io_channel = torch.stack([read, write_num / write_den])
 
-        return {
-            "name": "attention_qkvo",
-            "shape": (n_blocks, n_heads, len(role_names)),
-            "roles": role_names,
-            "groups": groups,
-        }
+        block_path = torch.stack(
+            [
+                self._mean(
+                    self._g2(block.attention_norm.weight),
+                    self._g2(block.attention_norm.bias),
+                ),
+                self._mean(qw, qb, kw, kb),
+                self._mean(vw, vb, ow, ob),
+                self._mean(
+                    self._g2(block.ffn_norm.weight), self._g2(block.ffn_norm.bias)
+                ),
+                self._mean(fc1w, fc1b),
+                self._mean(fc2w, fc2b),
+            ]
+        )
 
-    def _get_mlp_layer_param_group(self):
-        groups = []
+        return block_path, attention_circuit_dim, mlp_memory_unit, residual_io_channel
 
-        for block_idx, block in enumerate(self.blocks):
-            prefix = f"vit.transformer.encoder.layer.{block_idx}.ffn"
+    @torch.no_grad()
+    def aggregate_fim_grads(self, n_mlp_groups: int = 64):
+        """
+        Returned FIM groups:
 
-            groups.append(
-                {
-                    "name": f"mlp_layer_{block_idx}",
-                    "index": (block_idx,),
-                    "items": [
-                        {
-                            "name": f"{prefix}.fc1.weight",
-                            "param": block.ffn.fc1.weight,
-                            "index": None,
-                        },
-                        {
-                            "name": f"{prefix}.fc2.weight",
-                            "param": block.ffn.fc2.weight,
-                            "index": None,
-                        },
-                    ],
-                }
-            )
+        input_patch_channel: [D]
+            FIM per patch-embedding output channel.
+            For ViT-B/16: [768].
+
+        input_pos_grid: [G, G]
+            FIM per learned patch positional embedding, arranged as the image patch grid.
+            For 224x224 ViT-B/16 with 16x16 patches: [14, 14].
+
+        block_path: [B, 6]
+            FIM per transformer block and computational path.
+            Path axis: [LN1, QK, OV, LN2, MLP key, MLP value].
+            For ViT-B/16: [12, 6].
+
+        attention_circuit_head: [B, H, 2]
+            FIM per block, attention head, and attention circuit.
+            Circuit axis: [QK, OV].
+            For ViT-B/16: [12, 12, 2].
+
+        mlp_memory_group: [B, K, 2]
+            FIM per block, grouped MLP hidden units, and MLP memory role.
+            Role axis: [key, value].
+            K defaults to 64 groups.
+            For ViT-B/16: [12, 64, 2].
+
+        residual_io_channel: [B, 2, D]
+            FIM per block, residual-stream role, and residual channel.
+            Role axis: [read, write].
+            For ViT-B/16: [12, 2, 768].
+
+        attention_circuit_dim: [B, H, 2, Dh]
+            Fine-grained attention FIM per block, head, circuit, and head dimension.
+            Circuit axis: [QK, OV].
+            For ViT-B/16: [12, 12, 2, 64].
+
+        mlp_memory_unit: [B, M, 2]
+            Fine-grained MLP FIM per block, MLP hidden unit, and memory role.
+            Role axis: [key, value].
+            For ViT-B/16: [12, 3072, 2].
+        """
+
+        input_patch_channel, input_pos_grid = self._input_fim()
+
+        block_path, attn_dim, mlp_unit, res_io = zip(
+            *(self._block_fim(block) for block in self.blocks)
+        )
+
+        block_path = torch.stack(block_path)
+        attn_dim = torch.stack(attn_dim)
+        mlp_unit = torch.stack(mlp_unit)
+        res_io = torch.stack(res_io)
 
         return {
-            "name": "mlp_layer",
-            "shape": (len(self.blocks),),
-            "groups": groups,
-        }
-
-    def _get_patch_embed_channel_param_group(self):
-        groups = []
-
-        patch_embed = self.embeddings.patch_embeddings
-        n_channels = patch_embed.weight.shape[0]
-
-        prefix = "vit.transformer.embeddings.patch_embeddings"
-
-        for channel_idx in range(n_channels):
-            groups.append(
-                {
-                    "name": f"patch_embed_channel_{channel_idx}",
-                    "index": (channel_idx,),
-                    "items": [
-                        {
-                            "name": f"{prefix}.weight",
-                            "param": patch_embed.weight,
-                            "index": (
-                                channel_idx,
-                                slice(None),
-                                slice(None),
-                                slice(None),
-                            ),
-                        }
-                    ],
-                }
-            )
-
-        return {
-            "name": "patch_embed_channel",
-            "shape": (n_channels,),
-            "groups": groups,
+            "input_patch_channel": input_patch_channel,
+            "input_pos_grid": input_pos_grid,
+            "block_path": block_path,
+            "attention_circuit_head": attn_dim.mean(-1),
+            "mlp_memory_group": self._group_units(mlp_unit, n_mlp_groups),
+            "residual_io_channel": res_io,
+            "attention_circuit_dim": attn_dim,
+            "mlp_memory_unit": mlp_unit,
         }

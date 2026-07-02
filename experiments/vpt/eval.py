@@ -46,44 +46,44 @@ def _load_best_tuning_config(
     best_configs = []
 
     for _, prompt_mode_results in tuning_results.items():
-        best_entry = None
+        for _, prompt_length_results in prompt_mode_results.items():
+            best_entry = None
 
-        for prompt_length_results in prompt_mode_results.values():
             for entry in prompt_length_results:
                 if best_entry is None or entry["val_acc"] > best_entry["val_acc"]:
                     best_entry = entry
 
-        if best_entry is None:
-            continue
+            if best_entry is None:
+                continue
 
-        save_name = best_entry["save_name"]
-        run_dir = tuning_dir / f"{save_name}_{_TUNING_SEED}"
+            save_name = best_entry["save_name"]
+            run_dir = tuning_dir / f"{save_name}_{_TUNING_SEED}"
 
-        config_path = run_dir / "config.json"
-        train_summary_path = run_dir / "train_summary.json"
+            config_path = run_dir / "config.json"
+            train_summary_path = run_dir / "train_summary.json"
 
-        config = _load_json(config_path)
-        train_summary = _load_json(train_summary_path)
+            config = _load_json(config_path)
+            train_summary = _load_json(train_summary_path)
 
-        best_configs.append(
-            {
-                "save_name": save_name,
-                "best_val_acc": best_entry["val_acc"],
-                # from train_summary.json
-                "best_epoch": _get_required(train_summary, "best_epoch"),
-                # from config.json
-                "batch_size": _get_required(config, "batch_size"),
-                "gpu_batch_size": _get_required(config, "gpu_batch_size"),
-                "start_lr": _get_required(config, "start_lr"),
-                "final_lr": _get_required(config, "final_lr"),
-                "warmup_epochs": _get_required(config, "warmup_epochs"),
-                "prompt_mode": _get_required(config, "prompt_mode"),
-                "prompt_length": _get_required(config, "prompt_length"),
-                "ref_lr": _get_required(config, "ref_lr"),
-                "ref_wd": _get_required(config, "ref_wd"),
-                "final_wd": _get_required(config, "final_wd"),
-            }
-        )
+            best_configs.append(
+                {
+                    "save_name": save_name,
+                    "best_val_acc": best_entry["val_acc"],
+                    # from train_summary.json
+                    "best_epoch": _get_required(train_summary, "best_epoch"),
+                    # from config.json
+                    "batch_size": _get_required(config, "batch_size"),
+                    "gpu_batch_size": _get_required(config, "gpu_batch_size"),
+                    "start_lr": _get_required(config, "start_lr"),
+                    "final_lr": _get_required(config, "final_lr"),
+                    "warmup_epochs": _get_required(config, "warmup_epochs"),
+                    "prompt_mode": _get_required(config, "prompt_mode"),
+                    "prompt_length": _get_required(config, "prompt_length"),
+                    "ref_lr": _get_required(config, "ref_lr"),
+                    "ref_wd": _get_required(config, "ref_wd"),
+                    "final_wd": _get_required(config, "final_wd"),
+                }
+            )
 
     if len(best_configs) == 0:
         raise ValueError(f"No valid tuning entries found in: {tuning_json_path}")
@@ -244,6 +244,7 @@ def build_results(
                 "n_seeds": stats["n"],
                 "seed_results": seed_results,
                 "save_name": item["save_name"],
+                "best_val_acc": item["best_val_acc"],
                 "lr": item["ref_lr"],
                 "wd": item["ref_wd"],
                 "prompt_mode": item["prompt_mode"],
@@ -280,9 +281,18 @@ def aggregate_results(
 
         dataset_results = _load_json(json_path)
 
+        best_by_prompt_mode = {}
+
         for entry in dataset_results:
             row_name = entry["prompt_mode"]
 
+            if (
+                row_name not in best_by_prompt_mode
+                or entry["best_val_acc"] > best_by_prompt_mode[row_name]["best_val_acc"]
+            ):
+                best_by_prompt_mode[row_name] = entry
+
+        for row_name, entry in best_by_prompt_mode.items():
             if row_name not in rows:
                 rows[row_name] = {}
 

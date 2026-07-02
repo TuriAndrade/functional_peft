@@ -7,9 +7,8 @@ scipy
 numpy
 pandas
 matplotlib
-plotly
 python-dotenv
 pytest
 ml-collections
 huggingface_hub
-umap-learn
+scikit-learn

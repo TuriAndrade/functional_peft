@@ -1,28 +1,39 @@
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Tuple
 
 _SUFFIX = "analyze_task_distances"
 _DISTANCE_ANALYSIS_DIR = "distance_analysis"
 
 _REP_TYPE_RUNS = [
-    ("fim_block",),
-    ("fim_block_attn",),
-    ("fim_block_attn_q",),
-    ("fim_block_attn_k",),
-    ("fim_block_attn_v",),
-    ("fim_block_attn_o",),
-    ("fim_block_mlp",),
-    ("fim_patch_embd",),
-    ("fim_block_attn", "fim_block_mlp"),
-    ("fim_block_attn_q", "fim_block_attn_k"),
-    ("fim_block_attn_v", "fim_block_attn_o"),
-    ("fim_block", "fim_patch_embd"),
-    ("fim_block_attn", "fim_block_mlp", "fim_patch_embd"),
+    ("input_patch_channel", ("input_patch_channel",)),
+    ("input_pos_grid", ("input_pos_grid",)),
+    ("block_path", ("block_path",)),
+    ("attention_circuit_head", ("attention_circuit_head",)),
+    ("mlp_memory_group", ("mlp_memory_group",)),
+    ("residual_io_channel", ("residual_io_channel",)),
+    ("attention_circuit_dim", ("attention_circuit_dim",)),
+    ("mlp_memory_unit", ("mlp_memory_unit",)),
+    ("input_interface", ("input_patch_channel", "input_pos_grid")),
+    ("coarse_structure", ("input_patch_channel", "input_pos_grid", "block_path")),
+    ("transformer_circuits", ("attention_circuit_head", "mlp_memory_group")),
+    ("attention_residual", ("attention_circuit_head", "residual_io_channel")),
+    ("mlp_residual", ("mlp_memory_group", "residual_io_channel")),
+    (
+        "internal_structure",
+        ("attention_circuit_head", "mlp_memory_group", "residual_io_channel"),
+    ),
+    (
+        "main_head_level",
+        (
+            "input_patch_channel",
+            "input_pos_grid",
+            "attention_circuit_head",
+            "mlp_memory_group",
+            "residual_io_channel",
+        ),
+    ),
+    ("localization_detail", ("attention_circuit_dim", "mlp_memory_unit")),
 ]
-
-
-def _save_name(rep_types: Sequence[str]) -> str:
-    return "__".join(rep_type.removeprefix("fim_") for rep_type in rep_types)
 
 
 def build_args(representations_path: str) -> Tuple[List[Dict], str, str]:
@@ -32,9 +43,9 @@ def build_args(representations_path: str) -> Tuple[List[Dict], str, str]:
         {
             "representations_path": str(representations_path),
             "rep_types": list(rep_types),
-            "save_name": _save_name(rep_types),
+            "save_name": save_name,
         }
-        for rep_types in _REP_TYPE_RUNS
+        for save_name, rep_types in _REP_TYPE_RUNS
     ]
 
     output_path = str(representations_path / _DISTANCE_ANALYSIS_DIR / f"{_SUFFIX}.txt")

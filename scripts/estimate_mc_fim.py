@@ -26,6 +26,13 @@ def _build_parser():
     )
 
     parser.add_argument(
+        "--load-model-names",
+        type=json.loads,
+        default=None,
+        help="JSON array with model names. If None, default names are used.",
+    )
+
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=1,
@@ -121,7 +128,7 @@ def _get_model_name(config: dict):
     freeze_backbone = bool(config["freeze_backbone"])
 
     if prompt_length > 0:
-        return f"{backbone_name}_{prompt_mode}"
+        return f"{backbone_name}_{prompt_mode}_{prompt_length}"
 
     if freeze_backbone:
         return f"{backbone_name}_linear_probe"
@@ -143,7 +150,9 @@ def _check_same_dataset(configs):
     return first_dataset
 
 
-def _load_model_from_dir(model_dir: Path, img_size: int, n_classes: int):
+def _load_model_from_dir(
+    model_dir: Path, img_size: int, n_classes: int, model_name=None
+):
     config_path = model_dir / "config.json"
     ckpt_path = model_dir / "model.pt"
 
@@ -166,28 +175,30 @@ def _load_model_from_dir(model_dir: Path, img_size: int, n_classes: int):
     state_dict = _load_state_dict(ckpt_path)
     model.load_state_dict(state_dict, strict=False)
 
-    model_name = _get_model_name(config)
+    if model_name is None:
+        model_name = _get_model_name(config)
 
     return model, model_name, config
 
 
-def _load_all_models(model_dirs, img_size: int, n_classes: int):
+def _load_all_models(model_dirs, img_size: int, n_classes: int, model_names=None):
     models = []
-    model_names = []
+    loaded_model_names = []
     configs = []
 
-    for model_dir in model_dirs:
+    for i, model_dir in enumerate(model_dirs):
         model, model_name, config = _load_model_from_dir(
             model_dir=model_dir,
             img_size=img_size,
             n_classes=n_classes,
+            model_name=None if model_names is None else model_names[i],
         )
 
         models.append(model)
-        model_names.append(model_name)
+        loaded_model_names.append(model_name)
         configs.append(config)
 
-    return models, model_names, configs
+    return models, loaded_model_names, configs
 
 
 def main():
@@ -200,6 +211,14 @@ def main():
 
     if len(model_dirs) == 0:
         raise ValueError("--load-model-paths must contain at least one path.")
+
+    if args.load_model_names is not None and len(args.load_model_names) != len(
+        model_dirs
+    ):
+        raise ValueError(
+            "--load-model-names must have the same length as --load-model-paths. "
+            f"Found {len(args.load_model_names)} names and {len(model_dirs)} paths."
+        )
 
     # ----- Read configs first -----
     configs = []
@@ -235,6 +254,7 @@ def main():
         model_dirs=model_dirs,
         img_size=img_size,
         n_classes=n_classes,
+        model_names=args.load_model_names,
     )
 
     # ----- Save dir -----

@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-_SUFFIX = "compute_fim"
+_SUFFIX = "estimate_mc_fim"
 _EVAL_SUFFIX = "eval"
 _TOP1_ACC_DIR = "top1_acc_ft"
 _RUN_SEED = 0

@@ -31,8 +31,8 @@ from .full_ft.eval import (
     aggregate_results as full_ft_eval_ar,
 )
 
-from .task_characterization.compute_fim import (
-    build_args as task_characterization_compute_fim_ba,
+from .task_characterization.estimate_mc_fim import (
+    build_args as task_characterization_estimate_mc_fim_ba,
 )
 
 from .task_characterization.analyze_task_distances import (
@@ -50,7 +50,7 @@ build_args = {
     "linear_probe_eval": linear_probe_eval_ba,
     "full_ft_tuning": full_ft_tuning_ba,
     "full_ft_eval": full_ft_eval_ba,
-    "task_characterization_compute_fim": task_characterization_compute_fim_ba,
+    "task_characterization_estimate_mc_fim": task_characterization_estimate_mc_fim_ba,
     "task_characterization_analyze_task_distances": (
         task_characterization_analyze_task_distances_ba
     ),
