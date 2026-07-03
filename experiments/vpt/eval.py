@@ -208,23 +208,22 @@ def build_results(
     backbone_name: str,
     confidence: float = 0.95,
 ) -> None:
-    args, output_path, _ = build_args(
-        dataset_name=dataset_name,
-        backbone_name=backbone_name,
+    base_dir = (
+        Path(__file__).resolve().parent / "top1_acc_ft" / backbone_name / dataset_name
     )
+    suffix = "eval"
+    save_dir = base_dir / suffix
 
-    output_path = Path(output_path)
-    parent_dir = output_path.parent
-    suffix = output_path.stem
+    configs = _load_best_tuning_config(base_dir=base_dir)
 
     results = []
 
-    for item in args:
+    for config in configs:
         test_acc_values = []
         seed_results = []
 
-        for seed in item["run_seeds"]:
-            run_dir = Path(item["save_dir"]) / f"{item['save_name']}_{seed}"
+        for seed in config["run_seeds"]:
+            run_dir = save_dir / f"{config['save_name']}_{seed}"
             test_path = run_dir / "test_acc_eval.json"
 
             if not test_path.exists():
@@ -235,7 +234,6 @@ def build_results(
             test_acc = test_data["accuracy"]["top1"]
 
             test_acc_values.append(test_acc)
-
             seed_results.append(
                 {
                     "seed": seed,
@@ -245,7 +243,7 @@ def build_results(
             )
 
         if len(test_acc_values) == 0:
-            print(f"Skipping config with no test results: {item['save_name']}")
+            print(f"Skipping config with no test results: {config['save_name']}")
             continue
 
         stats = _compute_mean_std_ci(
@@ -263,16 +261,16 @@ def build_results(
                 "confidence": stats["confidence"],
                 "n_seeds": stats["n"],
                 "seed_results": seed_results,
-                "save_name": item["save_name"],
-                "best_val_acc": item["best_val_acc"],
-                "lr": item["ref_lr"],
-                "wd": item["ref_wd"],
-                "prompt_mode": item["prompt_mode"],
-                "prompt_length": item["prompt_length"],
+                "save_name": config["save_name"],
+                "best_val_acc": config["best_val_acc"],
+                "lr": config["ref_lr"],
+                "wd": config["ref_wd"],
+                "prompt_mode": config["prompt_mode"],
+                "prompt_length": config["prompt_length"],
             }
         )
 
-    json_path = parent_dir / f"{suffix}.json"
+    json_path = base_dir / f"{suffix}.json"
 
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
