@@ -2,8 +2,10 @@ import json
 from pathlib import Path
 from typing import List, Dict, Tuple
 import math
+
 from scipy.stats import t as student_t
 import pandas as pd
+
 from .tuning import _TUNING_SEED
 
 _EVAL_SEEDS = [0, 1, 2]
@@ -13,7 +15,6 @@ _COMMON_ARGS = {
     "save_ckpt": True,
     "save_ckpt_all_seeds": False,
     "early_stopping": False,
-    "run_seeds": _EVAL_SEEDS,
     "eval_on_test": True,
     "bootstrap": False,
 }
@@ -33,9 +34,17 @@ def _get_required(config: Dict, key: str):
     return config[key]
 
 
-def _load_best_tuning_config(
-    base_dir: Path,
-) -> List[Dict]:
+def _make_eval_save_name(config: Dict, prefix: str = "") -> str:
+    return (
+        f"{prefix}"
+        f"pm-{config['prompt_mode']}"
+        f"_pl-{config['prompt_length']}"
+        f"_lr-{config['ref_lr']}"
+        f"_wd-{config['ref_wd']}"
+    )
+
+
+def _load_best_tuning_config(base_dir: Path) -> List[Dict]:
     tuning_suffix = "tuning"
 
     tuning_json_path = base_dir / f"{tuning_suffix}.json"
@@ -56,22 +65,16 @@ def _load_best_tuning_config(
             if best_entry is None:
                 continue
 
-            save_name = best_entry["save_name"]
-            run_dir = tuning_dir / f"{save_name}_{_TUNING_SEED}"
+            tuning_save_name = best_entry["save_name"]
+            run_dir = tuning_dir / f"{tuning_save_name}_{_TUNING_SEED}"
 
-            config_path = run_dir / "config.json"
-            train_summary_path = run_dir / "train_summary.json"
-
-            config = _load_json(config_path)
-            train_summary = _load_json(train_summary_path)
+            config = _load_json(run_dir / "config.json")
+            train_summary = _load_json(run_dir / "train_summary.json")
 
             best_configs.append(
                 {
-                    "save_name": save_name,
                     "best_val_acc": best_entry["val_acc"],
-                    # from train_summary.json
                     "best_epoch": _get_required(train_summary, "best_epoch"),
-                    # from config.json
                     "batch_size": _get_required(config, "batch_size"),
                     "gpu_batch_size": _get_required(config, "gpu_batch_size"),
                     "start_lr": _get_required(config, "start_lr"),
@@ -88,6 +91,31 @@ def _load_best_tuning_config(
     if len(best_configs) == 0:
         raise ValueError(f"No valid tuning entries found in: {tuning_json_path}")
 
+    best_by_prompt_mode = {}
+
+    for config in best_configs:
+        prompt_mode = config["prompt_mode"]
+
+        if (
+            prompt_mode not in best_by_prompt_mode
+            or config["best_val_acc"] > best_by_prompt_mode[prompt_mode]["best_val_acc"]
+        ):
+            best_by_prompt_mode[prompt_mode] = config
+
+    for config in best_configs:
+        is_best_prompt_mode_config = (
+            config is best_by_prompt_mode[config["prompt_mode"]]
+        )
+
+        config["save_name"] = _make_eval_save_name(
+            config,
+            prefix="best_" if is_best_prompt_mode_config else "",
+        )
+
+        config["run_seeds"] = (
+            list(_EVAL_SEEDS) if is_best_prompt_mode_config else [_EVAL_SEEDS[0]]
+        )
+
     return best_configs
 
 
@@ -95,50 +123,42 @@ def build_args(
     dataset_name: str,
     backbone_name: str,
 ) -> Tuple[List[Dict], str, str]:
-    _BASE_DIR = (
+    base_dir = (
         Path(__file__).resolve().parent / "top1_acc_ft" / backbone_name / dataset_name
     )
-    _SUFFIX = "eval"
+    suffix = "eval"
 
-    best_configs = _load_best_tuning_config(
-        base_dir=_BASE_DIR,
-    )
+    best_configs = _load_best_tuning_config(base_dir=base_dir)
 
-    ARGS = []
+    args = []
 
-    for best_config in best_configs:
-        ARGS.append(
+    for config in best_configs:
+        args.append(
             {
                 **_COMMON_ARGS,
                 "dataset_name": dataset_name,
                 "backbone_name": backbone_name,
-                "save_dir": str(_BASE_DIR / _SUFFIX),
-                # copied from the selected tuning config
-                "batch_size": best_config["batch_size"],
-                "gpu_batch_size": best_config["gpu_batch_size"],
-                "start_lr": best_config["start_lr"],
-                "final_lr": best_config["final_lr"],
-                "warmup_epochs": best_config["warmup_epochs"],
-                # eval training length: best epoch found during tuning
-                "epochs": best_config["best_epoch"],
-                "save_name": (
-                    f"pm-{best_config['prompt_mode']}"
-                    f"_pl-{best_config['prompt_length']}"
-                    f"_lr-{best_config['ref_lr']}"
-                    f"_wd-{best_config['ref_wd']}"
-                ),
-                "prompt_mode": best_config["prompt_mode"],
-                "prompt_length": best_config["prompt_length"],
-                "ref_lr": best_config["ref_lr"],
-                "ref_wd": best_config["ref_wd"],
-                "final_wd": best_config["final_wd"],
+                "save_dir": str(base_dir / suffix),
+                "run_seeds": config["run_seeds"],
+                "batch_size": config["batch_size"],
+                "gpu_batch_size": config["gpu_batch_size"],
+                "start_lr": config["start_lr"],
+                "final_lr": config["final_lr"],
+                "warmup_epochs": config["warmup_epochs"],
+                "epochs": config["best_epoch"],
+                "save_name": config["save_name"],
+                "prompt_mode": config["prompt_mode"],
+                "prompt_length": config["prompt_length"],
+                "ref_lr": config["ref_lr"],
+                "ref_wd": config["ref_wd"],
+                "final_wd": config["final_wd"],
             }
         )
 
-    OUTPUT_PATH = str(_BASE_DIR / f"{_SUFFIX}.txt")
-    EXE_PREFIX = "python vpt_train_exe.py"
+    output_path = str(base_dir / f"{suffix}.txt")
+    exe_prefix = "python vpt_train_exe.py"
 
-    return ARGS, OUTPUT_PATH, EXE_PREFIX
+    return args, output_path, exe_prefix
 
 
 def _compute_mean_std_ci(values: List[float], confidence: float = 0.95) -> Dict:
@@ -260,9 +280,17 @@ def build_results(
     print(f"Saved JSON results to: {json_path}")
 
 
-def aggregate_results(
-    backbone_name: str,
-) -> None:
+def _format_result(entry: Dict) -> str:
+    if entry["test_acc_ci_low"] is None or entry["test_acc_ci_high"] is None:
+        return f"{entry['test_acc']:.4f}"
+
+    return (
+        f"{entry['test_acc']:.4f} "
+        f"[{entry['test_acc_ci_low']:.4f}, {entry['test_acc_ci_high']:.4f}]"
+    )
+
+
+def aggregate_results(backbone_name: str) -> None:
     results_dir = Path(__file__).resolve().parent / "top1_acc_ft" / backbone_name
     suffix = "eval"
 
@@ -281,25 +309,16 @@ def aggregate_results(
 
         dataset_results = _load_json(json_path)
 
-        best_by_prompt_mode = {}
-
         for entry in dataset_results:
+            if not entry["save_name"].startswith("best_"):
+                continue
+
             row_name = entry["prompt_mode"]
 
-            if (
-                row_name not in best_by_prompt_mode
-                or entry["best_val_acc"] > best_by_prompt_mode[row_name]["best_val_acc"]
-            ):
-                best_by_prompt_mode[row_name] = entry
-
-        for row_name, entry in best_by_prompt_mode.items():
             if row_name not in rows:
                 rows[row_name] = {}
 
-            rows[row_name][dataset_name] = (
-                f"{entry['test_acc']:.4f} "
-                f"[{entry['test_acc_ci_low']:.4f}, {entry['test_acc_ci_high']:.4f}]"
-            )
+            rows[row_name][dataset_name] = _format_result(entry)
 
     df = pd.DataFrame.from_dict(rows, orient="index")
     df = df.reindex(sorted(df.columns), axis=1)
