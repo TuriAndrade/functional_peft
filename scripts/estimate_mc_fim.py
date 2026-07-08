@@ -14,8 +14,11 @@ from utils import set_seed, seed_worker, parse_args_json
 def _build_parser():
     parser = argparse.ArgumentParser(description="Monte Carlo FIM estimator.")
 
-    parser.add_argument("--load-model-paths", type=json.loads, default=None)
-    parser.add_argument("--load-model-names", type=json.loads, default=None)
+    parser.add_argument("--load-linear-probe-path", type=str, default=None)
+    parser.add_argument("--load-linear-probe-name", type=str, default=None)
+    parser.add_argument("--load-prompt-model-paths", type=json.loads, default=None)
+    parser.add_argument("--load-prompt-model-names", type=json.loads, default=None)
+
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save-dir", type=str, default="fim_outputs/")
@@ -41,7 +44,6 @@ def _parse_args():
 def _load_json(path: Path):
     if not path.exists():
         raise FileNotFoundError(f"Missing file: {path}")
-
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -69,20 +71,28 @@ def _check_same_dataset(configs):
     return dataset_names[0]
 
 
-def _check_model_args(model_dirs, model_names):
-    if model_dirs is None:
-        raise ValueError("--load-model-paths is required.")
+def _check_model_args(args):
+    if args.load_linear_probe_path is None:
+        raise ValueError("--load-linear-probe-path is required.")
 
-    if model_names is None:
-        raise ValueError("--load-model-names is required.")
+    if args.load_linear_probe_name is None:
+        raise ValueError("--load-linear-probe-name is required.")
 
-    if len(model_dirs) == 0:
-        raise ValueError("--load-model-paths must contain at least one path.")
+    if args.load_prompt_model_paths is None:
+        raise ValueError("--load-prompt-model-paths is required.")
 
-    if len(model_names) != len(model_dirs):
+    if args.load_prompt_model_names is None:
+        raise ValueError("--load-prompt-model-names is required.")
+
+    if len(args.load_prompt_model_paths) == 0:
+        raise ValueError("--load-prompt-model-paths must contain at least one path.")
+
+    if len(args.load_prompt_model_names) != len(args.load_prompt_model_paths):
         raise ValueError(
-            "--load-model-names must have the same length as --load-model-paths. "
-            f"Found {len(model_names)} names and {len(model_dirs)} paths."
+            "--load-prompt-model-names must have the same length as "
+            "--load-prompt-model-paths. "
+            f"Found {len(args.load_prompt_model_names)} names and "
+            f"{len(args.load_prompt_model_paths)} paths."
         )
 
 
@@ -106,12 +116,12 @@ def _load_model(model_dir: Path, img_size: int, n_classes: int):
     return model, config
 
 
-def _load_models(model_dirs, img_size: int, n_classes: int):
+def _load_prompt_models(model_dirs, model_names, img_size: int, n_classes: int):
     models, configs = [], []
 
-    for model_dir in model_dirs:
+    for model_name, model_dir in zip(model_names, model_dirs):
         model, config = _load_model(model_dir, img_size, n_classes)
-        models.append(model)
+        models.append((model_name, model))
         configs.append(config)
 
     return models, configs
@@ -119,11 +129,16 @@ def _load_models(model_dirs, img_size: int, n_classes: int):
 
 def main():
     args = _parse_args()
+    _check_model_args(args)
 
-    _check_model_args(args.load_model_paths, args.load_model_names)
+    linear_probe_dir = Path(args.load_linear_probe_path)
+    prompt_model_dirs = [Path(p) for p in args.load_prompt_model_paths]
 
-    model_dirs = [Path(p) for p in args.load_model_paths]
-    configs = [_load_json(model_dir / "config.json") for model_dir in model_dirs]
+    configs = [_load_json(linear_probe_dir / "config.json")]
+    configs += [
+        _load_json(model_dir / "config.json") for model_dir in prompt_model_dirs
+    ]
+
     dataset_name = _check_same_dataset(configs)
 
     seed = args.seed if args.seed is not None else int(configs[0].get("run_seed", 0))
@@ -138,7 +153,13 @@ def main():
         worker_init_fn=seed_worker,
     )
 
-    models, configs = _load_models(model_dirs, img_size, n_classes)
+    linear_probe_model, _ = _load_model(linear_probe_dir, img_size, n_classes)
+    prompt_models, _ = _load_prompt_models(
+        prompt_model_dirs,
+        args.load_prompt_model_names,
+        img_size,
+        n_classes,
+    )
 
     save_dir = Path(args.save_dir)
     if args.save_name is not None:
@@ -146,8 +167,8 @@ def main():
     save_dir.mkdir(parents=True, exist_ok=True)
 
     estimator = MonteCarloFIMEstimator(
-        models=models,
-        model_names=args.load_model_names,
+        linear_probe=(args.load_linear_probe_name, linear_probe_model),
+        prompt_models=prompt_models,
         save_dir=save_dir,
         plot_norm=args.plot_norm,
         plot_percentile=args.plot_percentile,
@@ -170,14 +191,16 @@ def main():
                 "dataset_name": dataset_name,
                 "img_size": img_size,
                 "n_classes": n_classes,
-                "model_names": args.load_model_names,
-                "model_dirs": [str(p) for p in model_dirs],
+                "linear_probe_name": args.load_linear_probe_name,
+                "linear_probe_dir": str(linear_probe_dir),
+                "prompt_model_names": args.load_prompt_model_names,
+                "prompt_model_dirs": [str(p) for p in prompt_model_dirs],
             },
             f,
             indent=2,
         )
 
-    del fim_ds, fim_loader, models, estimator
+    del fim_ds, fim_loader, linear_probe_model, prompt_models, estimator
 
     gc.collect()
     if torch.cuda.is_available():

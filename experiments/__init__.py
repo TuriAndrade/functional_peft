@@ -35,12 +35,16 @@ from .task_characterization.estimate_mc_fim import (
     build_args as task_characterization_estimate_mc_fim_ba,
 )
 
-from .task_characterization.analyze_task_distances import (
-    build_args as task_characterization_analyze_task_distances_ba,
+from .task_characterization.estimate_task2vec_distances import (
+    build_args as task_characterization_estimate_task2vec_distances_ba,
 )
 
-from .task_characterization.analyze_task_separation import (
-    build_args as task_characterization_analyze_task_separation_ba,
+from .task_characterization.view_task2vec_distances import (
+    build_args as task_characterization_view_task2vec_distances_ba,
+)
+
+from .task_characterization.analyze_task2vec_separation import (
+    build_args as task_characterization_analyze_task2vec_separation_ba,
 )
 
 build_args = {
@@ -51,11 +55,12 @@ build_args = {
     "full_ft_tuning": full_ft_tuning_ba,
     "full_ft_eval": full_ft_eval_ba,
     "task_characterization_estimate_mc_fim": task_characterization_estimate_mc_fim_ba,
-    "task_characterization_analyze_task_distances": (
-        task_characterization_analyze_task_distances_ba
+    "task_characterization_estimate_task2vec_distances": task_characterization_estimate_task2vec_distances_ba,
+    "task_characterization_view_task2vec_distances": (
+        task_characterization_view_task2vec_distances_ba
     ),
-    "task_characterization_analyze_task_separation": (
-        task_characterization_analyze_task_separation_ba
+    "task_characterization_analyze_task2vec_separation": (
+        task_characterization_analyze_task2vec_separation_ba
     ),
 }
 

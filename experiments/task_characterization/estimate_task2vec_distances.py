@@ -1,8 +1,7 @@
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-_SUFFIX = "analyze_task_distances"
-_DISTANCE_ANALYSIS_DIR = "distance_analysis"
+_SUFFIX = "estimate_task2vec_distances"
 
 _REP_TYPE_RUNS = [
     ("input_patch_channel", ("input_patch_channel",)),
@@ -36,19 +35,26 @@ _REP_TYPE_RUNS = [
 ]
 
 
-def build_args(representations_path: str) -> Tuple[List[Dict], str, str]:
+def build_args(
+    representations_path: str,
+    backbone_name: str,
+) -> Tuple[List[Dict], str, str]:
     representations_path = Path(representations_path)
+    save_dir = (
+        Path(__file__).resolve().parent / "task2vec_distance_estimates" / backbone_name
+    )
 
     args = [
         {
             "representations_path": str(representations_path),
             "rep_types": list(rep_types),
+            "save_dir": str(save_dir),
             "save_name": save_name,
         }
         for save_name, rep_types in _REP_TYPE_RUNS
     ]
 
-    output_path = str(representations_path / _DISTANCE_ANALYSIS_DIR / f"{_SUFFIX}.txt")
-    exe_prefix = "python analyze_task_distances_exe.py"
+    output_path = str(save_dir / f"{_SUFFIX}.txt")
+    exe_prefix = "python estimate_task2vec_distances_exe.py"
 
     return args, output_path, exe_prefix

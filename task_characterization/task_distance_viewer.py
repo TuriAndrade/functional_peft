@@ -14,7 +14,7 @@ from scipy.spatial.distance import squareform
 from sklearn.manifold import MDS
 
 
-class TaskDistanceAnalyzer:
+class TaskDistanceViewer:
     def __init__(
         self,
         distance_matrix: np.ndarray,

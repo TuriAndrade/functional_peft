@@ -45,7 +45,7 @@ class ViTB16VPT(nn.Module):
             )
         )
         self.prompt_dropout_layer = nn.Dropout(0.0 if prompt_mode == "shallow" else 0.1)
-        self._init_prompt()
+        self.init_prompt()
 
     def freeze_backbone(self):
         self.backbone.freeze()
@@ -68,7 +68,7 @@ class ViTB16VPT(nn.Module):
     def eval(self):
         return self.train(False)
 
-    def _init_prompt(self):
+    def init_prompt(self):
         if self.prompt_length == 0:
             return
 
@@ -77,7 +77,7 @@ class ViTB16VPT(nn.Module):
         val = math.sqrt(6.0 / float(3 * reduce(mul, patch_size, 1) + prompt_dim))
         nn.init.uniform_(self.prompt.data, -val, val)
 
-    def _get_prompt_tokens(self, batch_size: int, layer_idx: int = 0) -> torch.Tensor:
+    def get_prompt_tokens(self, batch_size: int, layer_idx: int = 0) -> torch.Tensor:
         prompt = self.prompt[layer_idx if self.prompt_mode == "deep" else 0]
         prompt = prompt.unsqueeze(0).expand(batch_size, -1, -1)
         return self.prompt_dropout_layer(prompt)
@@ -99,7 +99,7 @@ class ViTB16VPT(nn.Module):
             return self.backbone.encode_tokens(h)
 
         if self.prompt_mode == "shallow":
-            prompt = self._get_prompt_tokens(batch_size)
+            prompt = self.get_prompt_tokens(batch_size)
             h = torch.cat([h[:, :1], prompt, h[:, 1:]], dim=1)
 
             for blk in self.backbone.blocks:
@@ -109,7 +109,7 @@ class ViTB16VPT(nn.Module):
 
         if self.prompt_mode == "deep":
             for layer_idx, blk in enumerate(self.backbone.blocks):
-                prompt = self._get_prompt_tokens(batch_size, layer_idx)
+                prompt = self.get_prompt_tokens(batch_size, layer_idx)
 
                 if layer_idx == 0:
                     h = torch.cat([h[:, :1], prompt, h[:, 1:]], dim=1)

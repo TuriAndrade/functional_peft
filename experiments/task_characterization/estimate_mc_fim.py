@@ -7,7 +7,9 @@ _EVAL_SUFFIX = "eval"
 _TOP1_ACC_DIR = "top1_acc_ft"
 _RUN_SEED = 0
 
-_EXPERIMENT_NAMES = ("linear_probe", "full_ft", "vpt")
+_LINEAR_PROBE_EXP = "linear_probe"
+_PROMPT_EXP = "vpt"
+_EXPERIMENT_NAMES = (_LINEAR_PROBE_EXP, _PROMPT_EXP)
 
 _COMMON_ARGS = {
     "mc_samples": 20,
@@ -82,13 +84,13 @@ def _validate_run_dir(run_dir: Path, dataset_name: str, backbone_name: str) -> D
 
 
 def _model_name(exp_name: str, backbone_name: str, config: Dict) -> str:
-    if exp_name == "full_ft":
-        return f"{backbone_name}_full_ft"
-
-    if exp_name == "linear_probe":
+    if exp_name == _LINEAR_PROBE_EXP:
         return f"{backbone_name}_linear_probe"
 
-    return f"{backbone_name}_vpt_{config['prompt_mode']}_{config['prompt_length']}"
+    if exp_name == _PROMPT_EXP:
+        return f"{backbone_name}_vpt_{config['prompt_mode']}_{config['prompt_length']}"
+
+    raise ValueError(f"Unexpected experiment: {exp_name}")
 
 
 def _find_eval_runs(
@@ -118,16 +120,32 @@ def _find_eval_runs(
     return runs
 
 
-def _build_load_models(
-    dataset_name: str, backbone_name: str
-) -> Tuple[List[str], List[str]]:
-    runs = [
-        run
-        for exp_name in _EXPERIMENT_NAMES
-        for run in _find_eval_runs(exp_name, dataset_name, backbone_name)
-    ]
+def _find_linear_probe_run(dataset_name: str, backbone_name: str) -> Tuple[Path, str]:
+    runs = _find_eval_runs(_LINEAR_PROBE_EXP, dataset_name, backbone_name)
 
-    return [str(path) for path, _ in runs], [name for _, name in runs]
+    if len(runs) != 1:
+        raise ValueError(
+            f"Expected exactly one linear probe run for {dataset_name}, "
+            f"found {len(runs)}: {[str(p) for p, _ in runs]}"
+        )
+
+    return runs[0]
+
+
+def _find_prompt_runs(dataset_name: str, backbone_name: str) -> List[Tuple[Path, str]]:
+    return _find_eval_runs(_PROMPT_EXP, dataset_name, backbone_name)
+
+
+def _build_load_models(dataset_name: str, backbone_name: str) -> Dict:
+    linear_path, linear_name = _find_linear_probe_run(dataset_name, backbone_name)
+    prompt_runs = _find_prompt_runs(dataset_name, backbone_name)
+
+    return {
+        "load_linear_probe_path": str(linear_path),
+        "load_linear_probe_name": linear_name,
+        "load_prompt_model_paths": [str(path) for path, _ in prompt_runs],
+        "load_prompt_model_names": [name for _, name in prompt_runs],
+    }
 
 
 def build_args(backbone_name: str) -> Tuple[List[Dict], str, str]:
@@ -135,16 +153,10 @@ def build_args(backbone_name: str) -> Tuple[List[Dict], str, str]:
     args = []
 
     for dataset_name in _list_dataset_names(backbone_name):
-        load_model_paths, load_model_names = _build_load_models(
-            dataset_name=dataset_name,
-            backbone_name=backbone_name,
-        )
-
         args.append(
             {
                 **_COMMON_ARGS,
-                "load_model_paths": load_model_paths,
-                "load_model_names": load_model_names,
+                **_build_load_models(dataset_name, backbone_name),
                 "save_dir": str(save_dir),
                 "save_name": dataset_name,
             }
