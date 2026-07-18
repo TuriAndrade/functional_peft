@@ -189,6 +189,7 @@ class SupervisedTrainer:
         plot_interval: int = 5,
         device: str = "cuda",
         save_ckpt: bool = False,
+        save_ckpt_interval: int = 0,
     ):
         hist = []
         wait = 0
@@ -198,6 +199,9 @@ class SupervisedTrainer:
         best_state_dict = None
 
         self.model.to(device)
+        if save_ckpt and (save_ckpt_interval > 0):
+            self.model.save(self.save_dir / "model_0.pt")
+
         for epoch in range(1, epochs + 1):
             train_acc, train_components = self._run_epoch(
                 train_loader,
@@ -235,6 +239,13 @@ class SupervisedTrainer:
 
             if epoch % plot_interval == 0:
                 self._plot_hist(hist)
+
+            if (
+                save_ckpt
+                and (save_ckpt_interval > 0)
+                and (epoch % save_ckpt_interval == 0)
+            ):
+                self.model.save(self.save_dir / f"model_{epoch}.pt")
 
             if use_validation:
                 if val_acc > best_val_acc:

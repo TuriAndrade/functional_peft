@@ -122,6 +122,7 @@ def _load_best_tuning_config(base_dir: Path) -> List[Dict]:
 def build_args(
     dataset_name: str,
     backbone_name: str,
+    save_ckpt_interval_denom: float = 10.0,
 ) -> Tuple[List[Dict], str, str]:
     base_dir = (
         Path(__file__).resolve().parent / "top1_acc_ft" / backbone_name / dataset_name
@@ -146,6 +147,9 @@ def build_args(
                 "final_lr": config["final_lr"],
                 "warmup_epochs": config["warmup_epochs"],
                 "epochs": config["best_epoch"],
+                "save_ckpt_interval": math.ceil(
+                    config["best_epoch"] / save_ckpt_interval_denom
+                ),
                 "save_name": config["save_name"],
                 "prompt_mode": config["prompt_mode"],
                 "prompt_length": config["prompt_length"],

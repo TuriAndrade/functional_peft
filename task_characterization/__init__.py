@@ -2,3 +2,5 @@ from .mc_fim_estimator import MonteCarloFIMEstimator
 from .task2vec_distance_estimator import Task2VecDistanceEstimator
 from .task_distance_viewer import TaskDistanceViewer
 from .task_separation_analyzer import TaskSeparationAnalyzer
+from .fim_rank_estimator import FIMRankEstimator
+from .fim_rank_distance_estimator import FIMRankDistanceEstimator

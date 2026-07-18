@@ -134,6 +134,12 @@ def _build_parser():
         help="Whether to save model weights.",
     )
     parser.add_argument(
+        "--save-ckpt-interval",
+        type=int,
+        default=0,
+        help="Interval for saving intermediate checlpoints. 0 disables it.",
+    )
+    parser.add_argument(
         "--save-ckpt-all-seeds",
         action="store_true",
         help=(
@@ -341,6 +347,7 @@ def _train_seed(args, run_seed: int, save_ckpt: bool):
         patience=args.patience,
         device=args.device,
         save_ckpt=save_ckpt,
+        save_ckpt_interval=args.save_ckpt_interval,
     )
 
     # ------- Eval -------
