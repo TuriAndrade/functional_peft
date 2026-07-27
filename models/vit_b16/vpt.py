@@ -241,67 +241,105 @@ class ViTB16VPT(nn.Module):
         self.load_state_dict(trainable_state_dict, strict=False)
 
     def _create_component_gates(self):
-        """Create zero log-gates and instrument each transformer block once."""
-        if hasattr(self, "fim_gates") and hasattr(self, "prompt_gates"):
+        """
+        Create multiplicative gates for transformer components and prompt coupling,
+        then instrument every transformer block for Fisher estimation.
+        """
+        if hasattr(self, "fim_gates") and hasattr(self, "prompt_coupling_gates"):
             return
 
         blocks = self.backbone.blocks
         n_layers = len(blocks)
         n_heads = blocks[0].attn.num_attention_heads
+        mlp_dim = blocks[0].ffn.fc1.out_features
         n_prompts = self.prompt_length
         n_patches = self.backbone.num_patches
-        prompt_end = 1 + n_prompts
-        n_tokens = prompt_end + n_patches
-        prompt_slice = slice(1, prompt_end)
-        patch_slice = slice(prompt_end, None)
+        n_tokens = 1 + n_prompts + n_patches
+
+        prompt_slice = slice(1, 1 + n_prompts)
+        patch_slice = slice(1 + n_prompts, None)
         reference = next(self.backbone.parameters())
 
         def gate(shape):
-            return nn.Parameter(reference.new_zeros(shape), requires_grad=False)
+            return nn.Parameter(reference.new_ones(shape), requires_grad=False)
 
         self.fim_gates = nn.ParameterDict(
             {
                 # [layer, branch], branch order: attention, MLP
-                "residual_path": gate((n_layers, 2)),
-                # [layer, attention head]
+                "residual_branch": gate((n_layers, 2)),
+                # [layer, head]
                 "attention_head": gate((n_layers, n_heads)),
-                # [layer, destination, source]
-                # destination/source order: CLS, PATCH
-                "attention_transport": gate((n_layers, 2, 2)),
-                # [layer, token type], token type order: CLS, PATCH
+                # [layer, head, destination, source]
+                # token order: CLS, PATCH
+                "backbone_attention_transport": gate((n_layers, n_heads, 2, 2)),
+                # [layer, head, destination]
+                # PROMPT -> CLS/PATCH; destination order: CLS, PATCH
+                "prompt_to_backbone_attention_transport": gate((n_layers, n_heads, 2)),
+                # [layer, head, source]
+                # CLS/PATCH/PROMPT -> PROMPT; meaningful for shallow VPT
+                # source order: CLS, PATCH, PROMPT
+                "prompt_destination_attention_transport": gate((n_layers, n_heads, 3)),
+                # [layer, head, spatial scale]
+                # scale order: SELF, LOCAL, MEDIUM, GLOBAL
+                "patch_spatial_transport": gate((n_layers, n_heads, 4)),
+                # [layer, hidden MLP unit]
+                "mlp_neuron": gate((n_layers, mlp_dim)),
+                # [layer, token type], token order: CLS, PATCH
                 "mlp_token_output": gate((n_layers, 2)),
-                # [layer, prompt token, direction, backbone token type]
-                # direction 0: backbone <- prompt
-                # direction 1: prompt <- backbone
-                # backbone token type order: CLS, PATCH
-                "tokenwise_prompt_backbone_transport": gate(
-                    (n_layers, n_prompts, 2, 2)
-                ),
+                # [layer]; PROMPT MLP output, meaningful for shallow VPT
+                "prompt_mlp_token_output": gate((n_layers,)),
             }
         )
-        # [layer, prompt token]
-        self.prompt_gates = gate((n_layers, n_prompts))
 
-        def scale(value, tensor):
-            return value.to(tensor).exp()
+        # [layer, prompt]: joint Q/K/V participation of each prompt at each layer.
+        self.prompt_coupling_gates = gate((n_layers, n_prompts))
+
+        # Fixed SELF/LOCAL/MEDIUM/GLOBAL bands from patch-grid geometry.
+        grid = self.backbone.grid_size
+        coords = (
+            torch.stack(
+                torch.meshgrid(
+                    torch.arange(grid, device=reference.device),
+                    torch.arange(grid, device=reference.device),
+                    indexing="ij",
+                ),
+                dim=-1,
+            )
+            .reshape(-1, 2)
+            .to(reference.dtype)
+        )
+
+        distances = torch.cdist(coords, coords)
+        quantiles = torch.quantile(
+            distances[distances > 0],
+            distances.new_tensor([1 / 3, 2 / 3]),
+        )
+
+        spatial_bins = torch.bucketize(distances, quantiles) + 1
+        spatial_bins.fill_diagonal_(0)
+
+        self.register_buffer(
+            "_fim_patch_spatial_bins",
+            spatial_bins,
+            persistent=False,
+        )
 
         def make_forward(layer_idx):
             def forward(block, hidden):
-                gates, attn = self.fim_gates, block.attn
+                gates = self.fim_gates
+                attn = block.attn
+
+                # --------------------------------------------------------------
+                # Attention
+                # --------------------------------------------------------------
                 residual = hidden
                 x = block.attention_norm(hidden)
 
-                # Prompt participation is gated after LayerNorm and before QKV.
+                # Joint participation of each prompt token before Q/K/V projection.
                 if n_prompts:
-                    prompt_scale = scale(self.prompt_gates[layer_idx], x)
-                    x = torch.cat(
-                        (
-                            x[:, :1],
-                            x[:, prompt_slice] * prompt_scale[None, :, None],
-                            x[:, patch_slice],
-                        ),
-                        dim=1,
-                    )
+                    token_scale = x.new_ones(n_tokens)
+                    token_scale[prompt_slice] = self.prompt_coupling_gates[layer_idx]
+                    x = x * token_scale[None, :, None]
 
                 query = attn.transpose_for_scores(attn.query(x))
                 key = attn.transpose_for_scores(attn.key(x))
@@ -313,33 +351,59 @@ class ViTB16VPT(nn.Module):
                 weights = attention_probs if attn.vis else None
                 attention_probs = attn.attn_dropout(attention_probs)
 
-                backbone_transport = scale(
-                    gates["attention_transport"][layer_idx],
-                    attention_probs,
-                )
-                token_transport = scale(
-                    gates["tokenwise_prompt_backbone_transport"][layer_idx],
-                    attention_probs,
+                # Attention transport gates scale value flow after softmax.
+                transport = attention_probs.new_ones(
+                    n_heads,
+                    n_tokens,
+                    n_tokens,
                 )
 
-                # transport[destination, source]; prompt-to-prompt stays ungated.
-                transport = attention_probs.new_ones((n_tokens, n_tokens))
-                transport[0, 0] = backbone_transport[0, 0]
-                transport[0, prompt_slice] = token_transport[:, 0, 0]
-                transport[0, patch_slice] = backbone_transport[0, 1]
-                transport[prompt_slice, 0] = token_transport[:, 1, 0]
-                transport[prompt_slice, patch_slice] = token_transport[:, 1, 1, None]
-                transport[patch_slice, 0] = backbone_transport[1, 0]
-                transport[patch_slice, prompt_slice] = token_transport[:, 0, 1]
-                transport[patch_slice, patch_slice] = backbone_transport[1, 1]
+                backbone_transport = gates["backbone_attention_transport"][layer_idx]
+                prompt_to_backbone = gates["prompt_to_backbone_attention_transport"][
+                    layer_idx
+                ]
+                prompt_destination = gates["prompt_destination_attention_transport"][
+                    layer_idx
+                ]
+                spatial_transport = gates["patch_spatial_transport"][layer_idx]
 
-                context = (attention_probs * transport[None, None]) @ value
+                # Backbone CLS/PATCH routes.
+                transport[:, 0, 0] = backbone_transport[:, 0, 0]
+                transport[:, 0, patch_slice] = backbone_transport[:, 0, 1, None]
+                transport[:, patch_slice, 0] = backbone_transport[:, 1, 0, None]
+
+                # PATCH <- PATCH decomposed by spatial scale.
+                spatial_scale = spatial_transport[:, self._fim_patch_spatial_bins]
+                transport[:, patch_slice, patch_slice] = (
+                    backbone_transport[:, 1, 1, None, None] * spatial_scale
+                )
+
+                if n_prompts:
+                    # PROMPT -> backbone routes.
+                    transport[:, 0, prompt_slice] = prompt_to_backbone[:, 0, None]
+                    transport[:, patch_slice, prompt_slice] = prompt_to_backbone[
+                        :, 1, None, None
+                    ]
+
+                    # Prompt-destination routes; functionally relevant for shallow VPT.
+                    transport[:, prompt_slice, 0] = prompt_destination[:, 0, None]
+                    transport[:, prompt_slice, patch_slice] = prompt_destination[
+                        :, 1, None, None
+                    ]
+                    transport[:, prompt_slice, prompt_slice] = prompt_destination[
+                        :, 2, None, None
+                    ]
+                else:
+                    # Keep prompt-specific families connected with zero derivative.
+                    transport = transport + 0.0 * (
+                        prompt_to_backbone.sum() + prompt_destination.sum()
+                    )
+
+                context = (attention_probs * transport[None]) @ value
+
+                # Attention-head contribution before the output projection.
                 context = (
-                    context
-                    * scale(
-                        gates["attention_head"][layer_idx],
-                        context,
-                    )[None, :, None, None]
+                    context * gates["attention_head"][layer_idx][None, :, None, None]
                 )
 
                 batch_size, _, current_tokens, _ = context.shape
@@ -348,196 +412,272 @@ class ViTB16VPT(nn.Module):
                     current_tokens,
                     attn.all_head_size,
                 )
+
                 attention_output = attn.proj_dropout(attn.out(context))
+
                 hidden = (
-                    residual
-                    + scale(
-                        gates["residual_path"][layer_idx, 0],
-                        attention_output,
-                    )
-                    * attention_output
+                    residual + gates["residual_branch"][layer_idx, 0] * attention_output
                 )
 
+                # --------------------------------------------------------------
+                # MLP
+                # --------------------------------------------------------------
                 residual = hidden
-                mlp_output = block.ffn(block.ffn_norm(hidden))
-                token_scale = scale(
-                    gates["mlp_token_output"][layer_idx],
-                    mlp_output,
-                )
-                mlp_output = torch.cat(
-                    (
-                        mlp_output[:, :1] * token_scale[0],
-                        mlp_output[:, prompt_slice],
-                        mlp_output[:, patch_slice] * token_scale[1],
-                    ),
-                    dim=1,
-                )
-                hidden = (
-                    residual
-                    + scale(
-                        gates["residual_path"][layer_idx, 1],
-                        mlp_output,
+                ffn = block.ffn
+
+                x = ffn.dropout(ffn.act_fn(ffn.fc1(block.ffn_norm(hidden))))
+
+                # MLP hidden-unit contribution before the output projection.
+                x = x * gates["mlp_neuron"][layer_idx][None, None, :]
+
+                mlp_output = ffn.dropout(ffn.fc2(x))
+
+                # CLS/PATCH MLP-output dependence.
+                token_scale = mlp_output.new_ones(n_tokens)
+                token_scale[0] = gates["mlp_token_output"][layer_idx, 0]
+                token_scale[patch_slice] = gates["mlp_token_output"][layer_idx, 1]
+
+                if n_prompts:
+                    # Persistent prompt MLP output; functionally relevant for shallow VPT.
+                    token_scale[prompt_slice] = gates["prompt_mlp_token_output"][
+                        layer_idx
+                    ]
+                else:
+                    # Keep the prompt-specific family connected with zero derivative.
+                    token_scale = (
+                        token_scale + 0.0 * gates["prompt_mlp_token_output"][layer_idx]
                     )
-                    * mlp_output
-                )
+
+                mlp_output = mlp_output * token_scale[None, :, None]
+
+                hidden = residual + gates["residual_branch"][layer_idx, 1] * mlp_output
 
                 return hidden, weights
 
             return forward
 
         for layer_idx, block in enumerate(blocks):
-            block.forward = MethodType(make_forward(layer_idx), block)
+            block.forward = MethodType(
+                make_forward(layer_idx),
+                block,
+            )
 
-    def _set_gates_grad(
+    def _reset_gate_values(self):
+        """
+        Set all diagnostic gates to one so the instrumented model exactly
+        reproduces the original model.
+        """
+        with torch.no_grad():
+            for gate in self.fim_gates.values():
+                gate.fill_(1)
+            self.prompt_coupling_gates.fill_(1)
+
+    def _set_gate_grads(
         self,
-        fim: bool = True,
-        prompt: bool = False,
+        mode: bool = True,
     ):
-        """Set gradient mode for the FIM and prompt diagnostic gates."""
+        """
+        Enable or disable gradients for all Fisher and prompt-coupling gates.
+        """
         for gate in self.fim_gates.values():
             gate.grad = None
-            gate.requires_grad_(fim)
+            gate.requires_grad_(mode)
 
-        self.prompt_gates.grad = None
-        self.prompt_gates.requires_grad_(prompt)
+        self.prompt_coupling_gates.grad = None
+        self.prompt_coupling_gates.requires_grad_(mode)
 
-    def estimate_sensitivity_profiles(
+    def estimate_fim_profiles(
         self,
         loader,
-        prompt: bool = False,
         mc_samples: int = 20,
-        component_chunk_size: int = 32,
         eps: float = 1e-12,
     ):
-        """Estimate F and, optionally, T, L and G for every gate family."""
-        if prompt and self.prompt_length == 0:
-            raise ValueError("Prompt sensitivity requires prompt_length > 0.")
+        """
+        Estimate functional Fisher and prompt-coupling profiles.
 
+        Returns:
+            F:
+                Diagonal model Fisher for every functional gate.
+
+            C:
+                Pairwise Fisher-score correlation between each FIM gate and
+                every [layer, prompt] coupling gate.
+
+            R_layer:
+                Multiple Fisher correlation between each FIM gate and the
+                prompt-coupling score subspace of each layer.
+
+            R_global:
+                Multiple Fisher correlation between each FIM gate and the
+                complete prompt-coupling score subspace.
+        """
         self._create_component_gates()
+        self._reset_gate_values()
+        self._set_gate_grads(True)
         self.eval()
 
-        gate_names, fim_gates = zip(*self.fim_gates.items())
-        gate_shapes = tuple(gate.shape for gate in fim_gates)
-        gate_sizes = tuple(gate.numel() for gate in fim_gates)
-        tokenwise_idx = gate_names.index("tokenwise_prompt_backbone_transport")
+        names, gates = zip(*self.fim_gates.items())
+        shapes = tuple(gate.shape for gate in gates)
+        sizes = tuple(gate.numel() for gate in gates)
 
-        aggregate_shape = (len(self.backbone.blocks), 2, 2)
-        names = (*gate_names, "prompt_backbone_transport")
-        shapes = (*gate_shapes, aggregate_shape)
-        sizes = (*gate_sizes, math.prod(aggregate_shape))
-        n_components = sum(sizes)
+        n_fim = sum(sizes)
+        n_layers, n_prompts = self.prompt_coupling_gates.shape
+        n_coupling = self.prompt_coupling_gates.numel()
+        use_prompts = n_coupling > 0
 
-        self._set_gates_grad(fim=True, prompt=prompt)
+        device = gates[0].device
 
-        with torch.no_grad():
-            for gate in (*fim_gates, self.prompt_gates):
-                gate.zero_()
+        fisher_sum = gates[0].new_zeros(n_fim)
 
-        device = self.prompt_gates.device
-        dtype = self.prompt_gates.dtype
-        fisher_sum = self.prompt_gates.new_zeros(n_components)
-        derivative_sum = (
-            self.prompt_gates.new_zeros((n_components, *self.prompt_gates.shape))
-            if prompt
-            else None
-        )
-        component_basis = (
-            torch.eye(n_components, device=device, dtype=dtype) if prompt else None
-        )
-        sample_bases = {}
+        if use_prompts:
+            cross_sum = gates[0].new_zeros(
+                n_fim,
+                n_coupling,
+            )
+            prompt_gram_sum = gates[0].new_zeros(
+                n_coupling,
+                n_coupling,
+            )
+
+        params = (*gates, self.prompt_coupling_gates) if use_prompts else gates
+
+        bases = {}
         sample_count = 0
 
         for batch in loader:
             x = batch[0].to(device, non_blocking=True)
+
+            # Model Fisher: sample labels from the predictive distribution.
             log_probs = self(x).log_softmax(dim=-1)
             labels = torch.multinomial(
-                log_probs.exp(),
+                log_probs.detach().exp(),
                 mc_samples,
                 replacement=True,
             )
+
             selected = log_probs.gather(1, labels).flatten()
             n_samples = selected.numel()
 
-            sample_basis = sample_bases.get(n_samples)
-            if sample_basis is None:
-                sample_basis = sample_bases[n_samples] = torch.eye(
+            # One score vector per sampled prediction.
+            basis = bases.get(n_samples)
+            if basis is None:
+                basis = bases[n_samples] = torch.eye(
                     n_samples,
                     device=device,
                     dtype=selected.dtype,
                 )
 
-            gate_scores = torch.autograd.grad(
+            scores = torch.autograd.grad(
                 selected,
-                fim_gates,
-                grad_outputs=sample_basis,
-                create_graph=prompt,
-                retain_graph=prompt,
+                params,
+                grad_outputs=basis,
                 is_grads_batched=True,
             )
 
-            # Summing scores before squaring exactly recovers the shared gate.
-            aggregate_score = gate_scores[tokenwise_idx].sum(dim=2).flatten(1)
-            fisher_samples = torch.cat(
-                [score.flatten(1) for score in gate_scores] + [aggregate_score],
+            fim_scores = torch.cat(
+                [score.flatten(1) for score in scores[: len(gates)]],
                 dim=1,
-            ).square()
+            )
 
-            fisher_sum.add_(fisher_samples.detach().sum(dim=0))
+            fisher_sum.add_(fim_scores.square().sum(dim=0))
+
+            if use_prompts:
+                prompt_scores = scores[-1].flatten(1)
+
+                cross_sum.add_(fim_scores.T @ prompt_scores)
+                prompt_gram_sum.add_(prompt_scores.T @ prompt_scores)
+
             sample_count += n_samples
-
-            if prompt:
-                # The detached term adds the predictive-distribution derivative.
-                surrogate = (
-                    fisher_samples + fisher_samples.detach() * selected[:, None]
-                ).sum(dim=0)
-
-                for start in range(
-                    0,
-                    n_components,
-                    component_chunk_size,
-                ):
-                    stop = min(
-                        start + component_chunk_size,
-                        n_components,
-                    )
-                    derivative_sum[start:stop].add_(
-                        torch.autograd.grad(
-                            surrogate,
-                            self.prompt_gates,
-                            grad_outputs=component_basis[start:stop],
-                            retain_graph=stop < n_components,
-                            is_grads_batched=True,
-                        )[0].detach()
-                    )
 
         fisher = fisher_sum / sample_count
 
-        def unpack(profile):
+        def unpack(profile, tail=()):
             return {
-                name: part.reshape(
-                    *profile.shape[:-1],
-                    *shape,
-                )
+                name: part.reshape(*shape, *tail)
                 for name, shape, part in zip(
                     names,
                     shapes,
-                    profile.split(sizes, dim=-1),
+                    profile.split(sizes),
                 )
             }
 
-        profiles = {"F": unpack(fisher)}
+        F_profile = unpack(fisher)
 
-        if prompt:
-            derivative = (derivative_sum / sample_count).movedim(0, -1)
-            token = derivative / (fisher + eps)
-            layer = token.sum(dim=1)
+        if use_prompts:
+            cross = cross_sum / sample_count
+            prompt_gram = prompt_gram_sum / sample_count
+            prompt_fisher = prompt_gram.diagonal()
 
-            profiles.update(
-                T=unpack(token),
-                L=unpack(layer),
-                G=unpack(layer.sum(dim=0)),
+            # Pairwise Fisher-score correlation.
+            coupling = cross / (
+                fisher[:, None] * prompt_fisher[None, :]
+            ).sqrt().clamp_min(eps)
+
+            cross_layer = cross.reshape(
+                n_fim,
+                n_layers,
+                n_prompts,
             )
 
-        self._set_gates_grad(fim=False, prompt=False)
-        self.sensitivity_profiles = profiles
-        return profiles
+            # Layerwise prompt-coupling Fisher blocks: [L, P, P].
+            prompt_layer = (
+                prompt_gram.reshape(
+                    n_layers,
+                    n_prompts,
+                    n_layers,
+                    n_prompts,
+                )
+                .diagonal(dim1=0, dim2=2)
+                .permute(2, 0, 1)
+            )
+
+            # Symmetric PSD Fisher blocks use the Hermitian pseudoinverse path.
+            # The default tolerance adapts to matrix dimension and dtype.
+            layer_pinv = torch.linalg.pinv(
+                prompt_layer,
+                hermitian=True,
+            )
+
+            global_pinv = torch.linalg.pinv(
+                prompt_gram,
+                hermitian=True,
+            )
+
+            Rl2 = torch.einsum(
+                "glp,lpq,glq->gl",
+                cross_layer,
+                layer_pinv,
+                cross_layer,
+            ) / fisher[:, None].clamp_min(eps)
+
+            Rg2 = (cross @ global_pinv * cross).sum(dim=-1) / fisher.clamp_min(eps)
+
+            C_profile = unpack(
+                coupling,
+                (n_layers, n_prompts),
+            )
+            R_layer_profile = unpack(
+                Rl2.clamp(0, 1).sqrt(),
+                (n_layers,),
+            )
+            R_global_profile = unpack(Rg2.clamp(0, 1).sqrt())
+
+        else:
+            C_profile = unpack(
+                fisher.new_zeros(n_fim, 0),
+                (n_layers, 0),
+            )
+            R_layer_profile = unpack(
+                fisher.new_zeros(n_fim, n_layers),
+                (n_layers,),
+            )
+            R_global_profile = unpack(fisher.new_zeros(n_fim))
+
+        self._set_gate_grads(False)
+
+        return {
+            "F": F_profile,
+            "C": C_profile,
+            "R_layer": R_layer_profile,
+            "R_global": R_global_profile,
+        }
