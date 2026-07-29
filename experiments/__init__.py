@@ -31,6 +31,10 @@ from .full_ft.eval import (
     aggregate_results as full_ft_eval_ar,
 )
 
+from .task_functional_signatures.estimate_functional_signatures import (
+    build_args as estimate_functional_signatures_ba,
+)
+
 build_args = {
     "vpt_tuning": vpt_tuning_ba,
     "vpt_eval": vpt_eval_ba,
@@ -38,6 +42,7 @@ build_args = {
     "linear_probe_eval": linear_probe_eval_ba,
     "full_ft_tuning": full_ft_tuning_ba,
     "full_ft_eval": full_ft_eval_ba,
+    "estimate_functional_signatures": estimate_functional_signatures_ba,
 }
 
 build_results = {

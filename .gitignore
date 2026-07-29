@@ -4,10 +4,7 @@ logs/
 
 # Experiment results
 experiments/*/top1_acc_ft/
-experiments/task_characterization/mc_fim_estimates
-experiments/task_characterization/task2vec_distance_estimates
-experiments/task_characterization/fim_rank_estimates
-experiments/task_characterization/fim_rank_distance_estimates
+experiments/task_functional_signatures/*/
 
 
 # Checkpoints

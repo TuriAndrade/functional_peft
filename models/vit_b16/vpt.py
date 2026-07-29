@@ -240,12 +240,13 @@ class ViTB16VPT(nn.Module):
 
         self.load_state_dict(trainable_state_dict, strict=False)
 
-    def _create_component_gates(self):
+    def _create_functional_gates(self):
         """
-        Create multiplicative gates for transformer components and prompt coupling,
-        then instrument every transformer block for Fisher estimation.
+        Create multiplicative gates for transformer functional components and
+        prompt coupling, then instrument every transformer block for Fisher
+        estimation.
         """
-        if hasattr(self, "fim_gates") and hasattr(self, "prompt_coupling_gates"):
+        if hasattr(self, "functional_gates") and hasattr(self, "prompt_coupling_gates"):
             return
 
         blocks = self.backbone.blocks
@@ -263,7 +264,7 @@ class ViTB16VPT(nn.Module):
         def gate(shape):
             return nn.Parameter(reference.new_ones(shape), requires_grad=False)
 
-        self.fim_gates = nn.ParameterDict(
+        self.functional_gates = nn.ParameterDict(
             {
                 # [layer, branch], branch order: attention, MLP
                 "residual_branch": gate((n_layers, 2)),
@@ -319,14 +320,14 @@ class ViTB16VPT(nn.Module):
         spatial_bins.fill_diagonal_(0)
 
         self.register_buffer(
-            "_fim_patch_spatial_bins",
+            "_functional_patch_spatial_bins",
             spatial_bins,
             persistent=False,
         )
 
         def make_forward(layer_idx):
             def forward(block, hidden):
-                gates = self.fim_gates
+                functional_gates = self.functional_gates
                 attn = block.attn
 
                 # --------------------------------------------------------------
@@ -335,7 +336,7 @@ class ViTB16VPT(nn.Module):
                 residual = hidden
                 x = block.attention_norm(hidden)
 
-                # Joint participation of each prompt token before Q/K/V projection.
+                # Joint participation of each prompt before Q/K/V projection.
                 if n_prompts:
                     token_scale = x.new_ones(n_tokens)
                     token_scale[prompt_slice] = self.prompt_coupling_gates[layer_idx]
@@ -351,21 +352,25 @@ class ViTB16VPT(nn.Module):
                 weights = attention_probs if attn.vis else None
                 attention_probs = attn.attn_dropout(attention_probs)
 
-                # Attention transport gates scale value flow after softmax.
+                # Transport gates scale value flow after softmax.
                 transport = attention_probs.new_ones(
                     n_heads,
                     n_tokens,
                     n_tokens,
                 )
 
-                backbone_transport = gates["backbone_attention_transport"][layer_idx]
-                prompt_to_backbone = gates["prompt_to_backbone_attention_transport"][
+                backbone_transport = functional_gates["backbone_attention_transport"][
                     layer_idx
                 ]
-                prompt_destination = gates["prompt_destination_attention_transport"][
+                prompt_to_backbone = functional_gates[
+                    "prompt_to_backbone_attention_transport"
+                ][layer_idx]
+                prompt_destination = functional_gates[
+                    "prompt_destination_attention_transport"
+                ][layer_idx]
+                spatial_transport = functional_gates["patch_spatial_transport"][
                     layer_idx
                 ]
-                spatial_transport = gates["patch_spatial_transport"][layer_idx]
 
                 # Backbone CLS/PATCH routes.
                 transport[:, 0, 0] = backbone_transport[:, 0, 0]
@@ -373,7 +378,9 @@ class ViTB16VPT(nn.Module):
                 transport[:, patch_slice, 0] = backbone_transport[:, 1, 0, None]
 
                 # PATCH <- PATCH decomposed by spatial scale.
-                spatial_scale = spatial_transport[:, self._fim_patch_spatial_bins]
+                spatial_scale = spatial_transport[
+                    :, self._functional_patch_spatial_bins
+                ]
                 transport[:, patch_slice, patch_slice] = (
                     backbone_transport[:, 1, 1, None, None] * spatial_scale
                 )
@@ -385,7 +392,7 @@ class ViTB16VPT(nn.Module):
                         :, 1, None, None
                     ]
 
-                    # Prompt-destination routes; functionally relevant for shallow VPT.
+                    # Prompt-destination routes; relevant for shallow VPT.
                     transport[:, prompt_slice, 0] = prompt_destination[:, 0, None]
                     transport[:, prompt_slice, patch_slice] = prompt_destination[
                         :, 1, None, None
@@ -403,7 +410,8 @@ class ViTB16VPT(nn.Module):
 
                 # Attention-head contribution before the output projection.
                 context = (
-                    context * gates["attention_head"][layer_idx][None, :, None, None]
+                    context
+                    * functional_gates["attention_head"][layer_idx][None, :, None, None]
                 )
 
                 batch_size, _, current_tokens, _ = context.shape
@@ -416,7 +424,9 @@ class ViTB16VPT(nn.Module):
                 attention_output = attn.proj_dropout(attn.out(context))
 
                 hidden = (
-                    residual + gates["residual_branch"][layer_idx, 0] * attention_output
+                    residual
+                    + functional_gates["residual_branch"][layer_idx, 0]
+                    * attention_output
                 )
 
                 # --------------------------------------------------------------
@@ -427,30 +437,36 @@ class ViTB16VPT(nn.Module):
 
                 x = ffn.dropout(ffn.act_fn(ffn.fc1(block.ffn_norm(hidden))))
 
-                # MLP hidden-unit contribution before the output projection.
-                x = x * gates["mlp_neuron"][layer_idx][None, None, :]
+                # Hidden-unit contribution before the MLP output projection.
+                x = x * functional_gates["mlp_neuron"][layer_idx][None, None, :]
 
                 mlp_output = ffn.dropout(ffn.fc2(x))
 
                 # CLS/PATCH MLP-output dependence.
                 token_scale = mlp_output.new_ones(n_tokens)
-                token_scale[0] = gates["mlp_token_output"][layer_idx, 0]
-                token_scale[patch_slice] = gates["mlp_token_output"][layer_idx, 1]
+                token_scale[0] = functional_gates["mlp_token_output"][layer_idx, 0]
+                token_scale[patch_slice] = functional_gates["mlp_token_output"][
+                    layer_idx, 1
+                ]
 
                 if n_prompts:
-                    # Persistent prompt MLP output; functionally relevant for shallow VPT.
-                    token_scale[prompt_slice] = gates["prompt_mlp_token_output"][
-                        layer_idx
-                    ]
+                    # Persistent prompt MLP output; relevant for shallow VPT.
+                    token_scale[prompt_slice] = functional_gates[
+                        "prompt_mlp_token_output"
+                    ][layer_idx]
                 else:
                     # Keep the prompt-specific family connected with zero derivative.
                     token_scale = (
-                        token_scale + 0.0 * gates["prompt_mlp_token_output"][layer_idx]
+                        token_scale
+                        + 0.0 * functional_gates["prompt_mlp_token_output"][layer_idx]
                     )
 
                 mlp_output = mlp_output * token_scale[None, :, None]
 
-                hidden = residual + gates["residual_branch"][layer_idx, 1] * mlp_output
+                hidden = (
+                    residual
+                    + functional_gates["residual_branch"][layer_idx, 1] * mlp_output
+                )
 
                 return hidden, weights
 
@@ -464,11 +480,11 @@ class ViTB16VPT(nn.Module):
 
     def _reset_gate_values(self):
         """
-        Set all diagnostic gates to one so the instrumented model exactly
-        reproduces the original model.
+        Set all functional and prompt-coupling gates to one so the instrumented
+        model exactly reproduces the original model.
         """
         with torch.no_grad():
-            for gate in self.fim_gates.values():
+            for gate in self.functional_gates.values():
                 gate.fill_(1)
             self.prompt_coupling_gates.fill_(1)
 
@@ -477,69 +493,73 @@ class ViTB16VPT(nn.Module):
         mode: bool = True,
     ):
         """
-        Enable or disable gradients for all Fisher and prompt-coupling gates.
+        Enable or disable gradients for all functional and prompt-coupling gates.
         """
-        for gate in self.fim_gates.values():
+        for gate in self.functional_gates.values():
             gate.grad = None
             gate.requires_grad_(mode)
 
         self.prompt_coupling_gates.grad = None
         self.prompt_coupling_gates.requires_grad_(mode)
 
-    def estimate_fim_profiles(
+    def estimate_functional_signatures(
         self,
         loader,
         mc_samples: int = 20,
         eps: float = 1e-12,
     ):
         """
-        Estimate functional Fisher and prompt-coupling profiles.
+        Estimate functional Fisher and prompt-coupling signatures.
 
         Returns:
             F:
-                Diagonal model Fisher for every functional gate.
+                Diagonal model Fisher signature over all functional gates.
 
             C:
-                Pairwise Fisher-score correlation between each FIM gate and
-                every [layer, prompt] coupling gate.
+                Pairwise Fisher-score coupling signature between each functional
+                gate and every [layer, prompt] coupling gate.
 
             R_layer:
-                Multiple Fisher correlation between each FIM gate and the
-                prompt-coupling score subspace of each layer.
+                Layerwise multiple Fisher coupling signature between each
+                functional gate and the prompt-coupling score subspace.
 
             R_global:
-                Multiple Fisher correlation between each FIM gate and the
-                complete prompt-coupling score subspace.
+                Global multiple Fisher coupling signature between each functional
+                gate and the complete prompt-coupling score subspace.
         """
-        self._create_component_gates()
+        self._create_functional_gates()
         self._reset_gate_values()
         self._set_gate_grads(True)
         self.eval()
 
-        names, gates = zip(*self.fim_gates.items())
-        shapes = tuple(gate.shape for gate in gates)
-        sizes = tuple(gate.numel() for gate in gates)
+        names, functional_gates = zip(*self.functional_gates.items())
+        shapes = tuple(gate.shape for gate in functional_gates)
+        sizes = tuple(gate.numel() for gate in functional_gates)
 
-        n_fim = sum(sizes)
+        n_functional = sum(sizes)
         n_layers, n_prompts = self.prompt_coupling_gates.shape
         n_coupling = self.prompt_coupling_gates.numel()
         use_prompts = n_coupling > 0
 
-        device = gates[0].device
+        device = functional_gates[0].device
 
-        fisher_sum = gates[0].new_zeros(n_fim)
+        fisher_sum = functional_gates[0].new_zeros(n_functional)
 
         if use_prompts:
-            cross_sum = gates[0].new_zeros(
-                n_fim,
+            cross_sum = functional_gates[0].new_zeros(
+                n_functional,
                 n_coupling,
             )
-            prompt_gram_sum = gates[0].new_zeros(
+            prompt_gram_sum = functional_gates[0].new_zeros(
                 n_coupling,
                 n_coupling,
             )
 
-        params = (*gates, self.prompt_coupling_gates) if use_prompts else gates
+        params = (
+            (*functional_gates, self.prompt_coupling_gates)
+            if use_prompts
+            else functional_gates
+        )
 
         bases = {}
         sample_count = 0
@@ -558,7 +578,7 @@ class ViTB16VPT(nn.Module):
             selected = log_probs.gather(1, labels).flatten()
             n_samples = selected.numel()
 
-            # One score vector per sampled prediction.
+            # One functional/prompt score vector per sampled prediction.
             basis = bases.get(n_samples)
             if basis is None:
                 basis = bases[n_samples] = torch.eye(
@@ -574,34 +594,34 @@ class ViTB16VPT(nn.Module):
                 is_grads_batched=True,
             )
 
-            fim_scores = torch.cat(
-                [score.flatten(1) for score in scores[: len(gates)]],
+            functional_scores = torch.cat(
+                [score.flatten(1) for score in scores[: len(functional_gates)]],
                 dim=1,
             )
 
-            fisher_sum.add_(fim_scores.square().sum(dim=0))
+            fisher_sum.add_(functional_scores.square().sum(dim=0))
 
             if use_prompts:
                 prompt_scores = scores[-1].flatten(1)
 
-                cross_sum.add_(fim_scores.T @ prompt_scores)
+                cross_sum.add_(functional_scores.T @ prompt_scores)
                 prompt_gram_sum.add_(prompt_scores.T @ prompt_scores)
 
             sample_count += n_samples
 
         fisher = fisher_sum / sample_count
 
-        def unpack(profile, tail=()):
+        def unpack(signature, tail=()):
             return {
                 name: part.reshape(*shape, *tail)
                 for name, shape, part in zip(
                     names,
                     shapes,
-                    profile.split(sizes),
+                    signature.split(sizes),
                 )
             }
 
-        F_profile = unpack(fisher)
+        F_signature = unpack(fisher)
 
         if use_prompts:
             cross = cross_sum / sample_count
@@ -614,7 +634,7 @@ class ViTB16VPT(nn.Module):
             ).sqrt().clamp_min(eps)
 
             cross_layer = cross.reshape(
-                n_fim,
+                n_functional,
                 n_layers,
                 n_prompts,
             )
@@ -631,8 +651,7 @@ class ViTB16VPT(nn.Module):
                 .permute(2, 0, 1)
             )
 
-            # Symmetric PSD Fisher blocks use the Hermitian pseudoinverse path.
-            # The default tolerance adapts to matrix dimension and dtype.
+            # Symmetric PSD Fisher blocks use the Hermitian pseudoinverse.
             layer_pinv = torch.linalg.pinv(
                 prompt_layer,
                 hermitian=True,
@@ -652,32 +671,32 @@ class ViTB16VPT(nn.Module):
 
             Rg2 = (cross @ global_pinv * cross).sum(dim=-1) / fisher.clamp_min(eps)
 
-            C_profile = unpack(
+            C_signature = unpack(
                 coupling,
                 (n_layers, n_prompts),
             )
-            R_layer_profile = unpack(
+            R_layer_signature = unpack(
                 Rl2.clamp(0, 1).sqrt(),
                 (n_layers,),
             )
-            R_global_profile = unpack(Rg2.clamp(0, 1).sqrt())
+            R_global_signature = unpack(Rg2.clamp(0, 1).sqrt())
 
         else:
-            C_profile = unpack(
-                fisher.new_zeros(n_fim, 0),
+            C_signature = unpack(
+                fisher.new_zeros(n_functional, 0),
                 (n_layers, 0),
             )
-            R_layer_profile = unpack(
-                fisher.new_zeros(n_fim, n_layers),
+            R_layer_signature = unpack(
+                fisher.new_zeros(n_functional, n_layers),
                 (n_layers,),
             )
-            R_global_profile = unpack(fisher.new_zeros(n_fim))
+            R_global_signature = unpack(fisher.new_zeros(n_functional))
 
         self._set_gate_grads(False)
 
         return {
-            "F": F_profile,
-            "C": C_profile,
-            "R_layer": R_layer_profile,
-            "R_global": R_global_profile,
+            "F": F_signature,
+            "C": C_signature,
+            "R_layer": R_layer_signature,
+            "R_global": R_global_signature,
         }
