@@ -4,7 +4,7 @@ from typing import List, Dict, Tuple
 _RUN_SEED = 0
 
 _COMMON_ARGS = {
-    "batch_size": 8,
+    "batch_size": 1,
     "mc_samples": 20,
     "eps": 1e-12,
     "device": "cuda",

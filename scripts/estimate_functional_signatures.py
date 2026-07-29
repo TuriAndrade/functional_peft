@@ -32,6 +32,19 @@ def _build_parser():
 def main():
     args = parse_args_json(_build_parser())
 
+    # Build output path first and skip if already completed.
+    save_dir = Path(args.save_dir)
+    if args.save_name is not None:
+        save_dir /= args.save_name
+
+    save_path = save_dir / "functional_signatures.npz"
+
+    if save_path.exists():
+        print(f"Experiment already done: {save_path}")
+        return
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+
     model_path = Path(args.model_path)
 
     with open(model_path / "config.json") as f:
@@ -77,13 +90,8 @@ def main():
         for component_name, values in signature.items()
     }
 
-    save_dir = Path(args.save_dir)
-    if args.save_name is not None:
-        save_dir /= args.save_name
-    save_dir.mkdir(parents=True, exist_ok=True)
-
     np.savez_compressed(
-        save_dir / "functional_signatures.npz",
+        save_path,
         dataset_name=np.array(args.dataset_name),
         backbone_name=np.array(args.backbone_name),
         prompt_mode=np.array(config["prompt_mode"]),
