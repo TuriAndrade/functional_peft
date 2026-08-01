@@ -26,6 +26,8 @@ def _build_parser():
     parser.add_argument("--save-dir", type=str, default=None)
     parser.add_argument("--save-name", type=str, default=None)
 
+    parser.add_argument("--verbose", action="store_true")
+
     return parser
 
 
@@ -80,6 +82,7 @@ def main():
         loader,
         mc_samples=args.mc_samples,
         eps=args.eps,
+        verbose=args.verbose,
     )
 
     # Flatten nested signature dictionaries into NPZ keys such as

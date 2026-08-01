@@ -5,9 +5,10 @@ _RUN_SEED = 0
 
 _COMMON_ARGS = {
     "batch_size": 1,
-    "mc_samples": 20,
+    "mc_samples": 50,
     "eps": 1e-12,
     "device": "cuda",
+    "verbose": True,
 }
 
 _METHODS = ("vpt", "linear_probe")

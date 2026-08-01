@@ -1,4 +1,5 @@
 import csv
+from itertools import combinations
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -6,10 +7,11 @@ import numpy as np
 from sklearn.manifold import MDS
 
 
-class FunctionalSignatureAnalyzer:
+class FisherSignatureAnalyzer:
     def __init__(
         self,
         model_names,
+        model_groups,
         dataset_names,
         dataset_groups,
         f_sig_paths,
@@ -17,6 +19,7 @@ class FunctionalSignatureAnalyzer:
         save_dir,
     ):
         self.model_names = model_names
+        self.model_groups = model_groups
         self.dataset_names = dataset_names
         self.dataset_groups = dataset_groups
         self.f_sig_paths = np.asarray(f_sig_paths)
@@ -40,15 +43,18 @@ class FunctionalSignatureAnalyzer:
 
         return 1.0 - np.dot(x, y) / (nx * ny + eps)
 
-    def _load_model(self, model_idx):
-        """Load all required Fisher families for one model."""
+    def _load_signatures(self):
+        """Load all required Fisher families for all models."""
         families = set(f for fs in self.keys.values() for f in fs)
-        signatures = {f: [] for f in families}
+        signatures = {}
 
-        for path in self.f_sig_paths[model_idx]:
-            with np.load(path) as data:
-                for family in families:
-                    signatures[family].append(data[f"F__{family}"])
+        for model_idx, model_name in enumerate(self.model_names):
+            signatures[model_name] = {f: [] for f in families}
+
+            for path in self.f_sig_paths[model_idx]:
+                with np.load(path) as data:
+                    for family in families:
+                        signatures[model_name][family].append(data[f"F__{family}"])
 
         return signatures
 
@@ -56,36 +62,38 @@ class FunctionalSignatureAnalyzer:
         """Compute the global or single-layer Task2Vec distance matrix."""
         vectors = [(x if layer is None else x[layer]).reshape(-1) for x in signatures]
 
-        n = len(vectors)
-        D = np.zeros((n, n))
+        D = np.zeros((len(vectors), len(vectors)))
 
-        for i in range(n):
+        for i in range(len(vectors)):
             for j in range(i):
-                D[i, j] = D[j, i] = self._task2vec_distance(vectors[i], vectors[j])
+                D[i, j] = D[j, i] = self._task2vec_distance(
+                    vectors[i],
+                    vectors[j],
+                )
 
         return D
 
-    def _compute_distances(self):
+    def _compute_distances(self, signatures):
         """Compute global and layerwise matrices for every model and key."""
         results = {}
 
-        for model_idx, model_name in enumerate(self.model_names):
-            signatures = self._load_model(model_idx)
-            results[model_name] = {}
+        for model in self.model_names:
+            sigs = signatures[model]
+            results[model] = {}
 
             for key, families in self.keys.items():
-                n_layers = signatures[families[0]][0].shape[0]
+                n_layers = sigs[families[0]][0].shape[0]
 
-                results[model_name][key] = {
+                results[model][key] = {
                     "global": np.mean(
-                        [self._distance_matrix(signatures[f]) for f in families],
+                        [self._distance_matrix(sigs[f]) for f in families],
                         axis=0,
                     ),
                     "layers": np.stack(
                         [
                             np.mean(
                                 [
-                                    self._distance_matrix(signatures[f], layer)
+                                    self._distance_matrix(sigs[f], layer)
                                     for f in families
                                 ],
                                 axis=0,
@@ -99,25 +107,21 @@ class FunctionalSignatureAnalyzer:
 
     def _plot(self, D, path):
         """Project a distance matrix to 2D with MDS and label every dataset."""
-        if np.allclose(D, 0):
-            xy = np.zeros((len(D), 2))
-        else:
-            xy = MDS(
+        xy = (
+            np.zeros((len(D), 2))
+            if np.allclose(D, 0)
+            else MDS(
                 n_components=2,
                 dissimilarity="precomputed",
                 random_state=0,
             ).fit_transform(D)
+        )
 
         fig, ax = plt.subplots(figsize=(10, 8))
         ax.scatter(xy[:, 0], xy[:, 1])
 
         for i, name in enumerate(self.dataset_names):
-            ax.annotate(
-                name,
-                xy[i],
-                xytext=(4, 4),
-                textcoords="offset points",
-            )
+            ax.annotate(name, xy[i], xytext=(4, 4), textcoords="offset points")
 
         ax.set_xticks([])
         ax.set_yticks([])
@@ -141,7 +145,7 @@ class FunctionalSignatureAnalyzer:
     @staticmethod
     def _pair_concordance(D, anchor, closer, farther):
         """Concordance that closer-tier tasks rank before farther-tier tasks."""
-        comparisons = [
+        scores = [
             (
                 1.0
                 if D[anchor, a] < D[anchor, b]
@@ -151,20 +155,10 @@ class FunctionalSignatureAnalyzer:
             for b in farther
         ]
 
-        return float(np.mean(comparisons)) if comparisons else np.nan
+        return float(np.mean(scores)) if scores else np.nan
 
     def _group_separation(self, D, group):
-        """
-        Compute ordinal ranking concordance for one hierarchy.
-
-        dataset_groups[group] is:
-            (positive, neg1, neg2, ...)
-
-        For each positive anchor, expected distance ordering is:
-            positive < neg1 < neg2 < ...
-
-        All ordered tier pairs receive equal weight.
-        """
+        """Compute ordinal ranking concordance for one dataset hierarchy."""
         index = {name: i for i, name in enumerate(self.dataset_names)}
         hierarchy = [
             [index[name] for name in tier] for tier in self.dataset_groups[group]
@@ -179,25 +173,20 @@ class FunctionalSignatureAnalyzer:
                 *hierarchy[1:],
             ]
 
-            pair_scores = [
-                self._pair_concordance(
-                    D,
-                    anchor,
-                    tiers[i],
-                    tiers[j],
-                )
+            scores = [
+                self._pair_concordance(D, anchor, tiers[i], tiers[j])
                 for i in range(len(tiers))
                 for j in range(i + 1, len(tiers))
                 if tiers[i] and tiers[j]
             ]
 
-            if pair_scores:
-                anchor_scores.append(np.mean(pair_scores))
+            if scores:
+                anchor_scores.append(np.mean(scores))
 
         return float(np.mean(anchor_scores)) if anchor_scores else np.nan
 
     def _save_separation(self, distances):
-        """Save per-signature layerwise results and a global summary."""
+        """Save layerwise separation results and global summary."""
         groups = list(self.dataset_groups)
         global_rows = []
 
@@ -218,7 +207,7 @@ class FunctionalSignatureAnalyzer:
                 out = self.save_dir / model / key
                 out.mkdir(parents=True, exist_ok=True)
 
-                with open(out / "separation.csv", "w", newline="") as f:
+                with open(out / "functional_separation.csv", "w", newline="") as f:
                     writer = csv.writer(f)
                     writer.writerow(["group_name"] + [name for name, _ in variants])
 
@@ -233,17 +222,106 @@ class FunctionalSignatureAnalyzer:
 
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        with open(
-            self.save_dir / "separation_global.csv",
-            "w",
-            newline="",
-        ) as f:
+        with open(self.save_dir / "functional_separation.csv", "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["model_name", "signature_key"] + groups)
             writer.writerows(global_rows)
 
+    def _model_distance(self, signatures, models, dataset_idx, families):
+        """Mean Fisher distance across model pairs for one dataset."""
+        return np.mean(
+            [
+                np.mean(
+                    [
+                        self._task2vec_distance(
+                            signatures[a][family][dataset_idx].reshape(-1),
+                            signatures[b][family][dataset_idx].reshape(-1),
+                        )
+                        for family in families
+                    ]
+                )
+                for a, b in combinations(models, 2)
+            ]
+        )
+
+    def _save_r_statistics(self, signatures, distances):
+        """
+        Save model-group R statistics.
+
+        For dataset t:
+
+            R_t =
+                mean distance across models for t
+                ----------------------------------
+                mean distance from t to other datasets
+                under the same models
+
+        Only the first tier of each model group is used.
+        """
+        rows = []
+
+        for group, hierarchy in self.model_groups.items():
+            models = list(hierarchy[0])
+
+            if len(models) < 2:
+                raise ValueError(
+                    f"Model group '{group}' needs at least two positive models."
+                )
+
+            unknown = set(models) - set(self.model_names)
+            if unknown:
+                raise ValueError(
+                    f"Unknown models in group '{group}': {sorted(unknown)}"
+                )
+
+            for key, families in self.keys.items():
+                values = []
+
+                for dataset_idx in range(len(self.dataset_names)):
+                    numerator = self._model_distance(
+                        signatures,
+                        models,
+                        dataset_idx,
+                        families,
+                    )
+
+                    denominator = np.mean(
+                        [
+                            np.mean(
+                                np.delete(
+                                    distances[model][key]["global"][dataset_idx],
+                                    dataset_idx,
+                                )
+                            )
+                            for model in models
+                        ]
+                    )
+
+                    values.append(
+                        numerator / denominator if denominator > 0 else np.nan
+                    )
+
+                rows.append([group, key, np.nanmean(values), *values])
+
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        with open(self.save_dir / "r_statistic.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "model_group",
+                    "signature_key",
+                    "global",
+                    *self.dataset_names,
+                ]
+            )
+            writer.writerows(rows)
+
     def analyze(self):
-        """Compute distances, save MDS plots, and evaluate task separation."""
-        distances = self._compute_distances()
+        """Compute distances, plots, task separation, and model-group R."""
+        signatures = self._load_signatures()
+        distances = self._compute_distances(signatures)
+
         self._save_plots(distances)
         self._save_separation(distances)
+        self._save_r_statistics(signatures, distances)

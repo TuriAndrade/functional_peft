@@ -5,7 +5,8 @@ import math
 from functools import reduce
 from operator import mul
 from types import MethodType
-from typing import Optional, List
+from typing import Optional
+from tqdm.auto import tqdm
 from .backbone import ViTB16Backbone
 
 
@@ -240,13 +241,12 @@ class ViTB16VPT(nn.Module):
 
         self.load_state_dict(trainable_state_dict, strict=False)
 
-    def _create_functional_gates(self):
+    def _create_functional_artifacts(self):
         """
-        Create multiplicative gates for transformer functional components and
-        prompt coupling, then instrument every transformer block for Fisher
-        estimation.
+        Create functional gates, participation storage, prompt-coupling gates,
+        and the instrumented transformer-block forward passes.
         """
-        if hasattr(self, "functional_gates") and hasattr(self, "prompt_coupling_gates"):
+        if hasattr(self, "functional_gates"):
             return
 
         blocks = self.backbone.blocks
@@ -270,32 +270,31 @@ class ViTB16VPT(nn.Module):
                 "residual_branch": gate((n_layers, 2)),
                 # [layer, head]
                 "attention_head": gate((n_layers, n_heads)),
-                # [layer, head, destination, source]
-                # token order: CLS, PATCH
+                # [layer, head, destination, source], token order: CLS, PATCH
                 "backbone_attention_transport": gate((n_layers, n_heads, 2, 2)),
-                # [layer, head, destination]
-                # PROMPT -> CLS/PATCH; destination order: CLS, PATCH
+                # [layer, head, destination], PROMPT -> CLS/PATCH
                 "prompt_to_backbone_attention_transport": gate((n_layers, n_heads, 2)),
-                # [layer, head, source]
-                # CLS/PATCH/PROMPT -> PROMPT; meaningful for shallow VPT
-                # source order: CLS, PATCH, PROMPT
+                # [layer, head, source], CLS/PATCH/PROMPT -> PROMPT
                 "prompt_destination_attention_transport": gate((n_layers, n_heads, 3)),
-                # [layer, head, spatial scale]
-                # scale order: SELF, LOCAL, MEDIUM, GLOBAL
+                # [layer, head, scale], scale order: SELF, LOCAL, MEDIUM, GLOBAL
                 "patch_spatial_transport": gate((n_layers, n_heads, 4)),
                 # [layer, hidden MLP unit]
                 "mlp_neuron": gate((n_layers, mlp_dim)),
                 # [layer, token type], token order: CLS, PATCH
                 "mlp_token_output": gate((n_layers, 2)),
-                # [layer]; PROMPT MLP output, meaningful for shallow VPT
+                # [layer], PROMPT MLP output
                 "prompt_mlp_token_output": gate((n_layers,)),
             }
         )
 
-        # [layer, prompt]: joint Q/K/V participation of each prompt at each layer.
+        self.functional_participation = {
+            name: gate_tensor.new_zeros(gate_tensor.shape)
+            for name, gate_tensor in self.functional_gates.items()
+        }
+
+        # [layer, prompt]: joint Q/K/V participation of each prompt.
         self.prompt_coupling_gates = gate((n_layers, n_prompts))
 
-        # Fixed SELF/LOCAL/MEDIUM/GLOBAL bands from patch-grid geometry.
         grid = self.backbone.grid_size
         coords = (
             torch.stack(
@@ -309,34 +308,59 @@ class ViTB16VPT(nn.Module):
             .reshape(-1, 2)
             .to(reference.dtype)
         )
-
         distances = torch.cdist(coords, coords)
         quantiles = torch.quantile(
             distances[distances > 0],
             distances.new_tensor([1 / 3, 2 / 3]),
         )
-
         spatial_bins = torch.bucketize(distances, quantiles) + 1
         spatial_bins.fill_diagonal_(0)
-
         self.register_buffer(
             "_functional_patch_spatial_bins",
             spatial_bins,
             persistent=False,
         )
 
+        attention_metrics = []
+        mlp_output_norms = []
+        with torch.no_grad():
+            for block in blocks:
+                attn = block.attn
+                weight = (
+                    attn.out.weight.detach()
+                    .reshape(attn.out.out_features, n_heads, attn.attention_head_size)
+                    .permute(1, 2, 0)
+                )
+                attention_metrics.append(weight @ weight.transpose(-1, -2))
+                mlp_output_norms.append(
+                    block.ffn.fc2.weight.detach().square().sum(dim=0)
+                )
+
+        self._functional_attention_metrics = torch.stack(attention_metrics)
+        self._functional_mlp_output_norms = torch.stack(mlp_output_norms)
+
         def make_forward(layer_idx):
             def forward(block, hidden):
                 functional_gates = self.functional_gates
                 attn = block.attn
 
-                # --------------------------------------------------------------
+                def record(name, energy):
+                    self.functional_participation[name][layer_idx].copy_(
+                        energy.detach().sum(dim=0)
+                    )
+
+                def projected_energy(context):
+                    return torch.einsum(
+                        "bhtd,hde,bhte->bh",
+                        context,
+                        self._functional_attention_metrics[layer_idx],
+                        context,
+                    )
+
                 # Attention
-                # --------------------------------------------------------------
                 residual = hidden
                 x = block.attention_norm(hidden)
 
-                # Joint participation of each prompt before Q/K/V projection.
                 if n_prompts:
                     token_scale = x.new_ones(n_tokens)
                     token_scale[prompt_slice] = self.prompt_coupling_gates[layer_idx]
@@ -352,13 +376,98 @@ class ViTB16VPT(nn.Module):
                 weights = attention_probs if attn.vis else None
                 attention_probs = attn.attn_dropout(attention_probs)
 
-                # Transport gates scale value flow after softmax.
-                transport = attention_probs.new_ones(
-                    n_heads,
-                    n_tokens,
-                    n_tokens,
-                )
+                with torch.no_grad():
+                    probs = attention_probs.detach()
+                    values = value.detach()
+                    value_cls = values[:, :, :1]
+                    value_patch = values[:, :, patch_slice]
 
+                    def route_energy(dest, source, source_values):
+                        return projected_energy(
+                            probs[:, :, dest, source] @ source_values
+                        )
+
+                    backbone_energy = torch.stack(
+                        (
+                            torch.stack(
+                                (
+                                    route_energy(slice(0, 1), slice(0, 1), value_cls),
+                                    route_energy(slice(0, 1), patch_slice, value_patch),
+                                ),
+                                dim=-1,
+                            ),
+                            torch.stack(
+                                (
+                                    route_energy(patch_slice, slice(0, 1), value_cls),
+                                    route_energy(patch_slice, patch_slice, value_patch),
+                                ),
+                                dim=-1,
+                            ),
+                        ),
+                        dim=-2,
+                    )
+                    record("backbone_attention_transport", backbone_energy)
+
+                    if n_prompts:
+                        value_prompt = values[:, :, prompt_slice]
+                        record(
+                            "prompt_to_backbone_attention_transport",
+                            torch.stack(
+                                (
+                                    route_energy(
+                                        slice(0, 1), prompt_slice, value_prompt
+                                    ),
+                                    route_energy(
+                                        patch_slice, prompt_slice, value_prompt
+                                    ),
+                                ),
+                                dim=-1,
+                            ),
+                        )
+                        record(
+                            "prompt_destination_attention_transport",
+                            torch.stack(
+                                (
+                                    route_energy(prompt_slice, slice(0, 1), value_cls),
+                                    route_energy(
+                                        prompt_slice, patch_slice, value_patch
+                                    ),
+                                    route_energy(
+                                        prompt_slice, prompt_slice, value_prompt
+                                    ),
+                                ),
+                                dim=-1,
+                            ),
+                        )
+                    else:
+                        zero = probs.new_zeros(probs.shape[0], n_heads)
+                        record(
+                            "prompt_to_backbone_attention_transport",
+                            torch.stack((zero, zero), dim=-1),
+                        )
+                        record(
+                            "prompt_destination_attention_transport",
+                            torch.stack((zero, zero, zero), dim=-1),
+                        )
+
+                    patch_probs = probs[:, :, patch_slice, patch_slice]
+                    spatial_energy = []
+                    for band in range(4):
+                        mask = (self._functional_patch_spatial_bins == band).to(
+                            patch_probs.dtype
+                        )
+                        spatial_energy.append(
+                            projected_energy(
+                                (patch_probs * mask[None, None]) @ value_patch
+                            )
+                        )
+                    record(
+                        "patch_spatial_transport",
+                        torch.stack(spatial_energy, dim=-1),
+                    )
+
+                # Transport gates scale value flow after softmax.
+                transport = attention_probs.new_ones(n_heads, n_tokens, n_tokens)
                 backbone_transport = functional_gates["backbone_attention_transport"][
                     layer_idx
                 ]
@@ -372,27 +481,19 @@ class ViTB16VPT(nn.Module):
                     layer_idx
                 ]
 
-                # Backbone CLS/PATCH routes.
                 transport[:, 0, 0] = backbone_transport[:, 0, 0]
                 transport[:, 0, patch_slice] = backbone_transport[:, 0, 1, None]
                 transport[:, patch_slice, 0] = backbone_transport[:, 1, 0, None]
-
-                # PATCH <- PATCH decomposed by spatial scale.
-                spatial_scale = spatial_transport[
-                    :, self._functional_patch_spatial_bins
-                ]
                 transport[:, patch_slice, patch_slice] = (
-                    backbone_transport[:, 1, 1, None, None] * spatial_scale
+                    backbone_transport[:, 1, 1, None, None]
+                    * spatial_transport[:, self._functional_patch_spatial_bins]
                 )
 
                 if n_prompts:
-                    # PROMPT -> backbone routes.
                     transport[:, 0, prompt_slice] = prompt_to_backbone[:, 0, None]
                     transport[:, patch_slice, prompt_slice] = prompt_to_backbone[
                         :, 1, None, None
                     ]
-
-                    # Prompt-destination routes; relevant for shallow VPT.
                     transport[:, prompt_slice, 0] = prompt_destination[:, 0, None]
                     transport[:, prompt_slice, patch_slice] = prompt_destination[
                         :, 1, None, None
@@ -401,27 +502,26 @@ class ViTB16VPT(nn.Module):
                         :, 2, None, None
                     ]
                 else:
-                    # Keep prompt-specific families connected with zero derivative.
                     transport = transport + 0.0 * (
                         prompt_to_backbone.sum() + prompt_destination.sum()
                     )
 
                 context = (attention_probs * transport[None]) @ value
+                with torch.no_grad():
+                    record("attention_head", projected_energy(context.detach()))
 
-                # Attention-head contribution before the output projection.
                 context = (
                     context
                     * functional_gates["attention_head"][layer_idx][None, :, None, None]
                 )
-
                 batch_size, _, current_tokens, _ = context.shape
                 context = context.transpose(1, 2).reshape(
                     batch_size,
                     current_tokens,
                     attn.all_head_size,
                 )
-
                 attention_output = attn.proj_dropout(attn.out(context))
+                attention_energy = attention_output.detach().square().sum(dim=(1, 2))
 
                 hidden = (
                     residual
@@ -429,20 +529,40 @@ class ViTB16VPT(nn.Module):
                     * attention_output
                 )
 
-                # --------------------------------------------------------------
                 # MLP
-                # --------------------------------------------------------------
                 residual = hidden
                 ffn = block.ffn
-
                 x = ffn.dropout(ffn.act_fn(ffn.fc1(block.ffn_norm(hidden))))
 
-                # Hidden-unit contribution before the MLP output projection.
-                x = x * functional_gates["mlp_neuron"][layer_idx][None, None, :]
+                with torch.no_grad():
+                    record(
+                        "mlp_neuron",
+                        x.detach().square().sum(dim=1)
+                        * self._functional_mlp_output_norms[layer_idx][None],
+                    )
 
+                x = x * functional_gates["mlp_neuron"][layer_idx][None, None, :]
                 mlp_output = ffn.dropout(ffn.fc2(x))
 
-                # CLS/PATCH MLP-output dependence.
+                with torch.no_grad():
+                    raw_mlp_output = mlp_output.detach()
+                    record(
+                        "mlp_token_output",
+                        torch.stack(
+                            (
+                                raw_mlp_output[:, 0].square().sum(dim=-1),
+                                raw_mlp_output[:, patch_slice].square().sum(dim=(1, 2)),
+                            ),
+                            dim=-1,
+                        ),
+                    )
+                    prompt_energy = (
+                        raw_mlp_output[:, prompt_slice].square().sum(dim=(1, 2))
+                        if n_prompts
+                        else raw_mlp_output.new_zeros(raw_mlp_output.shape[0])
+                    )
+                    record("prompt_mlp_token_output", prompt_energy)
+
                 token_scale = mlp_output.new_ones(n_tokens)
                 token_scale[0] = functional_gates["mlp_token_output"][layer_idx, 0]
                 token_scale[patch_slice] = functional_gates["mlp_token_output"][
@@ -450,51 +570,46 @@ class ViTB16VPT(nn.Module):
                 ]
 
                 if n_prompts:
-                    # Persistent prompt MLP output; relevant for shallow VPT.
                     token_scale[prompt_slice] = functional_gates[
                         "prompt_mlp_token_output"
                     ][layer_idx]
                 else:
-                    # Keep the prompt-specific family connected with zero derivative.
                     token_scale = (
                         token_scale
                         + 0.0 * functional_gates["prompt_mlp_token_output"][layer_idx]
                     )
 
                 mlp_output = mlp_output * token_scale[None, :, None]
+                mlp_energy = mlp_output.detach().square().sum(dim=(1, 2))
+
+                with torch.no_grad():
+                    record(
+                        "residual_branch",
+                        torch.stack((attention_energy, mlp_energy), dim=-1),
+                    )
 
                 hidden = (
                     residual
                     + functional_gates["residual_branch"][layer_idx, 1] * mlp_output
                 )
-
                 return hidden, weights
 
             return forward
 
         for layer_idx, block in enumerate(blocks):
-            block.forward = MethodType(
-                make_forward(layer_idx),
-                block,
-            )
+            block.forward = MethodType(make_forward(layer_idx), block)
 
-    def _reset_gate_values(self):
-        """
-        Set all functional and prompt-coupling gates to one so the instrumented
-        model exactly reproduces the original model.
-        """
+    def _reset_functional_artifacts(self):
+        """Reset functional gates and participation storage."""
         with torch.no_grad():
             for gate in self.functional_gates.values():
                 gate.fill_(1)
             self.prompt_coupling_gates.fill_(1)
+            for participation in self.functional_participation.values():
+                participation.zero_()
 
-    def _set_gate_grads(
-        self,
-        mode: bool = True,
-    ):
-        """
-        Enable or disable gradients for all functional and prompt-coupling gates.
-        """
+    def _set_gate_grads(self, mode: bool = True):
+        """Enable or disable functional and prompt-coupling gate gradients."""
         for gate in self.functional_gates.values():
             gate.grad = None
             gate.requires_grad_(mode)
@@ -507,28 +622,14 @@ class ViTB16VPT(nn.Module):
         loader,
         mc_samples: int = 20,
         eps: float = 1e-12,
+        verbose: bool = False,
     ):
         """
-        Estimate functional Fisher and prompt-coupling signatures.
-
-        Returns:
-            F:
-                Diagonal model Fisher signature over all functional gates.
-
-            C:
-                Pairwise Fisher-score coupling signature between each functional
-                gate and every [layer, prompt] coupling gate.
-
-            R_layer:
-                Layerwise multiple Fisher coupling signature between each
-                functional gate and the prompt-coupling score subspace.
-
-            R_global:
-                Global multiple Fisher coupling signature between each functional
-                gate and the complete prompt-coupling score subspace.
+        Estimate functional participation, Fisher sensitivity, normalized
+        sensitivity, and prompt-score coupling signatures.
         """
-        self._create_functional_gates()
-        self._reset_gate_values()
+        self._create_functional_artifacts()
+        self._reset_functional_artifacts()
         self._set_gate_grads(True)
         self.eval()
 
@@ -540,16 +641,13 @@ class ViTB16VPT(nn.Module):
         n_layers, n_prompts = self.prompt_coupling_gates.shape
         n_coupling = self.prompt_coupling_gates.numel()
         use_prompts = n_coupling > 0
-
         device = functional_gates[0].device
 
+        participation_sum = functional_gates[0].new_zeros(n_functional)
         fisher_sum = functional_gates[0].new_zeros(n_functional)
 
         if use_prompts:
-            cross_sum = functional_gates[0].new_zeros(
-                n_functional,
-                n_coupling,
-            )
+            cross_sum = functional_gates[0].new_zeros(n_functional, n_coupling)
             prompt_gram_sum = functional_gates[0].new_zeros(
                 n_coupling,
                 n_coupling,
@@ -562,19 +660,30 @@ class ViTB16VPT(nn.Module):
         )
 
         bases = {}
+        input_count = 0
         sample_count = 0
+        iterator = tqdm(loader, desc="Functional signatures") if verbose else loader
 
-        for batch in loader:
+        for batch in iterator:
             x = batch[0].to(device, non_blocking=True)
+            with torch.no_grad():
+                for participation in self.functional_participation.values():
+                    participation.zero_()
 
             # Model Fisher: sample labels from the predictive distribution.
             log_probs = self(x).log_softmax(dim=-1)
+            participation_sum.add_(
+                torch.cat(
+                    [self.functional_participation[name].reshape(-1) for name in names]
+                )
+            )
+            input_count += x.shape[0]
+
             labels = torch.multinomial(
                 log_probs.detach().exp(),
                 mc_samples,
                 replacement=True,
             )
-
             selected = log_probs.gather(1, labels).flatten()
             n_samples = selected.numel()
 
@@ -593,22 +702,20 @@ class ViTB16VPT(nn.Module):
                 grad_outputs=basis,
                 is_grads_batched=True,
             )
-
             functional_scores = torch.cat(
                 [score.flatten(1) for score in scores[: len(functional_gates)]],
                 dim=1,
             )
-
             fisher_sum.add_(functional_scores.square().sum(dim=0))
 
             if use_prompts:
                 prompt_scores = scores[-1].flatten(1)
-
                 cross_sum.add_(functional_scores.T @ prompt_scores)
                 prompt_gram_sum.add_(prompt_scores.T @ prompt_scores)
 
             sample_count += n_samples
 
+        participation = participation_sum / input_count
         fisher = fisher_sum / sample_count
 
         def unpack(signature, tail=()):
@@ -621,7 +728,18 @@ class ViTB16VPT(nn.Module):
                 )
             }
 
+        P_signature = unpack(participation)
         F_signature = unpack(fisher)
+        S_signature = {}
+        for name in names:
+            p = P_signature[name]
+            f = F_signature[name]
+            threshold = eps * p.amax().clamp_min(1.0)
+            S_signature[name] = torch.where(
+                p > threshold,
+                f / p.clamp_min(threshold),
+                torch.zeros_like(f),
+            )
 
         if use_prompts:
             cross = cross_sum / sample_count
@@ -633,11 +751,7 @@ class ViTB16VPT(nn.Module):
                 fisher[:, None] * prompt_fisher[None, :]
             ).sqrt().clamp_min(eps)
 
-            cross_layer = cross.reshape(
-                n_functional,
-                n_layers,
-                n_prompts,
-            )
+            cross_layer = cross.reshape(n_functional, n_layers, n_prompts)
 
             # Layerwise prompt-coupling Fisher blocks: [L, P, P].
             prompt_layer = (
@@ -652,15 +766,8 @@ class ViTB16VPT(nn.Module):
             )
 
             # Symmetric PSD Fisher blocks use the Hermitian pseudoinverse.
-            layer_pinv = torch.linalg.pinv(
-                prompt_layer,
-                hermitian=True,
-            )
-
-            global_pinv = torch.linalg.pinv(
-                prompt_gram,
-                hermitian=True,
-            )
+            layer_pinv = torch.linalg.pinv(prompt_layer, hermitian=True)
+            global_pinv = torch.linalg.pinv(prompt_gram, hermitian=True)
 
             Rl2 = torch.einsum(
                 "glp,lpq,glq->gl",
@@ -671,16 +778,12 @@ class ViTB16VPT(nn.Module):
 
             Rg2 = (cross @ global_pinv * cross).sum(dim=-1) / fisher.clamp_min(eps)
 
-            C_signature = unpack(
-                coupling,
-                (n_layers, n_prompts),
-            )
+            C_signature = unpack(coupling, (n_layers, n_prompts))
             R_layer_signature = unpack(
                 Rl2.clamp(0, 1).sqrt(),
                 (n_layers,),
             )
             R_global_signature = unpack(Rg2.clamp(0, 1).sqrt())
-
         else:
             C_signature = unpack(
                 fisher.new_zeros(n_functional, 0),
@@ -696,6 +799,8 @@ class ViTB16VPT(nn.Module):
 
         return {
             "F": F_signature,
+            "S": S_signature,
+            "P": P_signature,
             "C": C_signature,
             "R_layer": R_layer_signature,
             "R_global": R_global_signature,

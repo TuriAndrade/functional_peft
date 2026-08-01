@@ -2,14 +2,15 @@ import argparse
 import json
 from pathlib import Path
 
-from task_functional_signature import FunctionalSignatureAnalyzer
+from task_functional_signatures import FisherSignatureAnalyzer
 from utils import parse_args_json
 
 
 def _build_parser():
-    parser = argparse.ArgumentParser(description="Analyze functional signatures.")
+    parser = argparse.ArgumentParser(description="Analyze functional separation.")
 
     parser.add_argument("--model-names", type=json.loads, default=None)
+    parser.add_argument("--model-groups", type=json.loads, default=None)
     parser.add_argument("--dataset-names", type=json.loads, default=None)
     parser.add_argument("--dataset-groups", type=json.loads, default=None)
     parser.add_argument("--f-sig-paths", type=json.loads, default=None)
@@ -29,7 +30,7 @@ def main():
     if args.save_name is not None:
         save_dir /= args.save_name
 
-    save_path = save_dir / "task_separation.csv"
+    save_path = save_dir / "functional_separation.csv"
 
     if save_path.exists():
         print(f"Experiment already done: {save_path}")
@@ -37,8 +38,9 @@ def main():
 
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    analyzer = FunctionalSignatureAnalyzer(
+    analyzer = FisherSignatureAnalyzer(
         model_names=args.model_names,
+        model_groups=args.model_groups,
         dataset_names=args.dataset_names,
         dataset_groups=args.dataset_groups,
         f_sig_paths=args.f_sig_paths,

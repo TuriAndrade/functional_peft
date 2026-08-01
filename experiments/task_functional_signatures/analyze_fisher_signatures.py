@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
 
 _RUN_SEED = 0
 
@@ -58,9 +58,9 @@ _STRUCTURED = [
 
 
 _DATASET_GROUPS = {
-    # ---------------------------------------------------------
-    # Coarse VTAB taxonomy
-    # ---------------------------------------------------------
+    # =========================================================
+    # 1. Official VTAB taxonomy
+    # =========================================================
     "vtab_natural": (
         _NATURAL,
         _SPECIALIZED + _STRUCTURED,
@@ -73,20 +73,9 @@ _DATASET_GROUPS = {
         _STRUCTURED,
         _NATURAL + _SPECIALIZED,
     ),
-    # ---------------------------------------------------------
-    # Relation to ImageNet pretraining domain
-    #
-    # ImageNet is the singleton anchor:
-    # Natural < non-Natural VTAB.
-    # ---------------------------------------------------------
-    "imagenet_reference": (
-        ["imagenet_val"],
-        _NATURAL,
-        _SPECIALIZED + _STRUCTURED,
-    ),
-    # ---------------------------------------------------------
-    # Specialized-domain subgroups defined by VTAB
-    # ---------------------------------------------------------
+    # =========================================================
+    # 2. Official Specialized subdomains
+    # =========================================================
     "domain_remote_sensing": (
         [
             "vtab_eurosat",
@@ -107,9 +96,9 @@ _DATASET_GROUPS = {
             "vtab_resisc45",
         ],
     ),
-    # ---------------------------------------------------------
-    # Same-source / provenance
-    # ---------------------------------------------------------
+    # =========================================================
+    # 3. Shared input provenance
+    # =========================================================
     "source_clevr": (
         [
             "vtab_clevr_count",
@@ -152,10 +141,23 @@ _DATASET_GROUPS = {
             "vtab_kitti_distance",
         ],
     ),
-    # ---------------------------------------------------------
-    # Cross-dataset functional relations
-    # ---------------------------------------------------------
-    "functional_fine_grained": (
+    # =========================================================
+    # 4. Prediction-task relations
+    # =========================================================
+    "task_entity_category_recognition": (
+        [
+            "vtab_caltech101",
+            "vtab_cifar100",
+            "vtab_flowers102",
+            "vtab_pets",
+        ],
+        [
+            "vtab_dtd",
+            "vtab_sun397",
+            "vtab_svhn",
+        ],
+    ),
+    "task_fine_grained_recognition": (
         [
             "vtab_flowers102",
             "vtab_pets",
@@ -168,21 +170,44 @@ _DATASET_GROUPS = {
             "vtab_svhn",
         ],
     ),
-    "functional_distance": (
+    "task_distance_related": (
         [
             "vtab_clevr_distance",
+            "vtab_dmlab",
             "vtab_kitti_distance",
         ],
         [
             "vtab_clevr_count",
-            "vtab_dmlab",
             "vtab_dsprites_location",
             "vtab_dsprites_orientation",
             "vtab_smallnorb_azimuth",
             "vtab_smallnorb_elevation",
         ],
     ),
+    "task_angular_prediction": (
+        [
+            "vtab_dsprites_orientation",
+            "vtab_smallnorb_azimuth",
+            "vtab_smallnorb_elevation",
+        ],
+        [
+            "vtab_clevr_count",
+            "vtab_clevr_distance",
+            "vtab_dmlab",
+            "vtab_dsprites_location",
+            "vtab_kitti_distance",
+        ],
+    ),
+    # =========================================================
+    # 5. External reference
+    # =========================================================
+    "pretraining_domain_alignment": (
+        ["imagenet_val"],
+        _NATURAL,
+        _SPECIALIZED + _STRUCTURED,
+    ),
 }
+
 
 _VPT_CONFIGS = [
     ("vpt_deep_5", "deep", 5),
@@ -195,6 +220,19 @@ _VPT_CONFIGS = [
     ("vpt_shallow_100", "shallow", 100),
     ("vpt_shallow_200", "shallow", 200),
 ]
+
+
+_DEEP_MODELS = [name for name, prompt_mode, _ in _VPT_CONFIGS if prompt_mode == "deep"]
+
+_SHALLOW_MODELS = [
+    name for name, prompt_mode, _ in _VPT_CONFIGS if prompt_mode == "shallow"
+]
+
+_MODEL_GROUPS = {
+    "vpt_deep": (_DEEP_MODELS,),
+    "vpt_shallow": (_SHALLOW_MODELS,),
+}
+
 
 _F_SIG_KEYS = [
     "residual_branch",
@@ -242,12 +280,59 @@ def _find_signature(
     return str(matches[0])
 
 
+def _find_best_signature(
+    eval_dir: Path,
+    prompt_mode: str,
+) -> str:
+    """
+    Find the seed-specific Fisher signature for the VPT configuration
+    with the highest validation accuracy for one prompt mode.
+    """
+    eval_path = eval_dir.parent / "eval.json"
+
+    with open(eval_path) as f:
+        results = json.load(f)
+
+    candidates = [result for result in results if result["prompt_mode"] == prompt_mode]
+
+    if not candidates:
+        raise ValueError(f"No results for prompt_mode={prompt_mode} in {eval_path}.")
+
+    best = max(
+        candidates,
+        key=lambda result: result["best_val_acc"],
+    )
+
+    seed_results = [
+        result for result in best["seed_results"] if result["seed"] == _RUN_SEED
+    ]
+
+    if len(seed_results) != 1:
+        raise ValueError(
+            f"Expected one seed {_RUN_SEED} run for best "
+            f"prompt_mode={prompt_mode} in {eval_path}, "
+            f"found {len(seed_results)}."
+        )
+
+    signature_path = Path(seed_results[0]["run_dir"]) / "functional_signatures.npz"
+
+    if not signature_path.exists():
+        raise FileNotFoundError(signature_path)
+
+    return str(signature_path)
+
+
 def build_args(
     backbone_name: str,
 ) -> Tuple[List[Dict], str, str]:
     experiments_dir = Path(__file__).resolve().parent.parent
 
-    model_names = ["linear_probe"] + [name for name, _, _ in _VPT_CONFIGS]
+    model_names = (
+        ["linear_probe"]
+        + [name for name, _, _ in _VPT_CONFIGS]
+        + ["vpt_shallow_best", "vpt_deep_best"]
+    )
+
     f_sig_paths = []
 
     # Linear probe
@@ -265,7 +350,7 @@ def build_args(
         ]
     )
 
-    # VPT variants
+    # Fixed-length VPT variants
     for _, prompt_mode, prompt_length in _VPT_CONFIGS:
         f_sig_paths.append(
             [
@@ -283,11 +368,29 @@ def build_args(
             ]
         )
 
+    # Validation-selected VPT variants
+    for prompt_mode in ("shallow", "deep"):
+        f_sig_paths.append(
+            [
+                _find_best_signature(
+                    experiments_dir
+                    / "vpt"
+                    / "top1_acc_ft"
+                    / backbone_name
+                    / dataset_name
+                    / "eval",
+                    prompt_mode=prompt_mode,
+                )
+                for dataset_name in _DATASET_NAMES
+            ]
+        )
+
     save_dir = Path(__file__).resolve().parent / backbone_name
 
     args = [
         {
             "model_names": model_names,
+            "model_groups": _MODEL_GROUPS,
             "dataset_names": _DATASET_NAMES,
             "dataset_groups": _DATASET_GROUPS,
             "f_sig_paths": f_sig_paths,
@@ -300,8 +403,9 @@ def build_args(
     output_path = str(
         Path(__file__).resolve().parent
         / backbone_name
-        / "analyze_functional_signatures.txt"
+        / "analyze_fisher_signatures.txt"
     )
-    exe_prefix = "python analyze_functional_signatures_exe.py"
+
+    exe_prefix = "python analyze_fisher_signatures_exe.py"
 
     return args, output_path, exe_prefix
