@@ -730,16 +730,6 @@ class ViTB16VPT(nn.Module):
 
         P_signature = unpack(participation)
         F_signature = unpack(fisher)
-        S_signature = {}
-        for name in names:
-            p = P_signature[name]
-            f = F_signature[name]
-            threshold = eps * p.amax().clamp_min(1.0)
-            S_signature[name] = torch.where(
-                p > threshold,
-                f / p.clamp_min(threshold),
-                torch.zeros_like(f),
-            )
 
         if use_prompts:
             cross = cross_sum / sample_count
@@ -799,7 +789,6 @@ class ViTB16VPT(nn.Module):
 
         return {
             "F": F_signature,
-            "S": S_signature,
             "P": P_signature,
             "C": C_signature,
             "R_layer": R_layer_signature,

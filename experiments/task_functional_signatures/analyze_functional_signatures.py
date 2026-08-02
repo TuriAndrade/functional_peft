@@ -233,8 +233,7 @@ _MODEL_GROUPS = {
     "vpt_shallow": (_SHALLOW_MODELS,),
 }
 
-
-_F_SIG_KEYS = [
+_SIG_KEYS = [
     "residual_branch",
     "attention_head",
     "backbone_attention_transport",
@@ -285,7 +284,7 @@ def _find_best_signature(
     prompt_mode: str,
 ) -> str:
     """
-    Find the seed-specific Fisher signature for the VPT configuration
+    Find the seed-specific functional signature for the VPT configuration
     with the highest validation accuracy for one prompt mode.
     """
     eval_path = eval_dir.parent / "eval.json"
@@ -333,10 +332,10 @@ def build_args(
         + ["vpt_shallow_best", "vpt_deep_best"]
     )
 
-    f_sig_paths = []
+    sig_paths = []
 
     # Linear probe
-    f_sig_paths.append(
+    sig_paths.append(
         [
             _find_signature(
                 experiments_dir
@@ -352,7 +351,7 @@ def build_args(
 
     # Fixed-length VPT variants
     for _, prompt_mode, prompt_length in _VPT_CONFIGS:
-        f_sig_paths.append(
+        sig_paths.append(
             [
                 _find_signature(
                     experiments_dir
@@ -370,7 +369,7 @@ def build_args(
 
     # Validation-selected VPT variants
     for prompt_mode in ("shallow", "deep"):
-        f_sig_paths.append(
+        sig_paths.append(
             [
                 _find_best_signature(
                     experiments_dir
@@ -393,19 +392,20 @@ def build_args(
             "model_groups": _MODEL_GROUPS,
             "dataset_names": _DATASET_NAMES,
             "dataset_groups": _DATASET_GROUPS,
-            "f_sig_paths": f_sig_paths,
-            "f_sig_keys": _F_SIG_KEYS,
+            "signature_paths": sig_paths,
+            "signature_keys": _SIG_KEYS,
             "save_dir": str(save_dir),
             "save_name": None,
+            "verbose": True,
         }
     ]
 
     output_path = str(
         Path(__file__).resolve().parent
         / backbone_name
-        / "analyze_fisher_signatures.txt"
+        / "analyze_functional_signatures.txt"
     )
 
-    exe_prefix = "python analyze_fisher_signatures_exe.py"
+    exe_prefix = "python analyze_functional_signatures_exe.py"
 
     return args, output_path, exe_prefix

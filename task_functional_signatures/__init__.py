@@ -1,1 +1,1 @@
-from .fisher_signature_analyzer import FisherSignatureAnalyzer
+from .functional_signatures_analyzer import FunctionalSignaturesAnalyzer
