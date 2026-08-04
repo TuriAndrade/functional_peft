@@ -35,8 +35,8 @@ from .task_functional_signatures.estimate_functional_signatures import (
     build_args as estimate_functional_signatures_ba,
 )
 
-from .task_functional_signatures.analyze_functional_signatures import (
-    build_args as analyze_functional_signatures_ba,
+from .task_functional_signatures.analyze_vtab_functional_separation import (
+    build_args as analyze_vtab_functional_separation_ba,
 )
 
 build_args = {
@@ -47,7 +47,7 @@ build_args = {
     "full_ft_tuning": full_ft_tuning_ba,
     "full_ft_eval": full_ft_eval_ba,
     "estimate_functional_signatures": estimate_functional_signatures_ba,
-    "analyze_functional_signatures": analyze_functional_signatures_ba,
+    "analyze_vtab_functional_separation": analyze_vtab_functional_separation_ba,
 }
 
 build_results = {

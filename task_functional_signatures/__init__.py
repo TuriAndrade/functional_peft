@@ -1,1 +1,1 @@
-from .functional_signatures_analyzer import FunctionalSignaturesAnalyzer
+from .vtab_functional_separation_analyzer import VTABFunctionalSeparationAnalyzer
