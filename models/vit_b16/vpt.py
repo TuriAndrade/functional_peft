@@ -1035,7 +1035,7 @@ class ViTB16VPT(nn.Module):
             self.backbone.norm,
         )
 
-def _reset_functional_artifacts(self):
+    def _reset_functional_artifacts(self):
         """Reset all gates to identity and clear participation storage."""
         with torch.no_grad():
             for gate in self.functional_gates.values():
@@ -1046,7 +1046,7 @@ def _reset_functional_artifacts(self):
             for value in self.functional_participation.values():
                 value.zero_()
 
-def _set_gate_grads(self, mode: bool = True):
+    def _set_gate_grads(self, mode: bool = True):
         """Enable or disable gradients only for functional/coupling gates."""
         for gate in self.functional_gates.values():
             gate.grad = None
@@ -1055,7 +1055,7 @@ def _set_gate_grads(self, mode: bool = True):
         self.coupling_gates.grad = None
         self.coupling_gates.requires_grad_(mode)
 
-def estimate_functional_signatures(
+    def estimate_functional_signatures(
         self,
         loader,
         mc_samples: int = 20,
