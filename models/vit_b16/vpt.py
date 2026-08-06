@@ -243,8 +243,11 @@ class ViTB16VPT(nn.Module):
 
     def _create_functional_artifacts(self):
         """
-        Create functional gates, participation storage, prompt-coupling gates,
-        and the instrumented transformer-block forward passes.
+        Create the functional gates, participation accumulators, fixed route
+        masks/metrics, and instrumented ViT forward pass.
+
+        Every gate is initialized to one, so the patched forward is identical
+        to the original forward at the Fisher evaluation point.
         """
         if hasattr(self, "functional_gates"):
             return
@@ -252,6 +255,8 @@ class ViTB16VPT(nn.Module):
         blocks = self.backbone.blocks
         n_layers = len(blocks)
         n_heads = blocks[0].attn.num_attention_heads
+        embed_dim = self.backbone.embed_dim
+        head_dim = blocks[0].attn.attention_head_size
         mlp_dim = blocks[0].ffn.fc1.out_features
         n_prompts = self.prompt_length
         n_patches = self.backbone.num_patches
@@ -266,358 +271,791 @@ class ViTB16VPT(nn.Module):
 
         self.functional_gates = nn.ParameterDict(
             {
-                # [layer, branch], branch order: attention, MLP
-                "residual_branch": gate((n_layers, 2)),
-                # [layer, head]
-                "attention_head": gate((n_layers, n_heads)),
-                # [layer, head, destination, source], token order: CLS, PATCH
-                "backbone_attention_transport": gate((n_layers, n_heads, 2, 2)),
-                # [layer, head, destination], PROMPT -> CLS/PATCH
-                "prompt_to_backbone_attention_transport": gate((n_layers, n_heads, 2)),
-                # [layer, head, source], CLS/PATCH/PROMPT -> PROMPT
-                "prompt_destination_attention_transport": gate((n_layers, n_heads, 3)),
-                # [layer, head, scale], scale order: SELF, LOCAL, MEDIUM, GLOBAL
-                "patch_spatial_transport": gate((n_layers, n_heads, 4)),
-                # [layer, hidden MLP unit]
-                "mlp_neuron": gate((n_layers, mlp_dim)),
-                # [layer, token type], token order: CLS, PATCH
-                "mlp_token_output": gate((n_layers, 2)),
-                # [layer], PROMPT MLP output
-                "prompt_mlp_token_output": gate((n_layers,)),
+                # [layer, site, token group, residual channel]
+                #
+                # site:
+                #   0 = attention read
+                #   1 = attention write
+                #   2 = MLP read
+                #   3 = MLP write
+                #
+                # token group:
+                #   0 = CLS
+                #   1 = patches
+                "residual_stream_channel": gate(
+                    (n_layers, 4, 2, embed_dim)
+                ),
+
+                # [residual channel]
+                # Final normalized CLS immediately before the classifier.
+                "final_cls_readout": gate((embed_dim,)),
+
+                # [layer, head, route]
+                #
+                # route:
+                #   0 = CLS   <- CLS
+                #   1 = CLS   <- PATCH
+                #   2 = PATCH <- CLS
+                #   3 = PATCH <- PATCH self
+                #   4 = PATCH <- PATCH local
+                #   5 = PATCH <- PATCH medium
+                #   6 = PATCH <- PATCH global
+                "attention_qk_route": gate((n_layers, n_heads, 7)),
+                "attention_ov_route": gate((n_layers, n_heads, 7)),
+
+                # [layer, head, token group, raw head channel]
+                #
+                # QK token group:
+                #   0 = CLS query
+                #   1 = patch query
+                #
+                # OV token group:
+                #   0 = output written to CLS
+                #   1 = output written to patches
+                "attention_qk_channel": gate(
+                    (n_layers, n_heads, 2, head_dim)
+                ),
+                "attention_ov_channel": gate(
+                    (n_layers, n_heads, 2, head_dim)
+                ),
+
+                # [layer, processed token group, hidden MLP neuron]
+                #
+                # token group:
+                #   0 = CLS
+                #   1 = patches
+                "mlp_neuron": gate((n_layers, 2, mlp_dim)),
+
+                # [layer, head, destination group]
+                #
+                # Source is any prompt token.
+                # destination:
+                #   0 = CLS
+                #   1 = patches
+                "prompt_to_backbone_qk_route": gate(
+                    (n_layers, n_heads, 2)
+                ),
+                "prompt_to_backbone_ov_route": gate(
+                    (n_layers, n_heads, 2)
+                ),
             }
         )
 
-        self.functional_participation = {
-            name: gate_tensor.new_zeros(gate_tensor.shape)
-            for name, gate_tensor in self.functional_gates.items()
+        # [layer, prompt token]
+        #
+        # Scales each complete prompt state before its Q/K/V projections.
+        # These scores define the prompt space used by C and R.
+        self.coupling_gates = gate((n_layers, n_prompts))
+
+        # Coarse components are derived exactly from fine per-sample scores.
+        self._functional_shapes = {
+            **{
+                name: tuple(value.shape)
+                for name, value in self.functional_gates.items()
+            },
+
+            # [layer, sublayer]
+            #
+            # sublayer:
+            #   0 = attention
+            #   1 = MLP
+            "sublayer_update": (n_layers, 2),
+
+            # [layer, sublayer, token group]
+            #
+            # sublayer:
+            #   0 = attention
+            #   1 = MLP
+            #
+            # token group:
+            #   0 = CLS
+            #   1 = patches
+            "sublayer_token_update": (n_layers, 2, 2),
+
+            # [layer, head]
+            # Complete head output delivered to CLS/patch destinations.
+            "attention_head_update": (n_layers, n_heads),
         }
 
-        # [layer, prompt]: joint Q/K/V participation of each prompt.
-        self.prompt_coupling_gates = gate((n_layers, n_prompts))
+        self._functional_names = tuple(self._functional_shapes)
+
+        self.functional_participation = {
+            name: reference.new_zeros(shape)
+            for name, shape in self._functional_shapes.items()
+        }
+
+        # ------------------------------------------------------------------
+        # Fixed attention-route masks
+        # ------------------------------------------------------------------
 
         grid = self.backbone.grid_size
-        coords = (
-            torch.stack(
-                torch.meshgrid(
-                    torch.arange(grid, device=reference.device),
-                    torch.arange(grid, device=reference.device),
-                    indexing="ij",
-                ),
-                dim=-1,
-            )
-            .reshape(-1, 2)
-            .to(reference.dtype)
-        )
-        distances = torch.cdist(coords, coords)
-        quantiles = torch.quantile(
+
+        coordinates = torch.stack(
+            torch.meshgrid(
+                torch.arange(grid, device=reference.device),
+                torch.arange(grid, device=reference.device),
+                indexing="ij",
+            ),
+            dim=-1,
+        ).reshape(-1, 2).to(reference.dtype)
+
+        distances = torch.cdist(coordinates, coordinates)
+
+        thresholds = torch.quantile(
             distances[distances > 0],
             distances.new_tensor([1 / 3, 2 / 3]),
         )
-        spatial_bins = torch.bucketize(distances, quantiles) + 1
+
+        # Patch-to-patch bins:
+        #   0 = self
+        #   1 = local
+        #   2 = medium
+        #   3 = global
+        spatial_bins = torch.bucketize(
+            distances,
+            thresholds,
+        ) + 1
+
         spatial_bins.fill_diagonal_(0)
-        self.register_buffer(
-            "_functional_patch_spatial_bins",
-            spatial_bins,
-            persistent=False,
+
+        # Nine mutually exclusive routes ending at backbone tokens.
+        # Routes 0:7 are backbone-to-backbone.
+        # Routes 7:9 are prompt-to-backbone.
+        route_masks = reference.new_zeros(
+            9,
+            n_tokens,
+            n_tokens,
         )
 
-        attention_metrics = []
-        mlp_output_norms = []
+        route_masks[0, 0, 0] = 1
+        route_masks[1, 0, patch_slice] = 1
+        route_masks[2, patch_slice, 0] = 1
+
+        for band in range(4):
+            route_masks[
+                3 + band,
+                patch_slice,
+                patch_slice,
+            ] = (spatial_bins == band).to(reference.dtype)
+
+        route_masks[7, 0, prompt_slice] = 1
+        route_masks[8, patch_slice, prompt_slice] = 1
+
+        self._functional_route_masks = route_masks
+
+        # ------------------------------------------------------------------
+        # Fixed output-space energy metrics
+        # ------------------------------------------------------------------
+
+        head_metrics = []
+        head_channel_norms = []
+        mlp_neuron_norms = []
+
         with torch.no_grad():
             for block in blocks:
-                attn = block.attn
-                weight = (
-                    attn.out.weight.detach()
-                    .reshape(attn.out.out_features, n_heads, attn.attention_head_size)
-                    .permute(1, 2, 0)
-                )
-                attention_metrics.append(weight @ weight.transpose(-1, -2))
-                mlp_output_norms.append(
-                    block.ffn.fc2.weight.detach().square().sum(dim=0)
+                output_weight = block.attn.out.weight
+
+                layer_metrics = []
+                layer_channel_norms = []
+
+                for head_idx in range(n_heads):
+                    head_slice = slice(
+                        head_idx * head_dim,
+                        (head_idx + 1) * head_dim,
+                    )
+
+                    # Columns of W_O corresponding to this head: [D, K].
+                    head_weight = output_weight[:, head_slice]
+
+                    # For head context c:
+                    # ||W_O,h c||² = cᵀ(W_O,hᵀW_O,h)c.
+                    layer_metrics.append(
+                        head_weight.T @ head_weight
+                    )
+
+                    # Output norm of each raw head channel.
+                    layer_channel_norms.append(
+                        head_weight.square().sum(dim=0)
+                    )
+
+                head_metrics.append(torch.stack(layer_metrics))
+                head_channel_norms.append(
+                    torch.stack(layer_channel_norms)
                 )
 
-        self._functional_attention_metrics = torch.stack(attention_metrics)
-        self._functional_mlp_output_norms = torch.stack(mlp_output_norms)
+                # Output norm of each hidden MLP neuron.
+                mlp_neuron_norms.append(
+                    block.ffn.fc2.weight.square().sum(dim=0)
+                )
+
+        self._functional_head_metrics = torch.stack(head_metrics)
+        self._functional_head_channel_norms = torch.stack(
+            head_channel_norms
+        )
+        self._functional_mlp_neuron_norms = torch.stack(
+            mlp_neuron_norms
+        )
+
+        # ------------------------------------------------------------------
+        # Instrumented transformer-block forward
+        # ------------------------------------------------------------------
 
         def make_forward(layer_idx):
             def forward(block, hidden):
-                functional_gates = self.functional_gates
-                attn = block.attn
+                gates = self.functional_gates
+                attention = block.attn
 
-                def record(name, energy):
-                    self.functional_participation[name][layer_idx].copy_(
-                        energy.detach().sum(dim=0)
+                def record(name, index, value):
+                    """
+                    value has shape [batch, *component_shape_at_index].
+                    Participation is accumulated over the current batch.
+                    """
+                    self.functional_participation[name][index].copy_(
+                        value.detach().sum(dim=0)
                     )
 
-                def projected_energy(context):
+                def grouped_energy(value):
+                    """
+                    [B, T, C] -> [B, 2, C]
+
+                    Group 0 is CLS.
+                    Group 1 sums over all patch tokens.
+                    Prompt tokens are excluded.
+                    """
+                    energy = value.detach().square()
+
+                    return torch.stack(
+                        (
+                            energy[:, 0],
+                            energy[:, patch_slice].sum(dim=1),
+                        ),
+                        dim=1,
+                    )
+
+                def apply_token_groups(value, group_gate):
+                    """
+                    Apply separate channel/neuron gates to CLS and patches.
+
+                    value:      [B, T, C]
+                    group_gate: [2, C]
+
+                    Prompt tokens pass unchanged.
+                    """
+                    return torch.cat(
+                        (
+                            value[:, :1]
+                            * group_gate[0][None, None],
+
+                            value[:, prompt_slice],
+
+                            value[:, patch_slice]
+                            * group_gate[1][None, None],
+                        ),
+                        dim=1,
+                    )
+
+                def expand_head_groups(group_gate):
+                    """
+                    [H, 2, K] -> [H, T, K]
+
+                    Prompt tokens receive scale one.
+                    """
+                    return torch.cat(
+                        (
+                            group_gate[:, :1],
+
+                            group_gate.new_ones(
+                                n_heads,
+                                n_prompts,
+                                head_dim,
+                            ),
+
+                            group_gate[:, 1:2].expand(
+                                -1,
+                                n_patches,
+                                -1,
+                            ),
+                        ),
+                        dim=1,
+                    )
+
+                def projected_head_energy(context):
+                    """
+                    Squared output energy of each head after its W_O slice.
+
+                    context: [B, H, T, K]
+                    return:  [B, H]
+                    """
+                    context = context.detach()
+
                     return torch.einsum(
                         "bhtd,hde,bhte->bh",
                         context,
-                        self._functional_attention_metrics[layer_idx],
+                        self._functional_head_metrics[layer_idx],
                         context,
                     )
 
-                # Attention
+                # ==========================================================
+                # Attention read
+                # ==========================================================
+
                 residual = hidden
-                x = block.attention_norm(hidden)
+                value = block.attention_norm(hidden)
+
+                record(
+                    "residual_stream_channel",
+                    (layer_idx, 0),
+                    grouped_energy(value),
+                )
+
+                value = apply_token_groups(
+                    value,
+                    gates["residual_stream_channel"][
+                        layer_idx,
+                        0,
+                    ],
+                )
 
                 if n_prompts:
-                    token_scale = x.new_ones(n_tokens)
-                    token_scale[prompt_slice] = self.prompt_coupling_gates[layer_idx]
-                    x = x * token_scale[None, :, None]
-
-                query = attn.transpose_for_scores(attn.query(x))
-                key = attn.transpose_for_scores(attn.key(x))
-                value = attn.transpose_for_scores(attn.value(x))
-
-                attention_probs = attn.softmax(
-                    query @ key.transpose(-1, -2) / math.sqrt(attn.attention_head_size)
-                )
-                weights = attention_probs if attn.vis else None
-                attention_probs = attn.attn_dropout(attention_probs)
-
-                with torch.no_grad():
-                    probs = attention_probs.detach()
-                    values = value.detach()
-                    value_cls = values[:, :, :1]
-                    value_patch = values[:, :, patch_slice]
-
-                    def route_energy(dest, source, source_values):
-                        return projected_energy(
-                            probs[:, :, dest, source] @ source_values
-                        )
-
-                    backbone_energy = torch.stack(
+                    value = torch.cat(
                         (
-                            torch.stack(
-                                (
-                                    route_energy(slice(0, 1), slice(0, 1), value_cls),
-                                    route_energy(slice(0, 1), patch_slice, value_patch),
-                                ),
-                                dim=-1,
-                            ),
-                            torch.stack(
-                                (
-                                    route_energy(patch_slice, slice(0, 1), value_cls),
-                                    route_energy(patch_slice, patch_slice, value_patch),
-                                ),
-                                dim=-1,
-                            ),
+                            value[:, :1],
+
+                            value[:, prompt_slice]
+                            * self.coupling_gates[
+                                layer_idx
+                            ][None, :, None],
+
+                            value[:, patch_slice],
                         ),
-                        dim=-2,
-                    )
-                    record("backbone_attention_transport", backbone_energy)
-
-                    if n_prompts:
-                        value_prompt = values[:, :, prompt_slice]
-                        record(
-                            "prompt_to_backbone_attention_transport",
-                            torch.stack(
-                                (
-                                    route_energy(
-                                        slice(0, 1), prompt_slice, value_prompt
-                                    ),
-                                    route_energy(
-                                        patch_slice, prompt_slice, value_prompt
-                                    ),
-                                ),
-                                dim=-1,
-                            ),
-                        )
-                        record(
-                            "prompt_destination_attention_transport",
-                            torch.stack(
-                                (
-                                    route_energy(prompt_slice, slice(0, 1), value_cls),
-                                    route_energy(
-                                        prompt_slice, patch_slice, value_patch
-                                    ),
-                                    route_energy(
-                                        prompt_slice, prompt_slice, value_prompt
-                                    ),
-                                ),
-                                dim=-1,
-                            ),
-                        )
-                    else:
-                        zero = probs.new_zeros(probs.shape[0], n_heads)
-                        record(
-                            "prompt_to_backbone_attention_transport",
-                            torch.stack((zero, zero), dim=-1),
-                        )
-                        record(
-                            "prompt_destination_attention_transport",
-                            torch.stack((zero, zero, zero), dim=-1),
-                        )
-
-                    patch_probs = probs[:, :, patch_slice, patch_slice]
-                    spatial_energy = []
-                    for band in range(4):
-                        mask = (self._functional_patch_spatial_bins == band).to(
-                            patch_probs.dtype
-                        )
-                        spatial_energy.append(
-                            projected_energy(
-                                (patch_probs * mask[None, None]) @ value_patch
-                            )
-                        )
-                    record(
-                        "patch_spatial_transport",
-                        torch.stack(spatial_energy, dim=-1),
+                        dim=1,
                     )
 
-                # Transport gates scale value flow after softmax.
-                transport = attention_probs.new_ones(n_heads, n_tokens, n_tokens)
-                backbone_transport = functional_gates["backbone_attention_transport"][
-                    layer_idx
-                ]
-                prompt_to_backbone = functional_gates[
-                    "prompt_to_backbone_attention_transport"
-                ][layer_idx]
-                prompt_destination = functional_gates[
-                    "prompt_destination_attention_transport"
-                ][layer_idx]
-                spatial_transport = functional_gates["patch_spatial_transport"][
-                    layer_idx
-                ]
-
-                transport[:, 0, 0] = backbone_transport[:, 0, 0]
-                transport[:, 0, patch_slice] = backbone_transport[:, 0, 1, None]
-                transport[:, patch_slice, 0] = backbone_transport[:, 1, 0, None]
-                transport[:, patch_slice, patch_slice] = (
-                    backbone_transport[:, 1, 1, None, None]
-                    * spatial_transport[:, self._functional_patch_spatial_bins]
+                query = attention.transpose_for_scores(
+                    attention.query(value)
                 )
 
-                if n_prompts:
-                    transport[:, 0, prompt_slice] = prompt_to_backbone[:, 0, None]
-                    transport[:, patch_slice, prompt_slice] = prompt_to_backbone[
-                        :, 1, None, None
-                    ]
-                    transport[:, prompt_slice, 0] = prompt_destination[:, 0, None]
-                    transport[:, prompt_slice, patch_slice] = prompt_destination[
-                        :, 1, None, None
-                    ]
-                    transport[:, prompt_slice, prompt_slice] = prompt_destination[
-                        :, 2, None, None
-                    ]
-                else:
-                    transport = transport + 0.0 * (
-                        prompt_to_backbone.sum() + prompt_destination.sum()
+                key = attention.transpose_for_scores(
+                    attention.key(value)
+                )
+
+                attention_value = attention.transpose_for_scores(
+                    attention.value(value)
+                )
+
+                # ==========================================================
+                # QK channels
+                # ==========================================================
+
+                query_energy = query.detach().square()
+
+                qk_channel_energy = torch.stack(
+                    (
+                        query_energy[:, :, 0],
+
+                        query_energy[
+                            :,
+                            :,
+                            patch_slice,
+                        ].sum(dim=2),
+                    ),
+                    dim=2,
+                )
+
+                # For QK channel k:
+                #
+                # sum_j (q_ik k_jk / sqrt(K))²
+                # = q_ik² sum_j k_jk² / K.
+                qk_channel_energy = (
+                    qk_channel_energy
+                    * key.detach()
+                    .square()
+                    .sum(dim=2)[:, :, None]
+                    / head_dim
+                )
+
+                record(
+                    "attention_qk_channel",
+                    layer_idx,
+                    qk_channel_energy,
+                )
+
+                query = query * expand_head_groups(
+                    gates["attention_qk_channel"][layer_idx]
+                )[None]
+
+                attention_scores = (
+                    query @ key.transpose(-1, -2)
+                    / math.sqrt(head_dim)
+                )
+
+                # ==========================================================
+                # QK routes
+                # ==========================================================
+
+                qk_route_energy = torch.einsum(
+                    "bhij,rij->bhr",
+                    attention_scores.detach().square(),
+                    self._functional_route_masks,
+                )
+
+                record(
+                    "attention_qk_route",
+                    layer_idx,
+                    qk_route_energy[:, :, :7],
+                )
+
+                record(
+                    "prompt_to_backbone_qk_route",
+                    layer_idx,
+                    qk_route_energy[:, :, 7:],
+                )
+
+                qk_route_gates = torch.cat(
+                    (
+                        gates["attention_qk_route"][layer_idx],
+
+                        gates[
+                            "prompt_to_backbone_qk_route"
+                        ][layer_idx],
+                    ),
+                    dim=-1,
+                )
+
+                attention_scores = attention_scores * (
+                    1
+                    + torch.einsum(
+                        "hr,rij->hij",
+                        qk_route_gates - 1,
+                        self._functional_route_masks,
+                    )
+                )[None]
+
+                attention_probs = attention.softmax(
+                    attention_scores
+                )
+
+                weights = (
+                    attention_probs
+                    if attention.vis
+                    else None
+                )
+
+                attention_probs = attention.attn_dropout(
+                    attention_probs
+                )
+
+                # ==========================================================
+                # OV-route participation
+                # ==========================================================
+
+                with torch.no_grad():
+                    # [B, H, route, destination token, K]
+                    route_context = torch.einsum(
+                        "bhij,rij,bhjk->bhrik",
+                        attention_probs.detach(),
+                        self._functional_route_masks,
+                        attention_value.detach(),
                     )
 
-                context = (attention_probs * transport[None]) @ value
-                with torch.no_grad():
-                    record("attention_head", projected_energy(context.detach()))
+                    ov_route_energy = torch.einsum(
+                        "bhrik,hkl,bhril->bhr",
+                        route_context,
+                        self._functional_head_metrics[layer_idx],
+                        route_context,
+                    )
+
+                    record(
+                        "attention_ov_route",
+                        layer_idx,
+                        ov_route_energy[:, :, :7],
+                    )
+
+                    record(
+                        "prompt_to_backbone_ov_route",
+                        layer_idx,
+                        ov_route_energy[:, :, 7:],
+                    )
+
+                # ==========================================================
+                # OV routes
+                # ==========================================================
+
+                ov_route_gates = torch.cat(
+                    (
+                        gates["attention_ov_route"][layer_idx],
+
+                        gates[
+                            "prompt_to_backbone_ov_route"
+                        ][layer_idx],
+                    ),
+                    dim=-1,
+                )
+
+                transport_scale = (
+                    1
+                    + torch.einsum(
+                        "hr,rij->hij",
+                        ov_route_gates - 1,
+                        self._functional_route_masks,
+                    )
+                )
 
                 context = (
-                    context
-                    * functional_gates["attention_head"][layer_idx][None, :, None, None]
-                )
-                batch_size, _, current_tokens, _ = context.shape
-                context = context.transpose(1, 2).reshape(
-                    batch_size,
-                    current_tokens,
-                    attn.all_head_size,
-                )
-                attention_output = attn.proj_dropout(attn.out(context))
-                attention_energy = attention_output.detach().square().sum(dim=(1, 2))
+                    attention_probs
+                    * transport_scale[None]
+                ) @ attention_value
 
-                hidden = (
-                    residual
-                    + functional_gates["residual_branch"][layer_idx, 0]
-                    * attention_output
+                # All source routes ending at CLS/patch destinations.
+                backbone_context = torch.cat(
+                    (
+                        context[:, :, :1],
+                        context[:, :, patch_slice],
+                    ),
+                    dim=2,
                 )
 
-                # MLP
+                record(
+                    "attention_head_update",
+                    layer_idx,
+                    projected_head_energy(backbone_context),
+                )
+
+                # ==========================================================
+                # OV channels
+                # ==========================================================
+
+                context_energy = context.detach().square()
+
+                ov_channel_energy = torch.stack(
+                    (
+                        context_energy[:, :, 0],
+
+                        context_energy[
+                            :,
+                            :,
+                            patch_slice,
+                        ].sum(dim=2),
+                    ),
+                    dim=2,
+                )
+
+                # One context channel contributes:
+                # context_k * W_O[:, head_channel_k].
+                ov_channel_energy = (
+                    ov_channel_energy
+                    * self._functional_head_channel_norms[
+                        layer_idx
+                    ][None, :, None]
+                )
+
+                record(
+                    "attention_ov_channel",
+                    layer_idx,
+                    ov_channel_energy,
+                )
+
+                context = context * expand_head_groups(
+                    gates["attention_ov_channel"][layer_idx]
+                )[None]
+
+                context = (
+                    context.transpose(1, 2)
+                    .reshape(
+                        value.shape[0],
+                        n_tokens,
+                        n_heads * head_dim,
+                    )
+                )
+
+                attention_output = attention.proj_dropout(
+                    attention.out(context)
+                )
+
+                # ==========================================================
+                # Attention write
+                # ==========================================================
+
+                attention_energy = grouped_energy(
+                    attention_output
+                )
+
+                record(
+                    "residual_stream_channel",
+                    (layer_idx, 1),
+                    attention_energy,
+                )
+
+                record(
+                    "sublayer_update",
+                    (layer_idx, 0),
+                    attention_energy.sum(dim=(1, 2)),
+                )
+
+                record(
+                    "sublayer_token_update",
+                    (layer_idx, 0, slice(None)),
+                    attention_energy.sum(dim=-1),
+                )
+
+                hidden = residual + apply_token_groups(
+                    attention_output,
+                    gates["residual_stream_channel"][
+                        layer_idx,
+                        1,
+                    ],
+                )
+
+                # ==========================================================
+                # MLP read and neurons
+                # ==========================================================
+
                 residual = hidden
-                ffn = block.ffn
-                x = ffn.dropout(ffn.act_fn(ffn.fc1(block.ffn_norm(hidden))))
+                feed_forward = block.ffn
 
-                with torch.no_grad():
-                    record(
-                        "mlp_neuron",
-                        x.detach().square().sum(dim=1)
-                        * self._functional_mlp_output_norms[layer_idx][None],
-                    )
+                value = block.ffn_norm(hidden)
 
-                x = x * functional_gates["mlp_neuron"][layer_idx][None, None, :]
-                mlp_output = ffn.dropout(ffn.fc2(x))
-
-                with torch.no_grad():
-                    raw_mlp_output = mlp_output.detach()
-                    record(
-                        "mlp_token_output",
-                        torch.stack(
-                            (
-                                raw_mlp_output[:, 0].square().sum(dim=-1),
-                                raw_mlp_output[:, patch_slice].square().sum(dim=(1, 2)),
-                            ),
-                            dim=-1,
-                        ),
-                    )
-                    prompt_energy = (
-                        raw_mlp_output[:, prompt_slice].square().sum(dim=(1, 2))
-                        if n_prompts
-                        else raw_mlp_output.new_zeros(raw_mlp_output.shape[0])
-                    )
-                    record("prompt_mlp_token_output", prompt_energy)
-
-                token_scale = mlp_output.new_ones(n_tokens)
-                token_scale[0] = functional_gates["mlp_token_output"][layer_idx, 0]
-                token_scale[patch_slice] = functional_gates["mlp_token_output"][
-                    layer_idx, 1
-                ]
-
-                if n_prompts:
-                    token_scale[prompt_slice] = functional_gates[
-                        "prompt_mlp_token_output"
-                    ][layer_idx]
-                else:
-                    token_scale = (
-                        token_scale
-                        + 0.0 * functional_gates["prompt_mlp_token_output"][layer_idx]
-                    )
-
-                mlp_output = mlp_output * token_scale[None, :, None]
-                mlp_energy = mlp_output.detach().square().sum(dim=(1, 2))
-
-                with torch.no_grad():
-                    record(
-                        "residual_branch",
-                        torch.stack((attention_energy, mlp_energy), dim=-1),
-                    )
-
-                hidden = (
-                    residual
-                    + functional_gates["residual_branch"][layer_idx, 1] * mlp_output
+                record(
+                    "residual_stream_channel",
+                    (layer_idx, 2),
+                    grouped_energy(value),
                 )
-                return hidden, weights
+
+                value = apply_token_groups(
+                    value,
+                    gates["residual_stream_channel"][
+                        layer_idx,
+                        2,
+                    ],
+                )
+
+                value = feed_forward.dropout(
+                    feed_forward.act_fn(
+                        feed_forward.fc1(value)
+                    )
+                )
+
+                # Neuron output energy:
+                # activation_j² * ||W_2[:, j]||².
+                neuron_energy = (
+                    grouped_energy(value)
+                    * self._functional_mlp_neuron_norms[
+                        layer_idx
+                    ][None, None]
+                )
+
+                record(
+                    "mlp_neuron",
+                    layer_idx,
+                    neuron_energy,
+                )
+
+                value = apply_token_groups(
+                    value,
+                    gates["mlp_neuron"][layer_idx],
+                )
+
+                mlp_output = feed_forward.dropout(
+                    feed_forward.fc2(value)
+                )
+
+                # ==========================================================
+                # MLP write
+                # ==========================================================
+
+                mlp_energy = grouped_energy(mlp_output)
+
+                record(
+                    "residual_stream_channel",
+                    (layer_idx, 3),
+                    mlp_energy,
+                )
+
+                record(
+                    "sublayer_update",
+                    (layer_idx, 1),
+                    mlp_energy.sum(dim=(1, 2)),
+                )
+
+                record(
+                    "sublayer_token_update",
+                    (layer_idx, 1, slice(None)),
+                    mlp_energy.sum(dim=-1),
+                )
+
+                return (
+                    residual
+                    + apply_token_groups(
+                        mlp_output,
+                        gates["residual_stream_channel"][
+                            layer_idx,
+                            3,
+                        ],
+                    ),
+                    weights,
+                )
 
             return forward
 
         for layer_idx, block in enumerate(blocks):
-            block.forward = MethodType(make_forward(layer_idx), block)
+            block.forward = MethodType(
+                make_forward(layer_idx),
+                block,
+            )
 
-    def _reset_functional_artifacts(self):
-        """Reset functional gates and participation storage."""
+        # Apply the final CLS gate after the original encoder LayerNorm.
+        original_norm_forward = self.backbone.norm.forward
+
+        def norm_forward(norm, hidden):
+            encoded = original_norm_forward(hidden)
+
+            self.functional_participation[
+                "final_cls_readout"
+            ].copy_(
+                encoded[:, 0]
+                .detach()
+                .square()
+                .sum(dim=0)
+            )
+
+            return torch.cat(
+                (
+                    encoded[:, :1]
+                    * self.functional_gates[
+                        "final_cls_readout"
+                    ][None, None],
+
+                    encoded[:, 1:],
+                ),
+                dim=1,
+            )
+
+        self.backbone.norm.forward = MethodType(
+            norm_forward,
+            self.backbone.norm,
+        )
+
+def _reset_functional_artifacts(self):
+        """Reset all gates to identity and clear participation storage."""
         with torch.no_grad():
             for gate in self.functional_gates.values():
                 gate.fill_(1)
-            self.prompt_coupling_gates.fill_(1)
-            for participation in self.functional_participation.values():
-                participation.zero_()
 
-    def _set_gate_grads(self, mode: bool = True):
-        """Enable or disable functional and prompt-coupling gate gradients."""
+            self.coupling_gates.fill_(1)
+
+            for value in self.functional_participation.values():
+                value.zero_()
+
+def _set_gate_grads(self, mode: bool = True):
+        """Enable or disable gradients only for functional/coupling gates."""
         for gate in self.functional_gates.values():
             gate.grad = None
             gate.requires_grad_(mode)
 
-        self.prompt_coupling_gates.grad = None
-        self.prompt_coupling_gates.requires_grad_(mode)
+        self.coupling_gates.grad = None
+        self.coupling_gates.requires_grad_(mode)
 
-    def estimate_functional_signatures(
+def estimate_functional_signatures(
         self,
         loader,
         mc_samples: int = 20,
@@ -625,58 +1063,96 @@ class ViTB16VPT(nn.Module):
         verbose: bool = False,
     ):
         """
-        Estimate functional participation, Fisher sensitivity, normalized
-        sensitivity, and prompt-score coupling signatures.
+        Estimate:
+
+        P: functional participation
+        F: diagonal model Fisher
+        S: F / P
+        C: prompt-component Fisher-score correlation
+        R_layer: prompt-subspace alignment per layer
+        R_global: alignment with the complete prompt subspace
         """
+        if mc_samples < 1:
+            raise ValueError("mc_samples must be positive")
+
         self._create_functional_artifacts()
         self._reset_functional_artifacts()
         self._set_gate_grads(True)
         self.eval()
 
-        names, functional_gates = zip(*self.functional_gates.items())
-        shapes = tuple(gate.shape for gate in functional_gates)
-        sizes = tuple(gate.numel() for gate in functional_gates)
+        gate_names, gates = zip(*self.functional_gates.items())
 
-        n_functional = sum(sizes)
-        n_layers, n_prompts = self.prompt_coupling_gates.shape
-        n_coupling = self.prompt_coupling_gates.numel()
-        use_prompts = n_coupling > 0
-        device = functional_gates[0].device
+        names = self._functional_names
+        shapes = tuple(
+            self._functional_shapes[name]
+            for name in names
+        )
+        sizes = tuple(
+            math.prod(shape)
+            for shape in shapes
+        )
 
-        participation_sum = functional_gates[0].new_zeros(n_functional)
-        fisher_sum = functional_gates[0].new_zeros(n_functional)
+        total_size = sum(sizes)
+        n_layers, n_prompts = self.coupling_gates.shape
+        use_prompts = n_prompts > 0
+        device = gates[0].device
+
+        participation_sum = gates[0].new_zeros(total_size)
+        fisher_sum = gates[0].new_zeros(total_size)
 
         if use_prompts:
-            cross_sum = functional_gates[0].new_zeros(n_functional, n_coupling)
-            prompt_gram_sum = functional_gates[0].new_zeros(
-                n_coupling,
-                n_coupling,
+            coupling_size = n_layers * n_prompts
+
+            cross_sum = gates[0].new_zeros(
+                total_size,
+                coupling_size,
+            )
+
+            coupling_gram_sum = gates[0].new_zeros(
+                coupling_size,
+                coupling_size,
             )
 
         params = (
-            (*functional_gates, self.prompt_coupling_gates)
+            (*gates, self.coupling_gates)
             if use_prompts
-            else functional_gates
+            else gates
         )
 
         bases = {}
         input_count = 0
         sample_count = 0
-        iterator = tqdm(loader, desc="Functional signatures") if verbose else loader
+
+        iterator = (
+            tqdm(loader, desc="Functional signatures")
+            if verbose
+            else loader
+        )
 
         for batch in iterator:
-            x = batch[0].to(device, non_blocking=True)
-            with torch.no_grad():
-                for participation in self.functional_participation.values():
-                    participation.zero_()
+            x = batch[0].to(
+                device,
+                non_blocking=True,
+            )
 
-            # Model Fisher: sample labels from the predictive distribution.
+            with torch.no_grad():
+                for value in self.functional_participation.values():
+                    value.zero_()
+
+            # Model Fisher: sample labels from p(y | x).
             log_probs = self(x).log_softmax(dim=-1)
+
             participation_sum.add_(
                 torch.cat(
-                    [self.functional_participation[name].reshape(-1) for name in names]
+                    [
+                        self.functional_participation[
+                            name
+                        ].reshape(-1)
+                        for name in names
+                    ]
                 )
             )
+
             input_count += x.shape[0]
 
             labels = torch.multinomial(
@@ -684,11 +1160,16 @@ class ViTB16VPT(nn.Module):
                 mc_samples,
                 replacement=True,
             )
-            selected = log_probs.gather(1, labels).flatten()
+
+            selected = log_probs.gather(
+                1,
+                labels,
+            ).flatten()
+
             n_samples = selected.numel()
 
-            # One functional/prompt score vector per sampled prediction.
             basis = bases.get(n_samples)
+
             if basis is None:
                 basis = bases[n_samples] = torch.eye(
                     n_samples,
@@ -696,45 +1177,112 @@ class ViTB16VPT(nn.Module):
                     dtype=selected.dtype,
                 )
 
-            scores = torch.autograd.grad(
+            raw_scores = torch.autograd.grad(
                 selected,
                 params,
                 grad_outputs=basis,
                 is_grads_batched=True,
             )
+
+            scores = dict(
+                zip(
+                    gate_names,
+                    raw_scores[: len(gates)],
+                )
+            )
+
+            # Exact coarse sublayer scores.
+            stream_scores = scores[
+                "residual_stream_channel"
+            ]
+
+            # [sample, layer, sublayer, token group]
+            scores["sublayer_token_update"] = torch.stack(
+                (
+                    stream_scores[:, :, 1].sum(dim=-1),
+                    stream_scores[:, :, 3].sum(dim=-1),
+                ),
+                dim=2,
+            )
+
+            # [sample, layer, sublayer]
+            scores["sublayer_update"] = scores[
+                "sublayer_token_update"
+            ].sum(dim=-1)
+
+            # Exact coarse head-output scores.
+            scores["attention_head_update"] = (
+                scores["attention_ov_route"].sum(dim=-1)
+                + scores[
+                    "prompt_to_backbone_ov_route"
+                ].sum(dim=-1)
+            )
+
             functional_scores = torch.cat(
-                [score.flatten(1) for score in scores[: len(functional_gates)]],
+                [
+                    scores[name].flatten(start_dim=1)
+                    for name in names
+                ],
                 dim=1,
             )
-            fisher_sum.add_(functional_scores.square().sum(dim=0))
+
+            fisher_sum.add_(
+                functional_scores
+                .square()
+                .sum(dim=0)
+            )
 
             if use_prompts:
-                prompt_scores = scores[-1].flatten(1)
-                cross_sum.add_(functional_scores.T @ prompt_scores)
-                prompt_gram_sum.add_(prompt_scores.T @ prompt_scores)
+                coupling_scores = raw_scores[-1].flatten(
+                    start_dim=1
+                )
+
+                cross_sum.add_(
+                    functional_scores.T
+                    @ coupling_scores
+                )
+
+                coupling_gram_sum.add_(
+                    coupling_scores.T
+                    @ coupling_scores
+                )
 
             sample_count += n_samples
+
+        if sample_count == 0:
+            self._set_gate_grads(False)
+            raise ValueError("loader is empty")
 
         participation = participation_sum / input_count
         fisher = fisher_sum / sample_count
 
-        def unpack(signature, tail=()):
+        def unpack(value, tail=()):
             return {
-                name: part.reshape(*shape, *tail)
+                name: part.reshape(
+                    *shape,
+                    *tail,
+                )
                 for name, shape, part in zip(
                     names,
                     shapes,
-                    signature.split(sizes),
+                    value.split(sizes),
                 )
             }
 
         P_signature = unpack(participation)
         F_signature = unpack(fisher)
+
         S_signature = {}
+
         for name in names:
             p = P_signature[name]
             f = F_signature[name]
-            threshold = eps * p.amax().clamp_min(1.0)
+
+            threshold = (
+                eps
+                * p.amax().clamp_min(1.0)
+            )
+
             S_signature[name] = torch.where(
                 p > threshold,
                 f / p.clamp_min(threshold),
@@ -743,57 +1291,95 @@ class ViTB16VPT(nn.Module):
 
         if use_prompts:
             cross = cross_sum / sample_count
-            prompt_gram = prompt_gram_sum / sample_count
-            prompt_fisher = prompt_gram.diagonal()
+            coupling_gram = coupling_gram_sum / sample_count
+            coupling_fisher = coupling_gram.diagonal()
 
-            # Pairwise Fisher-score correlation.
-            coupling = cross / (
-                fisher[:, None] * prompt_fisher[None, :]
-            ).sqrt().clamp_min(eps)
+            C_signature = unpack(
+                cross
+                / (
+                    fisher[:, None]
+                    * coupling_fisher[None]
+                )
+                .sqrt()
+                .clamp_min(eps),
+                (n_layers, n_prompts),
+            )
 
-            cross_layer = cross.reshape(n_functional, n_layers, n_prompts)
+            cross_layer = cross.reshape(
+                total_size,
+                n_layers,
+                n_prompts,
+            )
 
-            # Layerwise prompt-coupling Fisher blocks: [L, P, P].
-            prompt_layer = (
-                prompt_gram.reshape(
+            layer_gram = (
+                coupling_gram
+                .reshape(
                     n_layers,
                     n_prompts,
                     n_layers,
                     n_prompts,
                 )
-                .diagonal(dim1=0, dim2=2)
+                .diagonal(
+                    dim1=0,
+                    dim2=2,
+                )
                 .permute(2, 0, 1)
             )
 
-            # Symmetric PSD Fisher blocks use the Hermitian pseudoinverse.
-            layer_pinv = torch.linalg.pinv(prompt_layer, hermitian=True)
-            global_pinv = torch.linalg.pinv(prompt_gram, hermitian=True)
+            layer_pinv = torch.linalg.pinv(
+                layer_gram,
+                hermitian=True,
+            )
 
-            Rl2 = torch.einsum(
+            global_pinv = torch.linalg.pinv(
+                coupling_gram,
+                hermitian=True,
+            )
+
+            R_layer_squared = torch.einsum(
                 "glp,lpq,glq->gl",
                 cross_layer,
                 layer_pinv,
                 cross_layer,
             ) / fisher[:, None].clamp_min(eps)
 
-            Rg2 = (cross @ global_pinv * cross).sum(dim=-1) / fisher.clamp_min(eps)
+            R_global_squared = (
+                cross @ global_pinv * cross
+            ).sum(dim=-1) / fisher.clamp_min(eps)
 
-            C_signature = unpack(coupling, (n_layers, n_prompts))
             R_layer_signature = unpack(
-                Rl2.clamp(0, 1).sqrt(),
+                R_layer_squared
+                .clamp(0, 1)
+                .sqrt(),
                 (n_layers,),
             )
-            R_global_signature = unpack(Rg2.clamp(0, 1).sqrt())
+
+            R_global_signature = unpack(
+                R_global_squared
+                .clamp(0, 1)
+                .sqrt()
+            )
+
         else:
             C_signature = unpack(
-                fisher.new_zeros(n_functional, 0),
+                fisher.new_zeros(
+                    total_size,
+                    0,
+                ),
                 (n_layers, 0),
             )
+
             R_layer_signature = unpack(
-                fisher.new_zeros(n_functional, n_layers),
+                fisher.new_zeros(
+                    total_size,
+                    n_layers,
+                ),
                 (n_layers,),
             )
-            R_global_signature = unpack(fisher.new_zeros(n_functional))
+
+            R_global_signature = unpack(
+                fisher.new_zeros(total_size)
+            )
 
         self._set_gate_grads(False)
 
