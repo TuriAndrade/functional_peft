@@ -52,15 +52,6 @@ _MODEL_GROUPS = {
     ),
 }
 
-_SIGNATURE_KEYS = (
-    "residual_branch",
-    "attention_head",
-    "backbone_attention_transport",
-    "patch_spatial_transport",
-    "mlp_neuron",
-    "mlp_token_output",
-)
-
 
 def _find_signature(
     eval_dir: Path,
@@ -189,13 +180,12 @@ def build_args(
             "model_names": model_names,
             "model_groups": _MODEL_GROUPS,
             "signature_paths": signature_paths,
-            "signature_keys": _SIGNATURE_KEYS,
             "save_dir": str(save_dir),
             "verbose": True,
         }
     ]
 
-    output_path = str(save_dir / "analyze_vtab_functional_separation.txt")
-    exe_prefix = "python analyze_vtab_functional_separation_exe.py"
+    output_path = str(save_dir / "analyze_vtab_functional_semantics.txt")
+    exe_prefix = "python analyze_vtab_functional_semantics_exe.py"
 
     return args, output_path, exe_prefix

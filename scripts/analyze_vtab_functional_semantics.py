@@ -2,18 +2,17 @@ import argparse
 import json
 from pathlib import Path
 
-from task_functional_signatures import VTABFunctionalSeparationAnalyzer
+from task_functional_signatures import VTABFunctionalSemanticsAnalyzer
 from utils import parse_args_json
 
 
 def _build_parser():
-    parser = argparse.ArgumentParser(description="Analyze VTAB functional separation.")
+    parser = argparse.ArgumentParser(description="Analyze VTAB functional semantics.")
 
     parser.add_argument("--model-names", type=json.loads, default=None)
     parser.add_argument("--model-groups", type=json.loads, default=None)
 
     parser.add_argument("--signature-paths", type=json.loads, default=None)
-    parser.add_argument("--signature-keys", type=json.loads, default=None)
 
     parser.add_argument("--save-dir", type=str, default=None)
     parser.add_argument("--save-name", type=str, default=None)
@@ -33,11 +32,10 @@ def main():
 
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    analyzer = VTABFunctionalSeparationAnalyzer(
+    analyzer = VTABFunctionalSemanticsAnalyzer(
         model_names=args.model_names,
         model_groups=args.model_groups,
         signature_paths=args.signature_paths,
-        signature_keys=args.signature_keys,
         save_dir=save_dir,
         create_plots=args.create_plots,
         verbose=args.verbose,

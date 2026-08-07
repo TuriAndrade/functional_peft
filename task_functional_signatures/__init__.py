@@ -1,1 +1,1 @@
-from .vtab_functional_separation_analyzer import VTABFunctionalSeparationAnalyzer
+from .vtab_functional_semantics_analyzer import VTABFunctionalSemanticsAnalyzer

@@ -282,14 +282,10 @@ class ViTB16VPT(nn.Module):
                 # token group:
                 #   0 = CLS
                 #   1 = patches
-                "residual_stream_channel": gate(
-                    (n_layers, 4, 2, embed_dim)
-                ),
-
+                "residual_stream_channel": gate((n_layers, 4, 2, embed_dim)),
                 # [residual channel]
                 # Final normalized CLS immediately before the classifier.
                 "final_cls_readout": gate((embed_dim,)),
-
                 # [layer, head, route]
                 #
                 # route:
@@ -302,7 +298,6 @@ class ViTB16VPT(nn.Module):
                 #   6 = PATCH <- PATCH global
                 "attention_qk_route": gate((n_layers, n_heads, 7)),
                 "attention_ov_route": gate((n_layers, n_heads, 7)),
-
                 # [layer, head, token group, raw head channel]
                 #
                 # QK token group:
@@ -312,32 +307,22 @@ class ViTB16VPT(nn.Module):
                 # OV token group:
                 #   0 = output written to CLS
                 #   1 = output written to patches
-                "attention_qk_channel": gate(
-                    (n_layers, n_heads, 2, head_dim)
-                ),
-                "attention_ov_channel": gate(
-                    (n_layers, n_heads, 2, head_dim)
-                ),
-
+                "attention_qk_channel": gate((n_layers, n_heads, 2, head_dim)),
+                "attention_ov_channel": gate((n_layers, n_heads, 2, head_dim)),
                 # [layer, processed token group, hidden MLP neuron]
                 #
                 # token group:
                 #   0 = CLS
                 #   1 = patches
                 "mlp_neuron": gate((n_layers, 2, mlp_dim)),
-
                 # [layer, head, destination group]
                 #
                 # Source is any prompt token.
                 # destination:
                 #   0 = CLS
                 #   1 = patches
-                "prompt_to_backbone_qk_route": gate(
-                    (n_layers, n_heads, 2)
-                ),
-                "prompt_to_backbone_ov_route": gate(
-                    (n_layers, n_heads, 2)
-                ),
+                "prompt_to_backbone_qk_route": gate((n_layers, n_heads, 2)),
+                "prompt_to_backbone_ov_route": gate((n_layers, n_heads, 2)),
             }
         )
 
@@ -353,14 +338,12 @@ class ViTB16VPT(nn.Module):
                 name: tuple(value.shape)
                 for name, value in self.functional_gates.items()
             },
-
             # [layer, sublayer]
             #
             # sublayer:
             #   0 = attention
             #   1 = MLP
             "sublayer_update": (n_layers, 2),
-
             # [layer, sublayer, token group]
             #
             # sublayer:
@@ -371,7 +354,6 @@ class ViTB16VPT(nn.Module):
             #   0 = CLS
             #   1 = patches
             "sublayer_token_update": (n_layers, 2, 2),
-
             # [layer, head]
             # Complete head output delivered to CLS/patch destinations.
             "attention_head_update": (n_layers, n_heads),
@@ -390,14 +372,18 @@ class ViTB16VPT(nn.Module):
 
         grid = self.backbone.grid_size
 
-        coordinates = torch.stack(
-            torch.meshgrid(
-                torch.arange(grid, device=reference.device),
-                torch.arange(grid, device=reference.device),
-                indexing="ij",
-            ),
-            dim=-1,
-        ).reshape(-1, 2).to(reference.dtype)
+        coordinates = (
+            torch.stack(
+                torch.meshgrid(
+                    torch.arange(grid, device=reference.device),
+                    torch.arange(grid, device=reference.device),
+                    indexing="ij",
+                ),
+                dim=-1,
+            )
+            .reshape(-1, 2)
+            .to(reference.dtype)
+        )
 
         distances = torch.cdist(coordinates, coordinates)
 
@@ -411,10 +397,13 @@ class ViTB16VPT(nn.Module):
         #   1 = local
         #   2 = medium
         #   3 = global
-        spatial_bins = torch.bucketize(
-            distances,
-            thresholds,
-        ) + 1
+        spatial_bins = (
+            torch.bucketize(
+                distances,
+                thresholds,
+            )
+            + 1
+        )
 
         spatial_bins.fill_diagonal_(0)
 
@@ -436,7 +425,9 @@ class ViTB16VPT(nn.Module):
                 3 + band,
                 patch_slice,
                 patch_slice,
-            ] = (spatial_bins == band).to(reference.dtype)
+            ] = (
+                spatial_bins == band
+            ).to(reference.dtype)
 
         route_masks[7, 0, prompt_slice] = 1
         route_masks[8, patch_slice, prompt_slice] = 1
@@ -469,32 +460,20 @@ class ViTB16VPT(nn.Module):
 
                     # For head context c:
                     # ||W_O,h c||² = cᵀ(W_O,hᵀW_O,h)c.
-                    layer_metrics.append(
-                        head_weight.T @ head_weight
-                    )
+                    layer_metrics.append(head_weight.T @ head_weight)
 
                     # Output norm of each raw head channel.
-                    layer_channel_norms.append(
-                        head_weight.square().sum(dim=0)
-                    )
+                    layer_channel_norms.append(head_weight.square().sum(dim=0))
 
                 head_metrics.append(torch.stack(layer_metrics))
-                head_channel_norms.append(
-                    torch.stack(layer_channel_norms)
-                )
+                head_channel_norms.append(torch.stack(layer_channel_norms))
 
                 # Output norm of each hidden MLP neuron.
-                mlp_neuron_norms.append(
-                    block.ffn.fc2.weight.square().sum(dim=0)
-                )
+                mlp_neuron_norms.append(block.ffn.fc2.weight.square().sum(dim=0))
 
         self._functional_head_metrics = torch.stack(head_metrics)
-        self._functional_head_channel_norms = torch.stack(
-            head_channel_norms
-        )
-        self._functional_mlp_neuron_norms = torch.stack(
-            mlp_neuron_norms
-        )
+        self._functional_head_channel_norms = torch.stack(head_channel_norms)
+        self._functional_mlp_neuron_norms = torch.stack(mlp_neuron_norms)
 
         # ------------------------------------------------------------------
         # Instrumented transformer-block forward
@@ -543,13 +522,9 @@ class ViTB16VPT(nn.Module):
                     """
                     return torch.cat(
                         (
-                            value[:, :1]
-                            * group_gate[0][None, None],
-
+                            value[:, :1] * group_gate[0][None, None],
                             value[:, prompt_slice],
-
-                            value[:, patch_slice]
-                            * group_gate[1][None, None],
+                            value[:, patch_slice] * group_gate[1][None, None],
                         ),
                         dim=1,
                     )
@@ -563,13 +538,11 @@ class ViTB16VPT(nn.Module):
                     return torch.cat(
                         (
                             group_gate[:, :1],
-
                             group_gate.new_ones(
                                 n_heads,
                                 n_prompts,
                                 head_dim,
                             ),
-
                             group_gate[:, 1:2].expand(
                                 -1,
                                 n_patches,
@@ -620,28 +593,18 @@ class ViTB16VPT(nn.Module):
                     value = torch.cat(
                         (
                             value[:, :1],
-
                             value[:, prompt_slice]
-                            * self.coupling_gates[
-                                layer_idx
-                            ][None, :, None],
-
+                            * self.coupling_gates[layer_idx][None, :, None],
                             value[:, patch_slice],
                         ),
                         dim=1,
                     )
 
-                query = attention.transpose_for_scores(
-                    attention.query(value)
-                )
+                query = attention.transpose_for_scores(attention.query(value))
 
-                key = attention.transpose_for_scores(
-                    attention.key(value)
-                )
+                key = attention.transpose_for_scores(attention.key(value))
 
-                attention_value = attention.transpose_for_scores(
-                    attention.value(value)
-                )
+                attention_value = attention.transpose_for_scores(attention.value(value))
 
                 # ==========================================================
                 # QK channels
@@ -652,7 +615,6 @@ class ViTB16VPT(nn.Module):
                 qk_channel_energy = torch.stack(
                     (
                         query_energy[:, :, 0],
-
                         query_energy[
                             :,
                             :,
@@ -668,9 +630,7 @@ class ViTB16VPT(nn.Module):
                 # = q_ik² sum_j k_jk² / K.
                 qk_channel_energy = (
                     qk_channel_energy
-                    * key.detach()
-                    .square()
-                    .sum(dim=2)[:, :, None]
+                    * key.detach().square().sum(dim=2)[:, :, None]
                     / head_dim
                 )
 
@@ -680,14 +640,12 @@ class ViTB16VPT(nn.Module):
                     qk_channel_energy,
                 )
 
-                query = query * expand_head_groups(
-                    gates["attention_qk_channel"][layer_idx]
-                )[None]
-
-                attention_scores = (
-                    query @ key.transpose(-1, -2)
-                    / math.sqrt(head_dim)
+                query = (
+                    query
+                    * expand_head_groups(gates["attention_qk_channel"][layer_idx])[None]
                 )
+
+                attention_scores = query @ key.transpose(-1, -2) / math.sqrt(head_dim)
 
                 # ==========================================================
                 # QK routes
@@ -714,36 +672,28 @@ class ViTB16VPT(nn.Module):
                 qk_route_gates = torch.cat(
                     (
                         gates["attention_qk_route"][layer_idx],
-
-                        gates[
-                            "prompt_to_backbone_qk_route"
-                        ][layer_idx],
+                        gates["prompt_to_backbone_qk_route"][layer_idx],
                     ),
                     dim=-1,
                 )
 
-                attention_scores = attention_scores * (
-                    1
-                    + torch.einsum(
-                        "hr,rij->hij",
-                        qk_route_gates - 1,
-                        self._functional_route_masks,
-                    )
-                )[None]
-
-                attention_probs = attention.softmax(
+                attention_scores = (
                     attention_scores
+                    * (
+                        1
+                        + torch.einsum(
+                            "hr,rij->hij",
+                            qk_route_gates - 1,
+                            self._functional_route_masks,
+                        )
+                    )[None]
                 )
 
-                weights = (
-                    attention_probs
-                    if attention.vis
-                    else None
-                )
+                attention_probs = attention.softmax(attention_scores)
 
-                attention_probs = attention.attn_dropout(
-                    attention_probs
-                )
+                weights = attention_probs if attention.vis else None
+
+                attention_probs = attention.attn_dropout(attention_probs)
 
                 # ==========================================================
                 # OV-route participation
@@ -784,27 +734,18 @@ class ViTB16VPT(nn.Module):
                 ov_route_gates = torch.cat(
                     (
                         gates["attention_ov_route"][layer_idx],
-
-                        gates[
-                            "prompt_to_backbone_ov_route"
-                        ][layer_idx],
+                        gates["prompt_to_backbone_ov_route"][layer_idx],
                     ),
                     dim=-1,
                 )
 
-                transport_scale = (
-                    1
-                    + torch.einsum(
-                        "hr,rij->hij",
-                        ov_route_gates - 1,
-                        self._functional_route_masks,
-                    )
+                transport_scale = 1 + torch.einsum(
+                    "hr,rij->hij",
+                    ov_route_gates - 1,
+                    self._functional_route_masks,
                 )
 
-                context = (
-                    attention_probs
-                    * transport_scale[None]
-                ) @ attention_value
+                context = (attention_probs * transport_scale[None]) @ attention_value
 
                 # All source routes ending at CLS/patch destinations.
                 backbone_context = torch.cat(
@@ -830,7 +771,6 @@ class ViTB16VPT(nn.Module):
                 ov_channel_energy = torch.stack(
                     (
                         context_energy[:, :, 0],
-
                         context_energy[
                             :,
                             :,
@@ -844,9 +784,7 @@ class ViTB16VPT(nn.Module):
                 # context_k * W_O[:, head_channel_k].
                 ov_channel_energy = (
                     ov_channel_energy
-                    * self._functional_head_channel_norms[
-                        layer_idx
-                    ][None, :, None]
+                    * self._functional_head_channel_norms[layer_idx][None, :, None]
                 )
 
                 record(
@@ -855,30 +793,24 @@ class ViTB16VPT(nn.Module):
                     ov_channel_energy,
                 )
 
-                context = context * expand_head_groups(
-                    gates["attention_ov_channel"][layer_idx]
-                )[None]
-
                 context = (
-                    context.transpose(1, 2)
-                    .reshape(
-                        value.shape[0],
-                        n_tokens,
-                        n_heads * head_dim,
-                    )
+                    context
+                    * expand_head_groups(gates["attention_ov_channel"][layer_idx])[None]
                 )
 
-                attention_output = attention.proj_dropout(
-                    attention.out(context)
+                context = context.transpose(1, 2).reshape(
+                    value.shape[0],
+                    n_tokens,
+                    n_heads * head_dim,
                 )
+
+                attention_output = attention.proj_dropout(attention.out(context))
 
                 # ==========================================================
                 # Attention write
                 # ==========================================================
 
-                attention_energy = grouped_energy(
-                    attention_output
-                )
+                attention_energy = grouped_energy(attention_output)
 
                 record(
                     "residual_stream_channel",
@@ -930,18 +862,14 @@ class ViTB16VPT(nn.Module):
                 )
 
                 value = feed_forward.dropout(
-                    feed_forward.act_fn(
-                        feed_forward.fc1(value)
-                    )
+                    feed_forward.act_fn(feed_forward.fc1(value))
                 )
 
                 # Neuron output energy:
                 # activation_j² * ||W_2[:, j]||².
                 neuron_energy = (
                     grouped_energy(value)
-                    * self._functional_mlp_neuron_norms[
-                        layer_idx
-                    ][None, None]
+                    * self._functional_mlp_neuron_norms[layer_idx][None, None]
                 )
 
                 record(
@@ -955,9 +883,7 @@ class ViTB16VPT(nn.Module):
                     gates["mlp_neuron"][layer_idx],
                 )
 
-                mlp_output = feed_forward.dropout(
-                    feed_forward.fc2(value)
-                )
+                mlp_output = feed_forward.dropout(feed_forward.fc2(value))
 
                 # ==========================================================
                 # MLP write
@@ -1009,22 +935,14 @@ class ViTB16VPT(nn.Module):
         def norm_forward(norm, hidden):
             encoded = original_norm_forward(hidden)
 
-            self.functional_participation[
-                "final_cls_readout"
-            ].copy_(
-                encoded[:, 0]
-                .detach()
-                .square()
-                .sum(dim=0)
+            self.functional_participation["final_cls_readout"].copy_(
+                encoded[:, 0].detach().square().sum(dim=0)
             )
 
             return torch.cat(
                 (
                     encoded[:, :1]
-                    * self.functional_gates[
-                        "final_cls_readout"
-                    ][None, None],
-
+                    * self.functional_gates["final_cls_readout"][None, None],
                     encoded[:, 1:],
                 ),
                 dim=1,
@@ -1083,14 +1001,8 @@ class ViTB16VPT(nn.Module):
         gate_names, gates = zip(*self.functional_gates.items())
 
         names = self._functional_names
-        shapes = tuple(
-            self._functional_shapes[name]
-            for name in names
-        )
-        sizes = tuple(
-            math.prod(shape)
-            for shape in shapes
-        )
+        shapes = tuple(self._functional_shapes[name] for name in names)
+        sizes = tuple(math.prod(shape) for shape in shapes)
 
         total_size = sum(sizes)
         n_layers, n_prompts = self.coupling_gates.shape
@@ -1113,21 +1025,13 @@ class ViTB16VPT(nn.Module):
                 coupling_size,
             )
 
-        params = (
-            (*gates, self.coupling_gates)
-            if use_prompts
-            else gates
-        )
+        params = (*gates, self.coupling_gates) if use_prompts else gates
 
         bases = {}
         input_count = 0
         sample_count = 0
 
-        iterator = (
-            tqdm(loader, desc="Functional signatures")
-            if verbose
-            else loader
-        )
+        iterator = tqdm(loader, desc="Functional signatures") if verbose else loader
 
         for batch in iterator:
             x = batch[0].to(
@@ -1144,12 +1048,7 @@ class ViTB16VPT(nn.Module):
 
             participation_sum.add_(
                 torch.cat(
-                    [
-                        self.functional_participation[
-                            name
-                        ].reshape(-1)
-                        for name in names
-                    ]
+                    [self.functional_participation[name].reshape(-1) for name in names]
                 )
             )
 
@@ -1192,9 +1091,7 @@ class ViTB16VPT(nn.Module):
             )
 
             # Exact coarse sublayer scores.
-            stream_scores = scores[
-                "residual_stream_channel"
-            ]
+            stream_scores = scores["residual_stream_channel"]
 
             # [sample, layer, sublayer, token group]
             scores["sublayer_token_update"] = torch.stack(
@@ -1206,46 +1103,26 @@ class ViTB16VPT(nn.Module):
             )
 
             # [sample, layer, sublayer]
-            scores["sublayer_update"] = scores[
-                "sublayer_token_update"
-            ].sum(dim=-1)
+            scores["sublayer_update"] = scores["sublayer_token_update"].sum(dim=-1)
 
             # Exact coarse head-output scores.
-            scores["attention_head_update"] = (
-                scores["attention_ov_route"].sum(dim=-1)
-                + scores[
-                    "prompt_to_backbone_ov_route"
-                ].sum(dim=-1)
-            )
+            scores["attention_head_update"] = scores["attention_ov_route"].sum(
+                dim=-1
+            ) + scores["prompt_to_backbone_ov_route"].sum(dim=-1)
 
             functional_scores = torch.cat(
-                [
-                    scores[name].flatten(start_dim=1)
-                    for name in names
-                ],
+                [scores[name].flatten(start_dim=1) for name in names],
                 dim=1,
             )
 
-            fisher_sum.add_(
-                functional_scores
-                .square()
-                .sum(dim=0)
-            )
+            fisher_sum.add_(functional_scores.square().sum(dim=0))
 
             if use_prompts:
-                coupling_scores = raw_scores[-1].flatten(
-                    start_dim=1
-                )
+                coupling_scores = raw_scores[-1].flatten(start_dim=1)
 
-                cross_sum.add_(
-                    functional_scores.T
-                    @ coupling_scores
-                )
+                cross_sum.add_(functional_scores.T @ coupling_scores)
 
-                coupling_gram_sum.add_(
-                    coupling_scores.T
-                    @ coupling_scores
-                )
+                coupling_gram_sum.add_(coupling_scores.T @ coupling_scores)
 
             sample_count += n_samples
 
@@ -1278,10 +1155,7 @@ class ViTB16VPT(nn.Module):
             p = P_signature[name]
             f = F_signature[name]
 
-            threshold = (
-                eps
-                * p.amax().clamp_min(1.0)
-            )
+            threshold = eps * p.amax().clamp_min(1.0)
 
             S_signature[name] = torch.where(
                 p > threshold,
@@ -1295,13 +1169,7 @@ class ViTB16VPT(nn.Module):
             coupling_fisher = coupling_gram.diagonal()
 
             C_signature = unpack(
-                cross
-                / (
-                    fisher[:, None]
-                    * coupling_fisher[None]
-                )
-                .sqrt()
-                .clamp_min(eps),
+                cross / (fisher[:, None] * coupling_fisher[None]).sqrt().clamp_min(eps),
                 (n_layers, n_prompts),
             )
 
@@ -1312,8 +1180,7 @@ class ViTB16VPT(nn.Module):
             )
 
             layer_gram = (
-                coupling_gram
-                .reshape(
+                coupling_gram.reshape(
                     n_layers,
                     n_prompts,
                     n_layers,
@@ -1343,22 +1210,16 @@ class ViTB16VPT(nn.Module):
                 cross_layer,
             ) / fisher[:, None].clamp_min(eps)
 
-            R_global_squared = (
-                cross @ global_pinv * cross
-            ).sum(dim=-1) / fisher.clamp_min(eps)
+            R_global_squared = (cross @ global_pinv * cross).sum(
+                dim=-1
+            ) / fisher.clamp_min(eps)
 
             R_layer_signature = unpack(
-                R_layer_squared
-                .clamp(0, 1)
-                .sqrt(),
+                R_layer_squared.clamp(0, 1).sqrt(),
                 (n_layers,),
             )
 
-            R_global_signature = unpack(
-                R_global_squared
-                .clamp(0, 1)
-                .sqrt()
-            )
+            R_global_signature = unpack(R_global_squared.clamp(0, 1).sqrt())
 
         else:
             C_signature = unpack(
@@ -1377,9 +1238,7 @@ class ViTB16VPT(nn.Module):
                 (n_layers,),
             )
 
-            R_global_signature = unpack(
-                fisher.new_zeros(total_size)
-            )
+            R_global_signature = unpack(fisher.new_zeros(total_size))
 
         self._set_gate_grads(False)
 
