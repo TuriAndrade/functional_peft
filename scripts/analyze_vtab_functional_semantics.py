@@ -17,6 +17,7 @@ def _build_parser():
     parser.add_argument("--save-dir", type=str, default=None)
     parser.add_argument("--save-name", type=str, default=None)
 
+    parser.add_argument("--save-distances", action="store_true")
     parser.add_argument("--create-plots", action="store_true")
     parser.add_argument("--verbose", action="store_true")
 
@@ -37,6 +38,7 @@ def main():
         model_groups=args.model_groups,
         signature_paths=args.signature_paths,
         save_dir=save_dir,
+        save_distances=args.save_distances,
         create_plots=args.create_plots,
         verbose=args.verbose,
     )

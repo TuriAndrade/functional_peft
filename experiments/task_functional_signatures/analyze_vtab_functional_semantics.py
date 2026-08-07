@@ -182,6 +182,8 @@ def build_args(
             "signature_paths": signature_paths,
             "save_dir": str(save_dir),
             "verbose": True,
+            "save_distances": False,
+            "create_plots": False,
         }
     ]
 
