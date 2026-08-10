@@ -1,21 +1,19 @@
 import csv
+import math
+from itertools import product
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.manifold import MDS
+from matplotlib.backends.backend_pdf import PdfPages
 from tqdm.auto import tqdm
 
 
 class VTABFunctionalSemanticsAnalyzer:
-    """Analyze semantic structure in raw and adaptation-delta VTAB signatures."""
+    """Interpretable semantic analysis of raw and adaptation-delta VTAB signatures."""
 
     SIGNATURES = ("F", "P", "S")
     REFERENCE_MODEL = "linear_probe"
-
-    # ------------------------------------------------------------------
-    # Functional-component schema
-    # ------------------------------------------------------------------
 
     L, H, D, K, MLP_DIM = 12, 12, 768, 64, 3072
 
@@ -92,6 +90,87 @@ class VTABFunctionalSemanticsAnalyzer:
         ),
     }
 
+    COMPONENT_FAMILY = {
+        "sublayer_update": "backbone_updates",
+        "sublayer_token_update": "backbone_updates",
+        "attention_head_update": "backbone_updates",
+        "residual_stream_channel": "residual_flow",
+        "attention_qk_route": "attention_routing",
+        "attention_ov_route": "attention_routing",
+        "attention_qk_channel": "feature_content",
+        "attention_ov_channel": "feature_content",
+        "mlp_neuron": "feature_content",
+        "prompt_to_backbone_qk_route": "prompt_influence",
+        "prompt_to_backbone_ov_route": "prompt_influence",
+        "final_cls_readout": "final_readout",
+    }
+
+    # Fix only semantically meaningful architectural axes.
+    # Latent residual/head/neuron coordinates remain population dimensions.
+    VIEW_AXES = {
+        "sublayer_update": (
+            ("sublayer",),
+            ("layer",),
+        ),
+        "sublayer_token_update": (
+            ("sublayer",),
+            ("token_group",),
+            ("sublayer", "token_group"),
+            ("layer",),
+            ("layer", "sublayer"),
+            ("layer", "token_group"),
+        ),
+        "attention_head_update": (("layer",),),
+        "residual_stream_channel": (
+            ("site",),
+            ("token_group",),
+            ("site", "token_group"),
+            ("layer",),
+            ("layer", "site", "token_group"),
+        ),
+        "attention_qk_route": (
+            ("route",),
+            ("layer",),
+            ("layer", "route"),
+        ),
+        "attention_ov_route": (
+            ("route",),
+            ("layer",),
+            ("layer", "route"),
+        ),
+        "attention_qk_channel": (
+            ("query_group",),
+            ("layer",),
+            ("layer", "query_group"),
+        ),
+        "attention_ov_channel": (
+            ("destination_group",),
+            ("layer",),
+            ("layer", "destination_group"),
+        ),
+        "mlp_neuron": (
+            ("token_group",),
+            ("layer",),
+            ("layer", "token_group"),
+        ),
+        "prompt_to_backbone_qk_route": (
+            ("destination_group",),
+            ("layer",),
+            ("layer", "destination_group"),
+        ),
+        "prompt_to_backbone_ov_route": (
+            ("destination_group",),
+            ("layer",),
+            ("layer", "destination_group"),
+        ),
+        "final_cls_readout": (),
+    }
+
+    PROMPT_COMPONENTS = (
+        "prompt_to_backbone_qk_route",
+        "prompt_to_backbone_ov_route",
+    )
+
     NATURAL = (
         "vtab_caltech101",
         "vtab_cifar100",
@@ -139,18 +218,42 @@ class VTABFunctionalSemanticsAnalyzer:
             "negatives": NATURAL + SPECIALIZED,
         },
         "domain_remote_sensing": {
-            "anchors": ("vtab_eurosat", "vtab_resisc45"),
-            "positives": ("vtab_eurosat", "vtab_resisc45"),
-            "negatives": ("vtab_patch_camelyon", "vtab_retinopathy"),
+            "anchors": (
+                "vtab_eurosat",
+                "vtab_resisc45",
+            ),
+            "positives": (
+                "vtab_eurosat",
+                "vtab_resisc45",
+            ),
+            "negatives": (
+                "vtab_patch_camelyon",
+                "vtab_retinopathy",
+            ),
         },
         "domain_medical": {
-            "anchors": ("vtab_patch_camelyon", "vtab_retinopathy"),
-            "positives": ("vtab_patch_camelyon", "vtab_retinopathy"),
-            "negatives": ("vtab_eurosat", "vtab_resisc45"),
+            "anchors": (
+                "vtab_patch_camelyon",
+                "vtab_retinopathy",
+            ),
+            "positives": (
+                "vtab_patch_camelyon",
+                "vtab_retinopathy",
+            ),
+            "negatives": (
+                "vtab_eurosat",
+                "vtab_resisc45",
+            ),
         },
         "source_clevr": {
-            "anchors": ("vtab_clevr_count", "vtab_clevr_distance"),
-            "positives": ("vtab_clevr_count", "vtab_clevr_distance"),
+            "anchors": (
+                "vtab_clevr_count",
+                "vtab_clevr_distance",
+            ),
+            "positives": (
+                "vtab_clevr_count",
+                "vtab_clevr_distance",
+            ),
             "negatives": (
                 "vtab_dmlab",
                 "vtab_dsprites_location",
@@ -294,15 +397,118 @@ class VTABFunctionalSemanticsAnalyzer:
 
     REPORT_GROUPS = tuple(METAGROUPS) + FUNCTIONAL_GROUPS + INDIVIDUAL_GROUPS
 
+    AGREEMENT_METRICS = (
+        "ranking_agreement",
+        "geometric_agreement",
+    )
+
     RAW_METRICS = {
-        "F": ("hellinger", "pairwise_normalized_cosine"),
+        "F": (
+            "hellinger",
+            "pairwise_normalized_cosine",
+        ),
         "P": ("hellinger",),
         "S": ("hellinger",),
     }
 
     DELTA_METRICS = {signature: ("angular",) for signature in SIGNATURES}
 
-    AGREEMENT_METRICS = ("ranking_agreement", "geometric_agreement")
+    RESULT_META_COLUMNS = (
+        "representation",
+        "signature",
+        "distance_metric",
+        "model_name",
+        "family",
+        "component",
+        "view",
+        "view_id",
+        "layer",
+        "site",
+        "sublayer",
+        "token_group",
+        "query_group",
+        "destination_group",
+        "route",
+        "vector_axes",
+        "vector_dim",
+    )
+
+    # Native depth geometry used by within-model reports.
+    # Every cell remains a non-scalar task embedding.
+    DEPTH_REPORTS = (
+        (
+            "sublayer_update",
+            "layer",
+            (),
+            "Sublayer balance by layer",
+        ),
+        (
+            "sublayer_token_update",
+            "layer_sublayer",
+            ("sublayer",),
+            "CLS/patch balance by layer and sublayer",
+        ),
+        (
+            "sublayer_token_update",
+            "layer_token_group",
+            ("token_group",),
+            "Attention/MLP balance by layer and token group",
+        ),
+        (
+            "attention_head_update",
+            "layer",
+            (),
+            "Attention-head population by layer",
+        ),
+        (
+            "residual_stream_channel",
+            "layer_site_token_group",
+            ("site", "token_group"),
+            "Residual flow by layer, site, and token group",
+        ),
+        (
+            "attention_qk_route",
+            "layer_route",
+            ("route",),
+            "QK routing by layer and route",
+        ),
+        (
+            "attention_ov_route",
+            "layer_route",
+            ("route",),
+            "OV transport by layer and route",
+        ),
+        (
+            "attention_qk_channel",
+            "layer_query_group",
+            ("query_group",),
+            "QK content by layer and query group",
+        ),
+        (
+            "attention_ov_channel",
+            "layer_destination_group",
+            ("destination_group",),
+            "OV content by layer and destination",
+        ),
+        (
+            "mlp_neuron",
+            "layer_token_group",
+            ("token_group",),
+            "MLP population by layer and token group",
+        ),
+        (
+            "prompt_to_backbone_qk_route",
+            "layer_destination_group",
+            ("destination_group",),
+            "Prompt QK influence by layer and destination",
+        ),
+        (
+            "prompt_to_backbone_ov_route",
+            "layer_destination_group",
+            ("destination_group",),
+            "Prompt OV influence by layer and destination",
+        ),
+    )
 
     def __init__(
         self,
@@ -310,92 +516,237 @@ class VTABFunctionalSemanticsAnalyzer:
         model_groups,
         signature_paths,
         save_dir,
-        save_distances=False,
         create_plots=False,
         verbose=True,
     ):
         self.model_names = tuple(model_names)
+
         self.model_groups = {
             name: tuple(models) for name, models in model_groups.items()
         }
+
         self.signature_paths = tuple(tuple(paths) for paths in signature_paths)
+
         self.save_dir = Path(save_dir)
-        self.save_distances = bool(save_distances)
         self.create_plots = bool(create_plots)
         self.verbose = bool(verbose)
 
         if len(set(self.model_names)) != len(self.model_names):
             raise ValueError("model_names must be unique.")
+
         if self.REFERENCE_MODEL not in self.model_names:
-            raise ValueError(f"model_names must contain '{self.REFERENCE_MODEL}'.")
+            raise ValueError(f"model_names must contain " f"'{self.REFERENCE_MODEL}'.")
+
         if len(self.signature_paths) != len(self.model_names):
-            raise ValueError("signature_paths must contain one sequence per model.")
+            raise ValueError("signature_paths must contain " "one sequence per model.")
+
         if any(len(paths) != len(self.DATASET_NAMES) for paths in self.signature_paths):
             raise ValueError(
-                f"Each model must have {len(self.DATASET_NAMES)} signature paths "
-                "ordered according to DATASET_NAMES."
+                f"Each model must have "
+                f"{len(self.DATASET_NAMES)} paths "
+                "ordered as DATASET_NAMES."
             )
 
         average_names = set()
+
         for name, models in self.model_groups.items():
-            if not models:
-                raise ValueError(f"Model group '{name}' is empty.")
-            if len(set(models)) != len(models):
-                raise ValueError(f"Model group '{name}' contains duplicate models.")
-            unknown = set(models) - set(self.model_names)
-            if unknown:
-                raise ValueError(f"Unknown models in '{name}': {sorted(unknown)}.")
-            average_name = f"{name}_average"
-            if average_name in self.model_names or average_name in average_names:
+            if not models or len(set(models)) != len(models):
                 raise ValueError(
-                    f"Conflicting model-group average name: {average_name}."
+                    f"Model group '{name}' must be "
+                    "non-empty and contain unique models."
                 )
-            average_names.add(average_name)
+
+            unknown = set(models) - set(self.model_names)
+
+            if unknown:
+                raise ValueError(f"Unknown models in '{name}': " f"{sorted(unknown)}.")
+
+            average = f"{name}_average"
+
+            if average in self.model_names or average in average_names:
+                raise ValueError("Conflicting model-group " f"average name: {average}.")
+
+            average_names.add(average)
 
         self.components = tuple(self.COMPONENTS)
+
         self.dataset_index = {name: i for i, name in enumerate(self.DATASET_NAMES)}
+
+        self.views = self._build_views()
 
     def _log(self, message):
         if self.verbose:
-            print(message, flush=True)
+            print(
+                message,
+                flush=True,
+            )
 
     @classmethod
-    def _layer_count(cls, component):
+    def _axis_values(
+        cls,
+        component,
+        axis,
+    ):
         shape, axes = cls.COMPONENTS[component]
-        return shape[0] if axes[0] == "layer" else 0
+
+        if axis == "layer":
+            return range(shape[axes.index(axis)])
+
+        return cls.AXIS_VALUES[axis]
+
+    @classmethod
+    def _axis_index(
+        cls,
+        axis,
+        value,
+    ):
+        if axis == "layer":
+            return int(value)
+
+        return cls.AXIS_VALUES[axis].index(value)
+
+    @staticmethod
+    def _view_description(
+        selectors,
+        vector_axes,
+    ):
+        if not selectors:
+            return "Full component signature."
+
+        fixed = ", ".join(f"{axis}={value}" for axis, value in selectors.items())
+
+        return f"Fix {fixed}; compare tasks over " f"{' x '.join(vector_axes)}."
+
+    def _build_views(self):
+        views = []
+
+        for component in self.components:
+            shape, axes = self.COMPONENTS[component]
+
+            family = self.COMPONENT_FAMILY[component]
+
+            views.append(
+                {
+                    "family": family,
+                    "component": component,
+                    "view": "full",
+                    "view_id": f"{component}/full",
+                    "selectors": {},
+                    "vector_axes": axes,
+                    "vector_dim": math.prod(shape),
+                    "description": "Full component signature.",
+                }
+            )
+
+            for fixed_axes in self.VIEW_AXES.get(
+                component,
+                (),
+            ):
+                value_lists = (
+                    self._axis_values(
+                        component,
+                        axis,
+                    )
+                    for axis in fixed_axes
+                )
+
+                for values in product(*value_lists):
+                    selectors = dict(
+                        zip(
+                            fixed_axes,
+                            values,
+                        )
+                    )
+
+                    vector_axes = tuple(axis for axis in axes if axis not in selectors)
+
+                    vector_dim = math.prod(
+                        size for size, axis in zip(shape, axes) if axis not in selectors
+                    )
+
+                    # Scalar cells are not valid
+                    # task embeddings.
+                    if vector_dim < 2:
+                        continue
+
+                    view = "_".join(fixed_axes)
+
+                    suffix = "/".join(
+                        f"{axis}={value}" for axis, value in selectors.items()
+                    )
+
+                    views.append(
+                        {
+                            "family": family,
+                            "component": component,
+                            "view": view,
+                            "view_id": (f"{component}/" f"{view}/{suffix}"),
+                            "selectors": selectors,
+                            "vector_axes": vector_axes,
+                            "vector_dim": vector_dim,
+                            "description": self._view_description(
+                                selectors,
+                                vector_axes,
+                            ),
+                        }
+                    )
+
+        ids = [view["view_id"] for view in views]
+
+        if len(ids) != len(set(ids)):
+            raise RuntimeError("Duplicate view IDs.")
+
+        return tuple(views)
 
     def _load_signatures(self):
         signatures = {signature: {} for signature in self.SIGNATURES}
+
         total = len(self.model_names) * len(self.DATASET_NAMES)
 
         with tqdm(
-            total=total, desc="Loading signatures", disable=not self.verbose
+            total=total,
+            desc="Loading signatures",
+            disable=not self.verbose,
         ) as pbar:
-            for model_index, model in enumerate(self.model_names):
+            for model_idx, model in enumerate(self.model_names):
                 loaded = {
                     signature: {component: [] for component in self.components}
                     for signature in self.SIGNATURES
                 }
 
-                for path in self.signature_paths[model_index]:
+                for path in self.signature_paths[model_idx]:
                     with np.load(path) as data:
                         for component in self.components:
-                            expected_shape = self.COMPONENTS[component][0]
+                            expected = self.COMPONENTS[component][0]
+
                             for signature in self.SIGNATURES:
-                                name = f"{signature}__{component}"
-                                if name not in data:
-                                    raise KeyError(f"Missing '{name}' in {path}.")
-                                x = np.asarray(data[name], dtype=np.float64)
-                                if x.shape != expected_shape:
+                                key = f"{signature}__" f"{component}"
+
+                                if key not in data:
+                                    raise KeyError(f"Missing '{key}' " f"in {path}.")
+
+                                x = np.asarray(
+                                    data[key],
+                                    dtype=np.float64,
+                                )
+
+                                if x.shape != expected:
                                     raise ValueError(
-                                        f"Invalid shape for '{name}' in {path}: "
-                                        f"{x.shape}, expected {expected_shape}."
+                                        f"Invalid shape for "
+                                        f"'{key}' in {path}: "
+                                        f"{x.shape}, expected "
+                                        f"{expected}."
                                     )
+
                                 if not np.all(np.isfinite(x)):
                                     raise ValueError(
-                                        f"Non-finite values in '{name}' from {path}."
+                                        f"Non-finite values "
+                                        f"in '{key}' from "
+                                        f"{path}."
                                     )
+
                                 loaded[signature][component].append(x)
+
                     pbar.update()
 
                 for signature in self.SIGNATURES:
@@ -406,167 +757,16 @@ class VTABFunctionalSemanticsAnalyzer:
 
         return signatures
 
-    @staticmethod
-    def _magnitude_stats(x):
-        x = np.abs(np.asarray(x, dtype=np.float64).reshape(-1))
-        if not x.size:
-            raise ValueError("Cannot analyze an empty signature.")
-
-        l1 = float(x.sum())
-        if l1:
-            p = x[x > 0] / l1
-            support = float(np.exp(-np.sum(p * np.log(p))) / x.size)
-        else:
-            support = 0.0
-
-        return {
-            "l1_norm": l1,
-            "mean_absolute_value": float(x.mean()),
-            "effective_support_fraction": support,
-        }
-
-    def _signature_vectors(self, signatures, model, dataset, component):
-        x = signatures[model][component][dataset]
-        vectors = {"global": x.reshape(-1)}
-        vectors.update(
-            {
-                f"layer_{layer:02d}": x[layer].reshape(-1)
-                for layer in range(self._layer_count(component))
-            }
-        )
-        return vectors
-
-    @staticmethod
-    def _mean_stats(dataset_stats):
-        first = next(iter(dataset_stats.values()))
-        return {
-            variant: {
-                metric: float(values.mean()) if values.size else np.nan
-                for metric in metrics
-                for values in [
-                    np.asarray(
-                        [
-                            stats[variant][metric]
-                            for stats in dataset_stats.values()
-                            if np.isfinite(stats[variant][metric])
-                        ],
-                        dtype=np.float64,
-                    )
-                ]
-            }
-            for variant, metrics in first.items()
-        }
-
-    def _compute_magnitude(self, representations):
-        results = {}
-
-        for representation, signatures_by_type in representations.items():
-            results[representation] = {}
-            for signature, signatures in signatures_by_type.items():
-                results[representation][signature] = {}
-                reference = representations["raw"][signature][self.REFERENCE_MODEL]
-
-                for model in signatures:
-                    results[representation][signature][model] = {}
-                    for component in self.components:
-                        dataset_stats = {}
-
-                        for dataset, dataset_name in enumerate(self.DATASET_NAMES):
-                            vectors = self._signature_vectors(
-                                signatures, model, dataset, component
-                            )
-                            stats = {
-                                variant: self._magnitude_stats(vector)
-                                for variant, vector in vectors.items()
-                            }
-
-                            if representation == "delta":
-                                reference_vectors = self._signature_vectors(
-                                    {self.REFERENCE_MODEL: reference},
-                                    self.REFERENCE_MODEL,
-                                    dataset,
-                                    component,
-                                )
-                                for variant, values in stats.items():
-                                    reference_l1 = float(
-                                        np.abs(reference_vectors[variant]).sum()
-                                    )
-                                    values["relative_l1_change"] = (
-                                        values["l1_norm"] / reference_l1
-                                        if reference_l1 > 0
-                                        else np.nan
-                                    )
-
-                            dataset_stats[dataset_name] = stats
-
-                        results[representation][signature][model][component] = {
-                            "global": self._mean_stats(dataset_stats),
-                            "datasets": dataset_stats,
-                        }
-
-        return results
-
-    def _save_magnitude(self, magnitude):
-        base_columns = (
-            "l1_norm",
-            "mean_absolute_value",
-            "effective_support_fraction",
-        )
-
-        for representation, signatures in magnitude.items():
-            columns = base_columns + (
-                ("relative_l1_change",) if representation == "delta" else ()
-            )
-
-            for signature, models in signatures.items():
-                root = self.save_dir / "magnitude_analysis" / representation / signature
-                summary = []
-
-                for model in self.model_names:
-                    if model not in models:
-                        continue
-
-                    for component, values in models[model].items():
-                        out = root / model / component
-                        out.mkdir(parents=True, exist_ok=True)
-
-                        with open(out / "magnitude.csv", "w", newline="") as file:
-                            writer = csv.writer(file)
-                            writer.writerow(["dataset_name", "variant", *columns])
-
-                            for variant, stats in values["global"].items():
-                                writer.writerow(
-                                    ["global", variant, *[stats[c] for c in columns]]
-                                )
-
-                            for dataset_name in self.DATASET_NAMES:
-                                for variant, stats in values["datasets"][
-                                    dataset_name
-                                ].items():
-                                    writer.writerow(
-                                        [
-                                            dataset_name,
-                                            variant,
-                                            *[stats[c] for c in columns],
-                                        ]
-                                    )
-
-                        stats = values["global"]["global"]
-                        summary.append([model, component, *[stats[c] for c in columns]])
-
-                root.mkdir(parents=True, exist_ok=True)
-                with open(root / "magnitude.csv", "w", newline="") as file:
-                    writer = csv.writer(file)
-                    writer.writerow(["model_name", "component", *columns])
-                    writer.writerows(summary)
-
-    def _make_delta_signatures(self, signatures):
+    def _make_delta_signatures(
+        self,
+        raw,
+    ):
         return {
             signature: {
                 model: {
                     component: (
-                        signatures[signature][model][component]
-                        - signatures[signature][self.REFERENCE_MODEL][component]
+                        raw[signature][model][component]
+                        - raw[signature][self.REFERENCE_MODEL][component]
                     )
                     for component in self.components
                 }
@@ -576,405 +776,1708 @@ class VTABFunctionalSemanticsAnalyzer:
             for signature in self.SIGNATURES
         }
 
+    def _has_prompts(
+        self,
+        raw,
+        model,
+    ):
+        return any(
+            np.any(raw["P"][model][component]) for component in self.PROMPT_COMPONENTS
+        )
+
     @staticmethod
-    def _zero_case(a, b):
-        a_zero, b_zero = not np.any(a), not np.any(b)
-        return 0.0 if a_zero and b_zero else 1.0 if a_zero or b_zero else None
+    def _magnitude_stats(x):
+        x = np.abs(
+            np.asarray(
+                x,
+                dtype=np.float64,
+            ).reshape(-1)
+        )
 
-    def _hellinger(self, a, b):
-        if np.any(a < 0) or np.any(b < 0):
-            raise ValueError("Hellinger distance requires nonnegative signatures.")
-        zero = self._zero_case(a, b)
-        if zero is not None:
-            return zero
-        p, q = a / a.sum(), b / b.sum()
-        return float(np.sqrt(0.5 * np.square(np.sqrt(p) - np.sqrt(q)).sum()))
+        l1 = float(x.sum())
 
-    def _pairwise_normalized_cosine(self, a, b):
-        if np.any(a < 0) or np.any(b < 0):
-            raise ValueError(
-                "Task2Vec pairwise-normalized cosine requires nonnegative signatures."
+        if not l1:
+            return (
+                0.0,
+                float(x.mean()),
+                0.0,
             )
-        zero = self._zero_case(a, b)
-        if zero is not None:
-            return zero
 
-        total = a + b
-        x = np.divide(a, total, out=np.zeros_like(a), where=total > 0)
-        y = np.divide(b, total, out=np.zeros_like(b), where=total > 0)
-        similarity = np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y))
-        return float(1.0 - np.clip(similarity, -1.0, 1.0))
+        p = x[x > 0] / l1
 
-    def _angular(self, a, b):
-        zero = self._zero_case(a, b)
-        if zero is not None:
-            return zero
-        similarity = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-        return float(np.arccos(np.clip(similarity, -1.0, 1.0)) / np.pi)
+        support = float(np.exp(-np.sum(p * np.log(p))) / x.size)
 
-    def _distance(self, metric, a, b):
-        a = np.asarray(a, dtype=np.float64).reshape(-1)
-        b = np.asarray(b, dtype=np.float64).reshape(-1)
-        return getattr(self, f"_{metric}")(a, b)
+        return (
+            l1,
+            float(x.mean()),
+            support,
+        )
 
-    def _distance_matrix(self, signatures, metric, model, component, layer=None):
-        n = len(self.DATASET_NAMES)
-        matrix = np.zeros((n, n), dtype=np.float64)
+    def _compute_magnitude(
+        self,
+        representations,
+        raw,
+    ):
+        # Do not mix downstream VTAB
+        # magnitude with the ImageNet reference.
+        scopes = {
+            "vtab_mean": np.arange(len(self.DATASET_NAMES) - 1),
+            "imagenet_val": np.asarray([len(self.DATASET_NAMES) - 1]),
+        }
 
-        for i in range(n):
-            a = signatures[model][component][i]
-            if layer is not None:
-                a = a[layer]
+        rows = []
 
-            for j in range(i):
-                b = signatures[model][component][j]
-                if layer is not None:
-                    b = b[layer]
-                matrix[i, j] = matrix[j, i] = self._distance(metric, a, b)
+        for (
+            representation,
+            signature_types,
+        ) in representations.items():
+
+            for (
+                signature,
+                models,
+            ) in signature_types.items():
+
+                reference = raw[signature][self.REFERENCE_MODEL]
+
+                for (
+                    model,
+                    components,
+                ) in models.items():
+
+                    has_prompts = self._has_prompts(
+                        raw,
+                        model,
+                    )
+
+                    for (
+                        component,
+                        values,
+                    ) in components.items():
+
+                        if component in self.PROMPT_COMPONENTS and not has_prompts:
+                            continue
+
+                        shape, axes = self.COMPONENTS[component]
+
+                        variants = [
+                            (
+                                "full",
+                                "",
+                                values.reshape(
+                                    len(values),
+                                    -1,
+                                ),
+                            )
+                        ]
+
+                        if axes[0] == "layer":
+                            variants += [
+                                (
+                                    "layer",
+                                    layer,
+                                    values[
+                                        :,
+                                        layer,
+                                    ].reshape(
+                                        len(values),
+                                        -1,
+                                    ),
+                                )
+                                for layer in range(shape[0])
+                            ]
+
+                        for (
+                            view,
+                            layer,
+                            vectors,
+                        ) in variants:
+
+                            ref = reference[component]
+
+                            if view == "layer":
+                                ref = ref[
+                                    :,
+                                    layer,
+                                ]
+
+                            ref_l1 = (
+                                np.abs(ref)
+                                .reshape(
+                                    len(ref),
+                                    -1,
+                                )
+                                .sum(axis=1)
+                            )
+
+                            delta_l1 = np.abs(vectors).sum(axis=1)
+
+                            for (
+                                scope,
+                                indices,
+                            ) in scopes.items():
+
+                                stats = np.asarray(
+                                    [
+                                        self._magnitude_stats(vectors[i])
+                                        for i in indices
+                                    ],
+                                    dtype=np.float64,
+                                )
+
+                                ratio = np.divide(
+                                    delta_l1[indices],
+                                    ref_l1[indices],
+                                    out=np.full(
+                                        len(indices),
+                                        np.nan,
+                                        dtype=np.float64,
+                                    ),
+                                    where=(ref_l1[indices] > 0),
+                                )
+
+                                finite = ratio[np.isfinite(ratio)]
+
+                                rows.append(
+                                    {
+                                        "representation": representation,
+                                        "signature": signature,
+                                        "model_name": model,
+                                        "component": component,
+                                        "view": view,
+                                        "layer": layer,
+                                        "dataset_scope": scope,
+                                        "l1_norm": float(
+                                            stats[
+                                                :,
+                                                0,
+                                            ].mean()
+                                        ),
+                                        "mean_absolute_value": float(
+                                            stats[
+                                                :,
+                                                1,
+                                            ].mean()
+                                        ),
+                                        "effective_support_fraction": float(
+                                            stats[
+                                                :,
+                                                2,
+                                            ].mean()
+                                        ),
+                                        "relative_l1_change": (
+                                            float(finite.mean())
+                                            if (
+                                                representation == "delta"
+                                                and finite.size
+                                            )
+                                            else ""
+                                        ),
+                                    }
+                                )
+
+        return rows
+
+    def _extract_vectors(
+        self,
+        signatures,
+        model,
+        view,
+    ):
+        component = view["component"]
+
+        x = signatures[model][component]
+
+        axes = self.COMPONENTS[component][1]
+
+        index = [slice(None)] + [
+            (
+                slice(None)
+                if axis not in view["selectors"]
+                else self._axis_index(
+                    axis,
+                    view["selectors"][axis],
+                )
+            )
+            for axis in axes
+        ]
+
+        vectors = x[tuple(index)].reshape(
+            len(self.DATASET_NAMES),
+            -1,
+        )
+
+        if vectors.shape[1] != view["vector_dim"]:
+            raise RuntimeError(
+                f"View "
+                f"'{view['view_id']}' "
+                f"has dimension "
+                f"{vectors.shape[1]}, "
+                f"expected "
+                f"{view['vector_dim']}."
+            )
+
+        return vectors
+
+    @staticmethod
+    def _hellinger_matrix(
+        vectors,
+    ):
+        if np.any(vectors < 0):
+            raise ValueError(
+                "Hellinger distance " "requires nonnegative " "signatures."
+            )
+
+        sums = vectors.sum(axis=1)
+
+        valid = sums > 0
+
+        roots = np.zeros_like(vectors)
+
+        roots[valid] = np.sqrt(
+            vectors[valid]
+            / sums[
+                valid,
+                None,
+            ]
+        )
+
+        similarity = np.clip(
+            roots @ roots.T,
+            0.0,
+            1.0,
+        )
+
+        matrix = np.sqrt(
+            np.maximum(
+                0.0,
+                1.0 - similarity,
+            )
+        )
+
+        # Preserve the original
+        # zero-vector convention.
+        matrix[
+            ~valid,
+            :,
+        ] = 1.0
+
+        matrix[
+            :,
+            ~valid,
+        ] = 1.0
+
+        matrix[
+            np.ix_(
+                ~valid,
+                ~valid,
+            )
+        ] = 0.0
+
+        np.fill_diagonal(
+            matrix,
+            0.0,
+        )
 
         return matrix
 
-    def _compute_distances(self, representations):
-        policy = {"raw": self.RAW_METRICS, "delta": self.DELTA_METRICS}
-        results = {"raw": {}, "delta": {}}
-        total = sum(
-            len(metrics)
-            * len(representations[representation][signature])
-            * len(self.components)
-            for representation, signatures in policy.items()
-            for signature, metrics in signatures.items()
+    @staticmethod
+    def _angular_matrix(
+        vectors,
+    ):
+        norms = np.linalg.norm(
+            vectors,
+            axis=1,
         )
 
-        with tqdm(
-            total=total, desc="Computing distances", disable=not self.verbose
-        ) as pbar:
-            for representation, signatures in policy.items():
-                for signature, metrics in signatures.items():
-                    values = representations[representation][signature]
+        valid = norms > 0
 
-                    for metric in metrics:
-                        results[representation].setdefault(metric, {})[signature] = {}
+        normalized = np.zeros_like(vectors)
 
-                        for model in values:
-                            results[representation][metric][signature][model] = {}
+        normalized[valid] = (
+            vectors[valid]
+            / norms[
+                valid,
+                None,
+            ]
+        )
 
-                            for component in self.components:
-                                n_layers = self._layer_count(component)
-                                layers = (
-                                    np.stack(
-                                        [
-                                            self._distance_matrix(
-                                                values, metric, model, component, layer
-                                            )
-                                            for layer in range(n_layers)
-                                        ]
-                                    )
-                                    if n_layers
-                                    else np.empty(
-                                        (
-                                            0,
-                                            len(self.DATASET_NAMES),
-                                            len(self.DATASET_NAMES),
-                                        ),
-                                        dtype=np.float64,
-                                    )
-                                )
+        similarity = np.clip(
+            normalized @ normalized.T,
+            -1.0,
+            1.0,
+        )
 
-                                results[representation][metric][signature][model][
-                                    component
-                                ] = {
-                                    "global": self._distance_matrix(
-                                        values, metric, model, component
-                                    ),
-                                    "layers": layers,
-                                }
+        matrix = np.arccos(similarity) / np.pi
 
-                                pbar.set_postfix_str(
-                                    f"{representation} | {metric} | {signature} | "
-                                    f"{model} | {component}",
-                                    refresh=False,
-                                )
-                                pbar.update()
+        matrix[
+            ~valid,
+            :,
+        ] = 1.0
 
-        return results
+        matrix[
+            :,
+            ~valid,
+        ] = 1.0
 
-    def _group_scores(self, matrix, group):
+        matrix[
+            np.ix_(
+                ~valid,
+                ~valid,
+            )
+        ] = 0.0
+
+        np.fill_diagonal(
+            matrix,
+            0.0,
+        )
+
+        return matrix
+
+    @staticmethod
+    def _pairwise_normalized_cosine_matrix(
+        vectors,
+    ):
+        if np.any(vectors < 0):
+            raise ValueError(
+                "Task2Vec pairwise-normalized "
+                "cosine requires nonnegative "
+                "signatures."
+            )
+
+        n = len(vectors)
+
+        matrix = np.zeros(
+            (n, n),
+            dtype=np.float64,
+        )
+
+        for i in range(n):
+            for j in range(i):
+                a = vectors[i]
+                b = vectors[j]
+
+                a_zero = not np.any(a)
+                b_zero = not np.any(b)
+
+                if a_zero or b_zero:
+                    distance = 0.0 if (a_zero and b_zero) else 1.0
+                else:
+                    total = a + b
+
+                    x = np.divide(
+                        a,
+                        total,
+                        out=np.zeros_like(a),
+                        where=total > 0,
+                    )
+
+                    y = np.divide(
+                        b,
+                        total,
+                        out=np.zeros_like(b),
+                        where=total > 0,
+                    )
+
+                    similarity = np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y))
+
+                    distance = 1.0 - np.clip(
+                        similarity,
+                        -1.0,
+                        1.0,
+                    )
+
+                matrix[
+                    i,
+                    j,
+                ] = distance
+
+                matrix[
+                    j,
+                    i,
+                ] = distance
+
+        return matrix
+
+    def _distance_matrix(
+        self,
+        metric,
+        vectors,
+    ):
+        return getattr(
+            self,
+            f"_{metric}_matrix",
+        )(vectors)
+
+    def _group_scores(
+        self,
+        matrix,
+        group,
+    ):
         spec = self.GROUPS[group]
+
         anchors = [self.dataset_index[x] for x in spec["anchors"]]
+
         positives = [self.dataset_index[x] for x in spec["positives"]]
+
         negatives = [self.dataset_index[x] for x in spec["negatives"]]
-        ranking, geometric = [], []
+
+        ranking = []
+        geometric = []
 
         for anchor in anchors:
             peers = [x for x in positives if x != anchor]
+
             if not peers or not negatives:
-                raise ValueError(f"Group '{group}' has no valid comparisons.")
+                raise ValueError(f"Group '{group}' " "has no valid comparisons.")
 
-            positive = matrix[anchor, peers]
-            negative = matrix[anchor, negatives]
+            positive = matrix[
+                anchor,
+                peers,
+            ]
 
-            # ROC-AUC / concordance:
-            # probability that a positive is closer than a negative.
-            p = positive[:, None]
-            n = negative[None, :]
+            negative = matrix[
+                anchor,
+                negatives,
+            ]
+
+            p = positive[
+                :,
+                None,
+            ]
+
+            n = negative[
+                None,
+                :,
+            ]
+
             ranking.append(
-                float(((p < n).sum() + 0.5 * (p == n).sum()) / p.size / n.size)
+                float(((p < n).sum() + 0.5 * (p == n).sum()) / (p.size * n.size))
             )
 
-            # Silhouette-style normalized semantic distance margin.
-            d_pos, d_neg = float(positive.mean()), float(negative.mean())
-            denominator = max(d_pos, d_neg)
+            d_pos = float(positive.mean())
+
+            d_neg = float(negative.mean())
+
+            denominator = max(
+                d_pos,
+                d_neg,
+            )
+
             geometric.append((d_neg - d_pos) / denominator if denominator else 0.0)
 
-        return {
-            "ranking_agreement": float(np.mean(ranking)),
-            "geometric_agreement": float(np.mean(geometric)),
+        return (
+            float(np.mean(ranking)),
+            float(np.mean(geometric)),
+        )
+
+    def _separation_scores(
+        self,
+        matrix,
+    ):
+        scores = {
+            group: self._group_scores(
+                matrix,
+                group,
+            )
+            for group in self.GROUPS
         }
 
-    def _separation_scores(self, matrix):
-        individual = {group: self._group_scores(matrix, group) for group in self.GROUPS}
+        for (
+            name,
+            groups,
+        ) in self.METAGROUPS.items():
 
-        for name, groups in self.METAGROUPS.items():
-            individual[name] = {
-                metric: float(np.mean([individual[group][metric] for group in groups]))
-                for metric in self.AGREEMENT_METRICS
-            }
+            scores[name] = tuple(
+                float(np.mean([scores[group][i] for group in groups])) for i in range(2)
+            )
 
         return {
-            metric: {group: individual[group][metric] for group in self.REPORT_GROUPS}
-            for metric in self.AGREEMENT_METRICS
+            f"{group}__{metric}": scores[group][i]
+            for group in self.REPORT_GROUPS
+            for i, metric in enumerate(self.AGREEMENT_METRICS)
         }
 
-    def _group_averages(self, model_scores):
-        averages = {}
+    def _result_row(
+        self,
+        representation,
+        signature,
+        metric,
+        model,
+        view,
+        scores,
+    ):
+        selectors = view["selectors"]
 
-        for group_name, group_models in self.model_groups.items():
-            models = [model for model in group_models if model in model_scores]
-            if not models:
-                continue
+        row = {
+            "representation": representation,
+            "signature": signature,
+            "distance_metric": metric,
+            "model_name": model,
+            "family": view["family"],
+            "component": view["component"],
+            "view": view["view"],
+            "view_id": view["view_id"],
+            **{
+                axis: selectors.get(
+                    axis,
+                    "",
+                )
+                for axis in (
+                    "layer",
+                    "site",
+                    "sublayer",
+                    "token_group",
+                    "query_group",
+                    "destination_group",
+                    "route",
+                )
+            },
+            "vector_axes": "|".join(view["vector_axes"]),
+            "vector_dim": view["vector_dim"],
+        }
 
-            averages[f"{group_name}_average"] = {
-                component: {
-                    metric: {
-                        group: float(
-                            np.mean(
-                                [
-                                    model_scores[model][component]["global"][metric][
-                                        group
-                                    ]
-                                    for model in models
-                                ]
+        row.update(scores)
+
+        return row
+
+    def _compute_separation(
+        self,
+        representations,
+        raw,
+    ):
+        policy = {
+            "raw": self.RAW_METRICS,
+            "delta": self.DELTA_METRICS,
+        }
+
+        total = sum(
+            len(metrics)
+            * sum(
+                sum(
+                    (view["component"] not in self.PROMPT_COMPONENTS)
+                    or self._has_prompts(
+                        raw,
+                        model,
+                    )
+                    for view in self.views
+                )
+                for model in representations[representation][signature]
+            )
+            for (
+                representation,
+                signature_metrics,
+            ) in policy.items()
+            for (
+                signature,
+                metrics,
+            ) in signature_metrics.items()
+        )
+
+        rows = []
+
+        with tqdm(
+            total=total,
+            desc="Computing semantic views",
+            disable=not self.verbose,
+        ) as pbar:
+
+            for (
+                representation,
+                signature_metrics,
+            ) in policy.items():
+
+                for (
+                    signature,
+                    metrics,
+                ) in signature_metrics.items():
+
+                    signatures = representations[representation][signature]
+
+                    for metric in metrics:
+                        for model in signatures:
+
+                            has_prompts = self._has_prompts(
+                                raw,
+                                model,
                             )
-                        )
-                        for group in self.REPORT_GROUPS
-                    }
-                    for metric in self.AGREEMENT_METRICS
-                }
-                for component in self.components
-            }
 
-        return averages
+                            for view in self.views:
 
-    def _compute_separation(self, distances):
-        results = {"raw": {}, "delta": {}}
-        total = sum(
-            len(components)
-            for metrics in distances.values()
-            for signatures in metrics.values()
-            for models in signatures.values()
-            for components in models.values()
-        )
+                                if (
+                                    view["component"] in self.PROMPT_COMPONENTS
+                                    and not has_prompts
+                                ):
+                                    continue
 
-        with tqdm(
-            total=total, desc="Computing separation", disable=not self.verbose
-        ) as pbar:
-            for representation, metrics in distances.items():
-                for metric, signatures in metrics.items():
-                    results[representation].setdefault(metric, {})
-
-                    for signature, models in signatures.items():
-                        model_scores = {
-                            model: {
-                                component: {
-                                    "global": self._separation_scores(
-                                        matrices["global"]
-                                    ),
-                                    "layers": [
-                                        self._separation_scores(matrix)
-                                        for matrix in matrices["layers"]
-                                    ],
-                                }
-                                for component, matrices in components.items()
-                            }
-                            for model, components in models.items()
-                        }
-
-                        pbar.update(
-                            sum(len(components) for components in models.values())
-                        )
-
-                        results[representation][metric][signature] = {
-                            "models": model_scores,
-                            "group_averages": self._group_averages(model_scores),
-                        }
-
-        return results
-
-    def _plot_distance(self, matrix, path, title):
-        xy = (
-            np.zeros((len(matrix), 2))
-            if np.allclose(matrix, 0)
-            else MDS(
-                n_components=2,
-                dissimilarity="precomputed",
-                random_state=0,
-                n_init=4,
-            ).fit_transform(matrix)
-        )
-
-        fig, ax = plt.subplots(figsize=(10, 8))
-        ax.scatter(xy[:, 0], xy[:, 1])
-
-        for i, name in enumerate(self.DATASET_NAMES):
-            ax.annotate(name, xy[i], xytext=(4, 4), textcoords="offset points")
-
-        ax.set_title(title)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        fig.tight_layout()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(path, dpi=200)
-        plt.close(fig)
-
-    def _save_distances(self, distances):
-        if not (self.save_distances or self.create_plots):
-            return
-
-        total = sum(
-            1 + len(matrices["layers"])
-            for metrics in distances.values()
-            for signatures in metrics.values()
-            for models in signatures.values()
-            for components in models.values()
-            for matrices in components.values()
-        )
-
-        with tqdm(
-            total=total, desc="Saving distance outputs", disable=not self.verbose
-        ) as pbar:
-            for representation, metrics in distances.items():
-                for metric, signatures in metrics.items():
-                    for signature, models in signatures.items():
-                        for model, components in models.items():
-                            for component, matrices in components.items():
-                                out = (
-                                    self.save_dir
-                                    / "distance_analysis"
-                                    / representation
-                                    / metric
-                                    / signature
-                                    / model
-                                    / component
-                                )
-                                items = [("global", matrices["global"])] + [
-                                    (f"layer_{layer:02d}", matrix)
-                                    for layer, matrix in enumerate(matrices["layers"])
-                                ]
-                                title = (
-                                    f"{representation} | {metric} | {signature} | "
-                                    f"{model} | {component}"
+                                vectors = self._extract_vectors(
+                                    signatures,
+                                    model,
+                                    view,
                                 )
 
-                                for variant, matrix in items:
-                                    if self.save_distances:
-                                        out.mkdir(parents=True, exist_ok=True)
-                                        np.save(out / f"{variant}.npy", matrix)
+                                # Matrix is transient:
+                                # compute -> score -> discard.
+                                matrix = self._distance_matrix(
+                                    metric,
+                                    vectors,
+                                )
 
-                                    if self.create_plots:
-                                        self._plot_distance(
-                                            matrix,
-                                            out / "plots" / f"{variant}.png",
-                                            f"{title} | {variant}",
-                                        )
+                                scores = self._separation_scores(matrix)
 
-                                    pbar.update()
+                                rows.append(
+                                    self._result_row(
+                                        representation,
+                                        signature,
+                                        metric,
+                                        model,
+                                        view,
+                                        scores,
+                                    )
+                                )
 
-    def _save_separation(self, separation):
-        columns = [
+                                pbar.update()
+
+        return rows + self._model_group_averages(rows)
+
+    def _score_columns(self):
+        return tuple(
             f"{group}__{metric}"
             for group in self.REPORT_GROUPS
             for metric in self.AGREEMENT_METRICS
+        )
+
+    def _model_group_averages(
+        self,
+        rows,
+    ):
+        score_columns = self._score_columns()
+
+        row_map = {
+            (
+                row["representation"],
+                row["signature"],
+                row["distance_metric"],
+                row["model_name"],
+                row["view_id"],
+            ): row
+            for row in rows
+        }
+
+        configs = sorted(
+            {
+                (
+                    row["representation"],
+                    row["signature"],
+                    row["distance_metric"],
+                )
+                for row in rows
+            }
+        )
+
+        averages = []
+
+        for (
+            representation,
+            signature,
+            metric,
+        ) in configs:
+
+            for (
+                group_name,
+                models,
+            ) in self.model_groups.items():
+
+                view_sets = [
+                    {
+                        row["view_id"]
+                        for row in rows
+                        if (
+                            row["representation"] == representation
+                            and row["signature"] == signature
+                            and row["distance_metric"] == metric
+                            and row["model_name"] == model
+                        )
+                    }
+                    for model in models
+                ]
+
+                common = set.intersection(*view_sets) if view_sets else set()
+
+                # A group average exists only
+                # for views present in every
+                # member model.
+                for view_id in sorted(common):
+                    members = [
+                        row_map[
+                            (
+                                representation,
+                                signature,
+                                metric,
+                                model,
+                                view_id,
+                            )
+                        ]
+                        for model in models
+                    ]
+
+                    row = dict(members[0])
+
+                    row["model_name"] = f"{group_name}_average"
+
+                    for column in score_columns:
+                        row[column] = float(
+                            np.mean([member[column] for member in members])
+                        )
+
+                    averages.append(row)
+
+        return averages
+
+    @staticmethod
+    def _write_csv(
+        path,
+        rows,
+        columns,
+    ):
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with open(
+            path,
+            "w",
+            newline="",
+        ) as file:
+
+            writer = csv.DictWriter(
+                file,
+                fieldnames=columns,
+            )
+
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def _save_metadata(self):
+        root = self.save_dir / "metadata"
+
+        component_rows = [
+            {
+                "component": component,
+                "family": self.COMPONENT_FAMILY[component],
+                "shape": "x".join(
+                    map(
+                        str,
+                        shape,
+                    )
+                ),
+                "axes": "|".join(axes),
+            }
+            for component, (
+                shape,
+                axes,
+            ) in self.COMPONENTS.items()
         ]
 
-        def row(scores):
-            return [
-                scores[metric][group]
+        self._write_csv(
+            root / "component_schema.csv",
+            component_rows,
+            (
+                "component",
+                "family",
+                "shape",
+                "axes",
+            ),
+        )
+
+        selector_axes = (
+            "layer",
+            "site",
+            "sublayer",
+            "token_group",
+            "query_group",
+            "destination_group",
+            "route",
+        )
+
+        view_rows = []
+
+        for view in self.views:
+            view_rows.append(
+                {
+                    "family": view["family"],
+                    "component": view["component"],
+                    "view": view["view"],
+                    "view_id": view["view_id"],
+                    **{
+                        axis: view["selectors"].get(
+                            axis,
+                            "",
+                        )
+                        for axis in selector_axes
+                    },
+                    "vector_axes": "|".join(view["vector_axes"]),
+                    "vector_dim": view["vector_dim"],
+                    "description": view["description"],
+                }
+            )
+
+        self._write_csv(
+            root / "view_schema.csv",
+            view_rows,
+            (
+                "family",
+                "component",
+                "view",
+                "view_id",
+                *selector_axes,
+                "vector_axes",
+                "vector_dim",
+                "description",
+            ),
+        )
+
+        semantic_rows = [
+            {
+                "group": group,
+                "type": "relation",
+                "anchors": "|".join(spec["anchors"]),
+                "positives": "|".join(spec["positives"]),
+                "negatives": "|".join(spec["negatives"]),
+                "members": "",
+            }
+            for group, spec in self.GROUPS.items()
+        ]
+
+        semantic_rows += [
+            {
+                "group": name,
+                "type": "metagroup",
+                "anchors": "",
+                "positives": "",
+                "negatives": "",
+                "members": "|".join(groups),
+            }
+            for name, groups in self.METAGROUPS.items()
+        ]
+
+        self._write_csv(
+            root / "semantic_groups.csv",
+            semantic_rows,
+            (
+                "group",
+                "type",
+                "anchors",
+                "positives",
+                "negatives",
+                "members",
+            ),
+        )
+
+        # Makes the prompt-delta
+        # interpretation explicit.
+        representation_rows = [
+            {
+                "representation": "raw",
+                "definition": (
+                    "Absolute functional " "signature for each " "model and task."
+                ),
+                "prompt_components": (
+                    "Absolute prompt-to-" "backbone signal when " "prompts exist."
+                ),
+            },
+            {
+                "representation": "delta",
+                "definition": (
+                    f"Model signature minus "
+                    f"{self.REFERENCE_MODEL} "
+                    "signature for the same "
+                    "task."
+                ),
+                "prompt_components": (
+                    "For prompt-specific "
+                    "components the reference "
+                    "mechanism is absent, so "
+                    "delta equals the introduced "
+                    "prompt signal."
+                ),
+            },
+        ]
+
+        self._write_csv(
+            root / "representation_schema.csv",
+            representation_rows,
+            (
+                "representation",
+                "definition",
+                "prompt_components",
+            ),
+        )
+
+    def _save_magnitude(
+        self,
+        rows,
+    ):
+        self._write_csv(
+            self.save_dir / "magnitude_analysis" / "magnitude.csv",
+            rows,
+            (
+                "representation",
+                "signature",
+                "model_name",
+                "component",
+                "view",
+                "layer",
+                "dataset_scope",
+                "l1_norm",
+                "mean_absolute_value",
+                "effective_support_fraction",
+                "relative_l1_change",
+            ),
+        )
+
+    def _save_separation(
+        self,
+        rows,
+    ):
+        columns = (
+            *self.RESULT_META_COLUMNS,
+            *self._score_columns(),
+        )
+
+        root = self.save_dir / "separation_analysis"
+
+        # Single source of truth.
+        self._write_csv(
+            root / "results.csv",
+            rows,
+            columns,
+        )
+
+        # Whole-component overview.
+        self._write_csv(
+            root / "overview.csv",
+            [row for row in rows if row["view"] == "full"],
+            columns,
+        )
+
+        # Readable family subsets.
+        for family in dict.fromkeys(self.COMPONENT_FAMILY.values()):
+            self._write_csv(
+                root / family / "results.csv",
+                [row for row in rows if row["family"] == family],
+                columns,
+            )
+
+    @staticmethod
+    def _short_label(
+        axis,
+        value,
+    ):
+        names = {
+            "attention_read": "attn-read",
+            "attention_write": "attn-write",
+            "mlp_read": "mlp-read",
+            "mlp_write": "mlp-write",
+            "attention": "attn",
+            "cls<-cls": "CLS<-CLS",
+            "cls<-patch": "CLS<-P",
+            "patch<-cls": "P<-CLS",
+            "patch<-patch_self": "P<-P self",
+            "patch<-patch_local": "P<-P local",
+            "patch<-patch_medium": "P<-P medium",
+            "patch<-patch_global": "P<-P global",
+        }
+
+        if axis == "layer":
+            return f"L{int(value):02d}"
+
+        return names.get(
+            str(value),
+            str(value),
+        )
+
+    def _native_matrix(
+        self,
+        rows,
+        component,
+        view_name,
+        col_axes,
+        group,
+        agreement,
+    ):
+        selected = [
+            row
+            for row in rows
+            if (row["component"] == component and row["view"] == view_name)
+        ]
+
+        if not selected:
+            return None, None
+
+        layers = list(range(self.L))
+
+        cols = (
+            list(
+                product(
+                    *(
+                        self._axis_values(
+                            component,
+                            axis,
+                        )
+                        for axis in col_axes
+                    )
+                )
+            )
+            if col_axes
+            else [()]
+        )
+
+        lookup = {
+            (
+                int(row["layer"]),
+                tuple(row[axis] for axis in col_axes),
+            ): row[f"{group}__" f"{agreement}"]
+            for row in selected
+        }
+
+        matrix = np.full(
+            (
+                len(layers),
+                len(cols),
+            ),
+            np.nan,
+            dtype=np.float64,
+        )
+
+        for i, layer in enumerate(layers):
+            for j, values in enumerate(cols):
+                matrix[
+                    i,
+                    j,
+                ] = lookup.get(
+                    (
+                        layer,
+                        tuple(values),
+                    ),
+                    np.nan,
+                )
+
+        labels = [
+            (
+                " / ".join(
+                    self._short_label(
+                        axis,
+                        value,
+                    )
+                    for axis, value in zip(
+                        col_axes,
+                        values,
+                    )
+                )
+                if col_axes
+                else "profile"
+            )
+            for values in cols
+        ]
+
+        return matrix, labels
+
+    @staticmethod
+    def _limits(
+        agreement,
+    ):
+        if agreement == "ranking_agreement":
+            return (
+                0.0,
+                1.0,
+                0.5,
+            )
+
+        return (
+            -1.0,
+            1.0,
+            0.0,
+        )
+
+    def _plot_overview_page(
+        self,
+        pdf,
+        rows,
+        agreement,
+        title,
+    ):
+        full = [row for row in rows if row["view"] == "full"]
+
+        if not full:
+            return
+
+        components = [
+            component
+            for component in self.components
+            if any(row["component"] == component for row in full)
+        ]
+
+        lookup = {row["component"]: row for row in full}
+
+        matrix = np.asarray(
+            [
+                [
+                    lookup[component][f"{group}__" f"{agreement}"]
+                    for component in components
+                ]
                 for group in self.REPORT_GROUPS
-                for metric in self.AGREEMENT_METRICS
+            ],
+            dtype=np.float64,
+        )
+
+        vmin, vmax, baseline = self._limits(agreement)
+
+        fig, ax = plt.subplots(figsize=(15, 9))
+
+        image = ax.imshow(
+            matrix,
+            aspect="auto",
+            vmin=vmin,
+            vmax=vmax,
+        )
+
+        ax.set_yticks(
+            range(len(self.REPORT_GROUPS)),
+            self.REPORT_GROUPS,
+        )
+
+        ax.set_xticks(
+            range(len(components)),
+            components,
+            rotation=55,
+            ha="right",
+        )
+
+        ax.set_title(
+            f"{title}\n" f"{agreement.replace('_', ' ')} " f"| neutral={baseline:g}"
+        )
+
+        fig.colorbar(
+            image,
+            ax=ax,
+            fraction=0.025,
+            pad=0.02,
+        )
+
+        fig.tight_layout()
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    def _plot_native_page(
+        self,
+        pdf,
+        rows,
+        spec,
+        agreement,
+    ):
+        (
+            component,
+            view_name,
+            col_axes,
+            title,
+        ) = spec
+
+        if not any(
+            row["component"] == component and row["view"] == view_name for row in rows
+        ):
+            return
+
+        vmin, vmax, baseline = self._limits(agreement)
+
+        fig, axes = plt.subplots(
+            5,
+            3,
+            figsize=(18, 22),
+            squeeze=False,
+            constrained_layout=True,
+        )
+
+        image = None
+
+        for ax, group in zip(
+            axes.flat,
+            self.REPORT_GROUPS,
+        ):
+            matrix, labels = self._native_matrix(
+                rows,
+                component,
+                view_name,
+                col_axes,
+                group,
+                agreement,
+            )
+
+            if matrix is None:
+                ax.axis("off")
+                continue
+
+            # One column means the valid
+            # per-layer task embedding has
+            # no additional semantic axis.
+            if matrix.shape[1] == 1:
+                ax.plot(
+                    range(self.L),
+                    matrix[:, 0],
+                    marker="o",
+                    markersize=2,
+                )
+
+                ax.axhline(
+                    baseline,
+                    linewidth=0.8,
+                    linestyle="--",
+                )
+
+                ax.set_ylim(
+                    vmin,
+                    vmax,
+                )
+
+                ax.set_xticks(
+                    range(self.L),
+                    [f"L{i:02d}" for i in range(self.L)],
+                    rotation=90,
+                    fontsize=6,
+                )
+
+            else:
+                image = ax.imshow(
+                    matrix,
+                    aspect="auto",
+                    vmin=vmin,
+                    vmax=vmax,
+                )
+
+                ax.set_yticks(
+                    range(self.L),
+                    [f"L{i:02d}" for i in range(self.L)],
+                    fontsize=6,
+                )
+
+                ax.set_xticks(
+                    range(len(labels)),
+                    labels,
+                    rotation=60,
+                    ha="right",
+                    fontsize=6,
+                )
+
+            ax.set_title(
+                group,
+                fontsize=9,
+            )
+
+        for ax in axes.flat[len(self.REPORT_GROUPS) :]:
+            ax.axis("off")
+
+        if image is not None:
+            fig.colorbar(
+                image,
+                ax=axes.ravel().tolist(),
+                fraction=0.012,
+                pad=0.01,
+            )
+
+        fig.suptitle(
+            f"{title}\n" f"{agreement.replace('_', ' ')}",
+            fontsize=15,
+        )
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    def _plot_model_overview_page(
+        self,
+        pdf,
+        rows,
+        agreement,
+        title,
+    ):
+        models = [
+            model
+            for model in self.model_names
+            if any(row["model_name"] == model for row in rows)
+        ]
+
+        components = [
+            component
+            for component in self.components
+            if any(
+                row["view"] == "full" and row["component"] == component for row in rows
+            )
+        ]
+
+        vmin, vmax, baseline = self._limits(agreement)
+
+        fig, axes = plt.subplots(
+            5,
+            3,
+            figsize=(18, 22),
+            squeeze=False,
+            constrained_layout=True,
+        )
+
+        image = None
+
+        for ax, group in zip(
+            axes.flat,
+            self.REPORT_GROUPS,
+        ):
+            lookup = {
+                (
+                    row["model_name"],
+                    row["component"],
+                ): row[f"{group}__" f"{agreement}"]
+                for row in rows
+                if row["view"] == "full"
+            }
+
+            matrix = np.asarray(
+                [
+                    [
+                        lookup.get(
+                            (
+                                model,
+                                component,
+                            ),
+                            np.nan,
+                        )
+                        for component in components
+                    ]
+                    for model in models
+                ],
+                dtype=np.float64,
+            )
+
+            image = ax.imshow(
+                matrix,
+                aspect="auto",
+                vmin=vmin,
+                vmax=vmax,
+            )
+
+            ax.set_yticks(
+                range(len(models)),
+                models,
+                fontsize=7,
+            )
+
+            ax.set_xticks(
+                range(len(components)),
+                components,
+                rotation=60,
+                ha="right",
+                fontsize=6,
+            )
+
+            ax.set_title(
+                group,
+                fontsize=9,
+            )
+
+        for ax in axes.flat[len(self.REPORT_GROUPS) :]:
+            ax.axis("off")
+
+        fig.colorbar(
+            image,
+            ax=axes.ravel().tolist(),
+            fraction=0.012,
+            pad=0.01,
+        )
+
+        fig.suptitle(
+            f"{title}\n" f"{agreement.replace('_', ' ')} " f"| neutral={baseline:g}",
+            fontsize=15,
+        )
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    def _plot_model_depth_page(
+        self,
+        pdf,
+        rows,
+        component,
+        agreement,
+    ):
+        selected = [
+            row
+            for row in rows
+            if (row["component"] == component and row["view"] == "layer")
+        ]
+
+        if not selected:
+            return
+
+        # Include promptless models as NaN/N/A
+        # rows rather than silently dropping them.
+        models = [
+            model
+            for model in self.model_names
+            if any(row["model_name"] == model for row in rows)
+        ]
+
+        vmin, vmax, baseline = self._limits(agreement)
+
+        fig, axes = plt.subplots(
+            5,
+            3,
+            figsize=(18, 22),
+            squeeze=False,
+            constrained_layout=True,
+        )
+
+        image = None
+
+        for ax, group in zip(
+            axes.flat,
+            self.REPORT_GROUPS,
+        ):
+            lookup = {
+                (
+                    row["model_name"],
+                    int(row["layer"]),
+                ): row[f"{group}__" f"{agreement}"]
+                for row in selected
+            }
+
+            matrix = np.asarray(
+                [
+                    [
+                        lookup.get(
+                            (
+                                model,
+                                layer,
+                            ),
+                            np.nan,
+                        )
+                        for layer in range(self.L)
+                    ]
+                    for model in models
+                ],
+                dtype=np.float64,
+            )
+
+            image = ax.imshow(
+                matrix,
+                aspect="auto",
+                vmin=vmin,
+                vmax=vmax,
+            )
+
+            ax.set_yticks(
+                range(len(models)),
+                models,
+                fontsize=7,
+            )
+
+            ax.set_xticks(
+                range(self.L),
+                [f"L{i:02d}" for i in range(self.L)],
+                rotation=90,
+                fontsize=6,
+            )
+
+            ax.set_title(
+                group,
+                fontsize=9,
+            )
+
+        for ax in axes.flat[len(self.REPORT_GROUPS) :]:
+            ax.axis("off")
+
+        fig.colorbar(
+            image,
+            ax=axes.ravel().tolist(),
+            fraction=0.012,
+            pad=0.01,
+        )
+
+        fig.suptitle(
+            f"Cross-model depth: "
+            f"{component}\n"
+            f"{agreement.replace('_', ' ')} "
+            f"| neutral={baseline:g}",
+            fontsize=15,
+        )
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    def _save_reports(
+        self,
+        rows,
+    ):
+        if not self.create_plots:
+            return
+
+        # Plot only actual models.
+        # Group averages remain in CSV.
+        real_rows = [row for row in rows if row["model_name"] in self.model_names]
+
+        configs = sorted(
+            {
+                (
+                    row["representation"],
+                    row["distance_metric"],
+                    row["signature"],
+                )
+                for row in real_rows
+            }
+        )
+
+        for (
+            representation,
+            metric,
+            signature,
+        ) in tqdm(
+            configs,
+            desc=("Saving interpretability " "reports"),
+            disable=not self.verbose,
+        ):
+
+            config_rows = [
+                row
+                for row in real_rows
+                if (
+                    row["representation"] == representation
+                    and row["distance_metric"] == metric
+                    and row["signature"] == signature
+                )
             ]
 
-        for representation, metrics in separation.items():
-            for metric, signatures in metrics.items():
-                for signature, result in signatures.items():
-                    root = (
-                        self.save_dir
-                        / "separation_analysis"
-                        / representation
-                        / metric
-                        / signature
+            # ----------------------------------------------------------
+            # Per-model reports:
+            # preserve native layer x semantic-axis geometry.
+            # ----------------------------------------------------------
+
+            for model in self.model_names:
+                model_rows = [row for row in config_rows if row["model_name"] == model]
+
+                if not model_rows:
+                    continue
+
+                path = (
+                    self.save_dir
+                    / "separation_analysis"
+                    / "reports"
+                    / "by_model"
+                    / representation
+                    / metric
+                    / signature
+                    / f"{model}.pdf"
+                )
+
+                path.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                with PdfPages(path) as pdf:
+                    for agreement in self.AGREEMENT_METRICS:
+                        self._plot_overview_page(
+                            pdf,
+                            model_rows,
+                            agreement,
+                            (
+                                f"{model} | "
+                                f"{representation} | "
+                                f"{signature} | "
+                                f"{metric}"
+                            ),
+                        )
+
+                        for spec in self.DEPTH_REPORTS:
+                            self._plot_native_page(
+                                pdf,
+                                model_rows,
+                                spec,
+                                agreement,
+                            )
+
+            # ----------------------------------------------------------
+            # Cross-model reports:
+            # model x component and model x layer views.
+            # ----------------------------------------------------------
+
+            path = (
+                self.save_dir
+                / "separation_analysis"
+                / "reports"
+                / "model_comparison"
+                / representation
+                / metric
+                / f"{signature}.pdf"
+            )
+
+            path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            with PdfPages(path) as pdf:
+                for agreement in self.AGREEMENT_METRICS:
+                    self._plot_model_overview_page(
+                        pdf,
+                        config_rows,
+                        agreement,
+                        (
+                            "Model comparison | "
+                            f"{representation} | "
+                            f"{signature} | "
+                            f"{metric}"
+                        ),
                     )
-                    summary = []
 
-                    for model in self.model_names:
-                        if model not in result["models"]:
-                            continue
+                    for component in self.components:
+                        axes = self.COMPONENTS[component][1]
 
-                        for component, scores in result["models"][model].items():
-                            out = root / model / component
-                            out.mkdir(parents=True, exist_ok=True)
-
-                            with open(out / "separation.csv", "w", newline="") as file:
-                                writer = csv.writer(file)
-                                writer.writerow(["variant", *columns])
-                                writer.writerow(["global", *row(scores["global"])])
-                                for layer, layer_scores in enumerate(scores["layers"]):
-                                    writer.writerow(
-                                        [f"layer_{layer:02d}", *row(layer_scores)]
-                                    )
-
-                            summary.append([model, component, *row(scores["global"])])
-
-                    for average_name, components in result["group_averages"].items():
-                        for component, scores in components.items():
-                            summary.append([average_name, component, *row(scores)])
-
-                    root.mkdir(parents=True, exist_ok=True)
-                    with open(root / "separation.csv", "w", newline="") as file:
-                        writer = csv.writer(file)
-                        writer.writerow(["model_name", "component", *columns])
-                        writer.writerows(summary)
+                        if axes[0] == "layer":
+                            self._plot_model_depth_page(
+                                pdf,
+                                config_rows,
+                                component,
+                                agreement,
+                            )
 
     def analyze(self):
-        self._log("Starting VTAB functional-semantic analysis.")
+        self._log("Starting VTAB " "functional-semantic analysis.")
 
         raw = self._load_signatures()
+
         representations = {
             "raw": raw,
             "delta": self._make_delta_signatures(raw),
         }
 
-        magnitude = self._compute_magnitude(representations)
-        distances = self._compute_distances(representations)
-        separation = self._compute_separation(distances)
+        magnitude = self._compute_magnitude(
+            representations,
+            raw,
+        )
+
+        separation = self._compute_separation(
+            representations,
+            raw,
+        )
+
+        self._save_metadata()
 
         self._save_magnitude(magnitude)
-        self._save_distances(distances)
+
         self._save_separation(separation)
 
-        self._log(f"Analysis complete. Results saved to: {self.save_dir}")
+        self._save_reports(separation)
+
+        self._log("Analysis complete. " f"Results saved to: " f"{self.save_dir}")
 
         return {
             "magnitude": magnitude,
-            "distances": distances,
             "separation": separation,
         }
