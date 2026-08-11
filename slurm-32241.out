@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/sonic_home/turirezende/lavpt/analyze_vtab_functional_semantics_exe.py", line 1, in <module>
+    from dotenv import load_dotenv
+ModuleNotFoundError: No module named 'dotenv'

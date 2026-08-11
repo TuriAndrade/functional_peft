@@ -6,6 +6,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.colors import SymLogNorm
+from scipy.stats import t as student_t
 from tqdm.auto import tqdm
 
 
@@ -14,7 +16,6 @@ class VTABFunctionalSemanticsAnalyzer:
 
     SIGNATURES = ("F", "P", "S")
     REFERENCE_MODEL = "linear_probe"
-
     L, H, D, K, MLP_DIM = 12, 12, 768, 64, 3072
 
     AXIS_VALUES = {
@@ -86,10 +87,7 @@ class VTABFunctionalSemanticsAnalyzer:
     }
 
     VIEW_AXES = {
-        "sublayer_update": (
-            ("sublayer",),
-            ("layer",),
-        ),
+        "sublayer_update": (("sublayer",), ("layer",)),
         "sublayer_token_update": (
             ("sublayer",),
             ("token_group",),
@@ -350,17 +348,10 @@ class VTABFunctionalSemanticsAnalyzer:
     )
 
     REPORT_GROUPS = tuple(METAGROUPS) + FUNCTIONAL_GROUPS + INDIVIDUAL_GROUPS
-
-    AGREEMENT_METRICS = (
-        "ranking_agreement",
-        "geometric_agreement",
-    )
+    AGREEMENT_METRICS = ("ranking_agreement", "geometric_agreement")
 
     RAW_METRICS = {
-        "F": (
-            "hellinger",
-            "pairwise_normalized_cosine",
-        ),
+        "F": ("hellinger", "pairwise_normalized_cosine"),
         "P": ("hellinger",),
         "S": ("hellinger",),
     }
@@ -396,21 +387,15 @@ class VTABFunctionalSemanticsAnalyzer:
         ),
         (
             "sublayer_token_update",
-            "layer_sublayer",
-            ("sublayer",),
-            "CLS/patch balance by layer and sublayer",
+            "layer",
+            (),
+            "Attention/MLP × CLS/patch organization by layer",
         ),
         (
             "sublayer_token_update",
-            "layer_token_group",
-            ("token_group",),
-            "Attention/MLP balance by layer and token group",
-        ),
-        (
-            "attention_head_update",
-            "layer",
-            (),
-            "Attention-head population by layer",
+            "layer_sublayer",
+            ("sublayer",),
+            "CLS/patch balance by layer and sublayer",
         ),
         (
             "residual_stream_channel",
@@ -431,24 +416,6 @@ class VTABFunctionalSemanticsAnalyzer:
             "OV transport by layer and route",
         ),
         (
-            "attention_qk_channel",
-            "layer_query_group",
-            ("query_group",),
-            "QK content by layer and query group",
-        ),
-        (
-            "attention_ov_channel",
-            "layer_destination_group",
-            ("destination_group",),
-            "OV content by layer and destination",
-        ),
-        (
-            "mlp_neuron",
-            "layer_token_group",
-            ("token_group",),
-            "MLP population by layer and token group",
-        ),
-        (
             "prompt_to_backbone_qk_route",
             "layer_destination_group",
             ("destination_group",),
@@ -462,6 +429,43 @@ class VTABFunctionalSemanticsAnalyzer:
         ),
     )
 
+    MAGNITUDE_METRICS = (
+        "l1_norm",
+        "mean_absolute_value",
+        "effective_support_fraction",
+        "relative_l1_change",
+    )
+
+    MAGNITUDE_DEPTH_FAMILIES = (
+        (
+            "Backbone computation",
+            ("sublayer_update", "sublayer_token_update"),
+        ),
+        (
+            "Residual flow",
+            ("residual_stream_channel",),
+        ),
+        (
+            "Attention routing",
+            ("attention_qk_route", "attention_ov_route"),
+        ),
+        (
+            "Feature content",
+            (
+                "attention_qk_channel",
+                "attention_ov_channel",
+                "mlp_neuron",
+            ),
+        ),
+        (
+            "Prompt influence",
+            (
+                "prompt_to_backbone_qk_route",
+                "prompt_to_backbone_ov_route",
+            ),
+        ),
+    )
+
     def __init__(
         self,
         model_names,
@@ -470,6 +474,8 @@ class VTABFunctionalSemanticsAnalyzer:
         save_dir,
         create_plots=False,
         verbose=True,
+        confidence=0.95,
+        decimal_places=2,
     ):
         self.model_names = tuple(model_names)
         self.model_groups = {
@@ -479,6 +485,14 @@ class VTABFunctionalSemanticsAnalyzer:
         self.save_dir = Path(save_dir)
         self.create_plots = bool(create_plots)
         self.verbose = bool(verbose)
+        self.confidence = float(confidence)
+        self.decimal_places = int(decimal_places)
+
+        if not 0 < self.confidence < 1:
+            raise ValueError("confidence must be in (0, 1).")
+
+        if self.decimal_places != decimal_places or self.decimal_places < 0:
+            raise ValueError("decimal_places must be a nonnegative integer.")
 
         if len(set(self.model_names)) != len(self.model_names):
             raise ValueError("model_names must be unique.")
@@ -602,7 +616,7 @@ class VTABFunctionalSemanticsAnalyzer:
                             "family": family,
                             "component": component,
                             "view": view,
-                            "view_id": (f"{component}/" f"{view}/" f"{suffix}"),
+                            "view_id": f"{component}/{view}/{suffix}",
                             "selectors": selectors,
                             "vector_axes": vector_axes,
                             "vector_dim": vector_dim,
@@ -643,7 +657,7 @@ class VTABFunctionalSemanticsAnalyzer:
                             expected = self.COMPONENTS[component][0]
 
                             for signature in self.SIGNATURES:
-                                key = f"{signature}__" f"{component}"
+                                key = f"{signature}__{component}"
 
                                 if key not in data:
                                     raise KeyError(f"Missing '{key}' in {path}.")
@@ -729,11 +743,43 @@ class VTABFunctionalSemanticsAnalyzer:
             support,
         )
 
-    def _compute_magnitude(self, representations, raw):
-        scopes = {
-            "vtab_mean": np.arange(len(self.DATASET_NAMES) - 1),
-            "imagenet_val": np.asarray([len(self.DATASET_NAMES) - 1]),
-        }
+    def _report_group_anchors(self, group):
+        if group in self.GROUPS:
+            return self.GROUPS[group]["anchors"]
+
+        return tuple(
+            dict.fromkeys(
+                dataset
+                for member in self.METAGROUPS[group]
+                for dataset in self.GROUPS[member]["anchors"]
+            )
+        )
+
+    def _compute_magnitude(
+        self,
+        representations,
+        raw,
+    ):
+        views = {view["view_id"]: view for view in self.views}
+
+        scopes = [
+            (
+                group,
+                np.asarray(
+                    [
+                        self.dataset_index[name]
+                        for name in self._report_group_anchors(group)
+                    ]
+                ),
+            )
+            for group in self.REPORT_GROUPS
+        ] + [
+            (
+                name,
+                np.asarray([i]),
+            )
+            for i, name in enumerate(self.DATASET_NAMES)
+        ]
 
         rows = []
 
@@ -752,11 +798,11 @@ class VTABFunctionalSemanticsAnalyzer:
                             continue
 
                         shape, axes = self.COMPONENTS[component]
+                        full = views[f"{component}/full"]
 
                         variants = [
                             (
-                                "full",
-                                "",
+                                full,
                                 values.reshape(
                                     len(values),
                                     -1,
@@ -767,8 +813,7 @@ class VTABFunctionalSemanticsAnalyzer:
                         if axes[0] == "layer":
                             variants += [
                                 (
-                                    "layer",
-                                    layer,
+                                    views[f"{component}/layer/layer={layer}"],
                                     values[
                                         :,
                                         layer,
@@ -780,10 +825,15 @@ class VTABFunctionalSemanticsAnalyzer:
                                 for layer in range(shape[0])
                             ]
 
-                        for view, layer, vectors in variants:
+                        for view, vectors in variants:
+                            layer = view["selectors"].get(
+                                "layer",
+                                "",
+                            )
+
                             ref = reference[component]
 
-                            if view == "layer":
+                            if layer != "":
                                 ref = ref[:, layer]
 
                             ref_l1 = (
@@ -795,9 +845,9 @@ class VTABFunctionalSemanticsAnalyzer:
                                 .sum(axis=1)
                             )
 
-                            delta_l1 = np.abs(vectors).sum(axis=1)
+                            value_l1 = np.abs(vectors).sum(axis=1)
 
-                            for scope, indices in scopes.items():
+                            for data_scope, indices in scopes:
                                 stats = np.asarray(
                                     [
                                         self._magnitude_stats(vectors[i])
@@ -806,54 +856,47 @@ class VTABFunctionalSemanticsAnalyzer:
                                     dtype=np.float64,
                                 )
 
-                                ratio = np.divide(
-                                    delta_l1[indices],
-                                    ref_l1[indices],
-                                    out=np.full(
-                                        len(indices),
-                                        np.nan,
-                                        dtype=np.float64,
-                                    ),
-                                    where=(ref_l1[indices] > 0),
-                                )
+                                relative = ""
 
-                                finite = ratio[np.isfinite(ratio)]
+                                if representation == "delta":
+                                    ratio = np.divide(
+                                        value_l1[indices],
+                                        ref_l1[indices],
+                                        out=np.full(
+                                            len(indices),
+                                            np.nan,
+                                            dtype=np.float64,
+                                        ),
+                                        where=(ref_l1[indices] > 0),
+                                    )
+
+                                    finite = ratio[np.isfinite(ratio)]
+
+                                    relative = (
+                                        float(finite.mean()) if finite.size else np.nan
+                                    )
 
                                 rows.append(
                                     {
                                         "representation": representation,
                                         "signature": signature,
                                         "model_name": model,
+                                        "data_scope": data_scope,
+                                        "family": view["family"],
                                         "component": component,
-                                        "view": view,
+                                        "view": view["view"],
+                                        "view_id": view["view_id"],
                                         "layer": layer,
-                                        "dataset_scope": scope,
-                                        "l1_norm": float(
-                                            stats[
-                                                :,
-                                                0,
-                                            ].mean()
-                                        ),
+                                        "vector_axes": "|".join(view["vector_axes"]),
+                                        "vector_dim": view["vector_dim"],
+                                        "l1_norm": float(stats[:, 0].mean()),
                                         "mean_absolute_value": float(
-                                            stats[
-                                                :,
-                                                1,
-                                            ].mean()
+                                            stats[:, 1].mean()
                                         ),
                                         "effective_support_fraction": float(
-                                            stats[
-                                                :,
-                                                2,
-                                            ].mean()
+                                            stats[:, 2].mean()
                                         ),
-                                        "relative_l1_change": (
-                                            float(finite.mean())
-                                            if (
-                                                representation == "delta"
-                                                and finite.size
-                                            )
-                                            else ""
-                                        ),
+                                        "relative_l1_change": relative,
                                     }
                                 )
 
@@ -927,16 +970,8 @@ class VTABFunctionalSemanticsAnalyzer:
             )
         )
 
-        matrix[
-            ~valid,
-            :,
-        ] = 1.0
-
-        matrix[
-            :,
-            ~valid,
-        ] = 1.0
-
+        matrix[~valid, :] = 1.0
+        matrix[:, ~valid] = 1.0
         matrix[
             np.ix_(
                 ~valid,
@@ -978,16 +1013,8 @@ class VTABFunctionalSemanticsAnalyzer:
 
         matrix = np.arccos(similarity) / np.pi
 
-        matrix[
-            ~valid,
-            :,
-        ] = 1.0
-
-        matrix[
-            :,
-            ~valid,
-        ] = 1.0
-
+        matrix[~valid, :] = 1.0
+        matrix[:, ~valid] = 1.0
         matrix[
             np.ix_(
                 ~valid,
@@ -1026,7 +1053,7 @@ class VTABFunctionalSemanticsAnalyzer:
                 b_zero = not np.any(b)
 
                 if a_zero or b_zero:
-                    distance = 0.0 if (a_zero and b_zero) else 1.0
+                    distance = 0.0 if a_zero and b_zero else 1.0
                 else:
                     total = a + b
 
@@ -1052,15 +1079,8 @@ class VTABFunctionalSemanticsAnalyzer:
                         1.0,
                     )
 
-                matrix[
-                    i,
-                    j,
-                ] = distance
-
-                matrix[
-                    j,
-                    i,
-                ] = distance
+                matrix[i, j] = distance
+                matrix[j, i] = distance
 
         return matrix
 
@@ -1094,7 +1114,7 @@ class VTABFunctionalSemanticsAnalyzer:
             peers = [x for x in positives if x != anchor]
 
             if not peers or not negatives:
-                raise ValueError(f"Group '{group}' has no " "valid comparisons.")
+                raise ValueError(f"Group '{group}' has no valid comparisons.")
 
             positive = matrix[
                 anchor,
@@ -1106,15 +1126,8 @@ class VTABFunctionalSemanticsAnalyzer:
                 negatives,
             ]
 
-            p = positive[
-                :,
-                None,
-            ]
-
-            n = negative[
-                None,
-                :,
-            ]
+            p = positive[:, None]
+            n = negative[None, :]
 
             ranking.append(
                 float(((p < n).sum() + 0.5 * (p == n).sum()) / (p.size * n.size))
@@ -1365,6 +1378,123 @@ class VTABFunctionalSemanticsAnalyzer:
 
         return averages
 
+    def _format_number(self, value):
+        if value in ("", None):
+            return ""
+
+        value = float(value)
+
+        if not np.isfinite(value):
+            return ""
+
+        decimals = self.decimal_places
+
+        if value:
+            decimals = max(
+                self.decimal_places,
+                int(math.ceil(-math.log10(abs(value)))),
+            )
+
+        return f"{value:.{decimals}f}"
+
+    def _mean_ci(self, values):
+        values = np.asarray(
+            values,
+            dtype=np.float64,
+        )
+
+        values = values[np.isfinite(values)]
+
+        if not values.size:
+            return np.nan, np.nan
+
+        mean = float(values.mean())
+
+        if values.size < 2:
+            return mean, np.nan
+
+        critical = student_t.ppf(
+            (1 + self.confidence) / 2,
+            values.size - 1,
+        )
+
+        return (
+            mean,
+            float(critical * values.std(ddof=1) / np.sqrt(values.size)),
+        )
+
+    def _format_magnitude_rows(self, rows):
+        lookup = {
+            (
+                row["representation"],
+                row["signature"],
+                row["model_name"],
+                row["component"],
+                row["view_id"],
+                row["data_scope"],
+            ): row
+            for row in rows
+        }
+
+        out = []
+
+        for row in rows:
+            formatted = dict(row)
+            group = row["data_scope"]
+
+            for metric in self.MAGNITUDE_METRICS:
+                value = row.get(
+                    metric,
+                    "",
+                )
+
+                if value in ("", None):
+                    continue
+
+                ci = np.nan
+
+                if group in self.REPORT_GROUPS:
+                    values = [
+                        lookup[
+                            (
+                                row["representation"],
+                                row["signature"],
+                                row["model_name"],
+                                row["component"],
+                                row["view_id"],
+                                dataset,
+                            )
+                        ].get(
+                            metric,
+                            np.nan,
+                        )
+                        for dataset in self._report_group_anchors(group)
+                    ]
+
+                    _, ci = self._mean_ci(values)
+
+                text = self._format_number(value)
+
+                if text and np.isfinite(ci):
+                    text += f" +- " f"{self._format_number(ci)}"
+
+                formatted[metric] = text
+
+            out.append(formatted)
+
+        return out
+
+    def _format_separation_rows(self, rows):
+        metrics = self._score_columns()
+
+        return [
+            {
+                **row,
+                **{metric: self._format_number(row[metric]) for metric in metrics},
+            }
+            for row in rows
+        ]
+
     @staticmethod
     def _write_csv(
         path,
@@ -1376,7 +1506,6 @@ class VTABFunctionalSemanticsAnalyzer:
             exist_ok=True,
         )
 
-        # Remove only columns unused by every row of this specific CSV.
         if rows:
             columns = tuple(
                 column
@@ -1495,6 +1624,7 @@ class VTABFunctionalSemanticsAnalyzer:
                 "positives": "|".join(spec["positives"]),
                 "negatives": "|".join(spec["negatives"]),
                 "members": "",
+                "magnitude_anchors": "|".join(spec["anchors"]),
             }
             for group, spec in self.GROUPS.items()
         ]
@@ -1507,6 +1637,7 @@ class VTABFunctionalSemanticsAnalyzer:
                 "positives": "",
                 "negatives": "",
                 "members": "|".join(groups),
+                "magnitude_anchors": "|".join(self._report_group_anchors(name)),
             }
             for name, groups in self.METAGROUPS.items()
         ]
@@ -1521,6 +1652,7 @@ class VTABFunctionalSemanticsAnalyzer:
                 "positives",
                 "negatives",
                 "members",
+                "magnitude_anchors",
             ),
         )
 
@@ -1567,54 +1699,75 @@ class VTABFunctionalSemanticsAnalyzer:
             [
                 {
                     "analysis": "separation",
-                    "path": ("separation_analysis/" "results.csv"),
-                    "contents": ("All semantic views " "and configurations."),
+                    "path": "separation_analysis/results.csv",
+                    "contents": "All semantic views and configurations.",
                 },
                 {
                     "analysis": "separation",
                     "path": (
-                        "separation_analysis/"
-                        "overview/{representation}/"
-                        "{distance_metric}/"
+                        "separation_analysis/overview/"
+                        "{representation}/{distance_metric}/"
                         "{signature}.csv"
                     ),
-                    "contents": ("Full-component views " "only."),
+                    "contents": "Full-component views only.",
                 },
                 {
                     "analysis": "separation",
-                    "path": ("separation_analysis/" "{family}/results.csv"),
-                    "contents": ("All semantic views " "for one component family."),
+                    "path": "separation_analysis/{family}/results.csv",
+                    "contents": "All semantic views for one component family.",
                 },
                 {
                     "analysis": "separation",
                     "path": (
-                        "separation_analysis/"
-                        "{family}/overview/"
-                        "{representation}/"
-                        "{distance_metric}/"
+                        "separation_analysis/{family}/overview/"
+                        "{representation}/{distance_metric}/"
                         "{signature}.csv"
                     ),
-                    "contents": ("Full-component views " "for one component family."),
+                    "contents": "Full-component views for one component family.",
                 },
                 {
                     "analysis": "magnitude",
-                    "path": ("magnitude_analysis/" "results.csv"),
-                    "contents": ("All full/layer " "magnitude rows."),
+                    "path": "magnitude_analysis/results.csv",
+                    "contents": (
+                        "All full/layer magnitude rows for each "
+                        "report-group anchor aggregate and dataset."
+                    ),
                 },
                 {
                     "analysis": "magnitude",
                     "path": (
-                        "magnitude_analysis/"
-                        "overview/{representation}/"
-                        "{signature}.csv"
+                        "magnitude_analysis/overview/"
+                        "{representation}/{signature}.csv"
                     ),
-                    "contents": ("Full-component " "magnitude rows only."),
+                    "contents": (
+                        "Full-component magnitude rows for each "
+                        "report-group anchor aggregate and dataset."
+                    ),
+                },
+                {
+                    "analysis": "magnitude",
+                    "path": (
+                        "magnitude_analysis/reports/by_model/"
+                        "{representation}/{signature}/{model}.pdf"
+                    ),
+                    "contents": "Per-model magnitude overview and depth reports.",
+                },
+                {
+                    "analysis": "magnitude",
+                    "path": (
+                        "magnitude_analysis/reports/model_comparison/"
+                        "{representation}/{signature}.pdf"
+                    ),
+                    "contents": "Cross-model magnitude overview and depth reports.",
                 },
                 {
                     "analysis": "all_csv",
                     "path": "*",
                     "contents": (
-                        "Columns empty for every " "row in a CSV are omitted."
+                        "Empty columns are omitted; analysis metrics "
+                        "use adaptive display precision, and magnitude "
+                        f"group means include {self.confidence:.0%} "
+                        "Student-t confidence intervals."
                     ),
                 },
             ],
@@ -1625,33 +1778,33 @@ class VTABFunctionalSemanticsAnalyzer:
             ),
         )
 
-    def _save_magnitude(
-        self,
-        rows,
-    ):
+    def _save_magnitude(self, rows):
         columns = (
             "representation",
             "signature",
             "model_name",
+            "data_scope",
+            "family",
             "component",
             "view",
+            "view_id",
             "layer",
-            "dataset_scope",
-            "l1_norm",
-            "mean_absolute_value",
-            "effective_support_fraction",
-            "relative_l1_change",
+            "vector_axes",
+            "vector_dim",
+            *self.MAGNITUDE_METRICS,
         )
 
         root = self.save_dir / "magnitude_analysis"
 
+        display = self._format_magnitude_rows(rows)
+
         self._write_csv(
             root / "results.csv",
-            rows,
+            display,
             columns,
         )
 
-        full = [row for row in rows if row["view"] == "full"]
+        full = [row for row in display if row["view"] == "full"]
 
         for representation in (
             "raw",
@@ -1720,20 +1873,22 @@ class VTABFunctionalSemanticsAnalyzer:
 
         root = self.save_dir / "separation_analysis"
 
+        display = self._format_separation_rows(rows)
+
         self._write_csv(
             root / "results.csv",
-            rows,
+            display,
             columns,
         )
 
         self._save_separation_overviews(
-            rows,
+            display,
             root,
             columns,
         )
 
         for family in dict.fromkeys(self.COMPONENT_FAMILY.values()):
-            family_rows = [row for row in rows if row["family"] == family]
+            family_rows = [row for row in display if row["family"] == family]
 
             family_root = root / family
 
@@ -2289,7 +2444,679 @@ class VTABFunctionalSemanticsAnalyzer:
         pdf.savefig(fig)
         plt.close(fig)
 
-    def _save_reports(
+    @staticmethod
+    def _magnitude_scale(values, metric):
+        values = np.asarray(values, dtype=np.float64)
+        values = values[np.isfinite(values)]
+
+        if not values.size:
+            return None
+
+        if metric == "effective_support_fraction":
+            return {"vmin": 0.0, "vmax": 1.0}
+
+        vmax = float(values.max())
+        positive = values[values > 0]
+
+        if not positive.size or vmax <= positive.min():
+            return {"vmin": 0.0, "vmax": vmax if vmax > 0 else 1.0}
+
+        return {
+            "norm": SymLogNorm(
+                linthresh=float(positive.min()),
+                vmin=0.0,
+                vmax=vmax,
+            )
+        }
+
+    def _plot_magnitude_overview_page(
+        self,
+        pdf,
+        rows,
+        metric,
+        scopes,
+        title,
+    ):
+        full = [row for row in rows if row["view"] == "full"]
+
+        components = [
+            component
+            for component in self.components
+            if any(row["component"] == component for row in full)
+        ]
+
+        lookup = {
+            (
+                row["data_scope"],
+                row["component"],
+            ): row.get(
+                metric,
+                np.nan,
+            )
+            for row in full
+        }
+
+        matrix = np.asarray(
+            [
+                [
+                    lookup.get(
+                        (
+                            scope,
+                            component,
+                        ),
+                        np.nan,
+                    )
+                    for component in components
+                ]
+                for scope in scopes
+            ],
+            dtype=np.float64,
+        )
+
+        scale = self._magnitude_scale(matrix, metric)
+
+        if not components or scale is None:
+            return
+
+        fig, ax = plt.subplots(
+            figsize=(
+                15,
+                11 if len(scopes) > 15 else 9,
+            )
+        )
+
+        image = ax.imshow(
+            matrix,
+            aspect="auto",
+            **scale,
+        )
+
+        ax.set_yticks(
+            range(len(scopes)),
+            scopes,
+            fontsize=7,
+        )
+
+        ax.set_xticks(
+            range(len(components)),
+            components,
+            rotation=55,
+            ha="right",
+            fontsize=7,
+        )
+
+        ax.set_title(f"{title}\n" f"{metric.replace('_', ' ')}")
+
+        fig.colorbar(
+            image,
+            ax=ax,
+            fraction=0.025,
+            pad=0.02,
+        )
+
+        fig.tight_layout()
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    def _plot_magnitude_depth_family_page(
+        self,
+        pdf,
+        rows,
+        family,
+        components,
+        metric,
+        title,
+        normalize=False,
+    ):
+        selected = [
+            row
+            for row in rows
+            if (
+                row["view"] == "layer"
+                and row["component"] in components
+                and row["data_scope"] in self.REPORT_GROUPS
+            )
+        ]
+
+        if not selected:
+            return
+
+        lookup = {
+            (
+                row["data_scope"],
+                row["component"],
+                int(row["layer"]),
+            ): row.get(
+                metric,
+                np.nan,
+            )
+            for row in selected
+        }
+
+        curves = {}
+        all_values = []
+
+        for group in self.REPORT_GROUPS:
+            for component in components:
+                y = np.asarray(
+                    [
+                        lookup.get(
+                            (
+                                group,
+                                component,
+                                layer,
+                            ),
+                            np.nan,
+                        )
+                        for layer in range(self.L)
+                    ],
+                    dtype=np.float64,
+                )
+
+                if normalize and np.isfinite(y).any():
+                    total = np.nansum(y)
+
+                    y = y / total if total > 0 else y
+
+                curves[
+                    group,
+                    component,
+                ] = y
+
+                all_values.extend(y[np.isfinite(y)])
+
+        if not all_values:
+            return
+
+        fig, axes = plt.subplots(
+            5,
+            3,
+            figsize=(18, 22),
+            squeeze=False,
+            constrained_layout=True,
+        )
+
+        legend = None
+
+        for ax, group in zip(
+            axes.flat,
+            self.REPORT_GROUPS,
+        ):
+            for component in components:
+                y = curves[
+                    group,
+                    component,
+                ]
+
+                if np.isfinite(y).any():
+                    ax.plot(
+                        range(self.L),
+                        y,
+                        marker="o",
+                        markersize=2,
+                        label=component,
+                    )
+
+            ax.set_xticks(
+                range(self.L),
+                [f"L{i:02d}" for i in range(self.L)],
+                rotation=90,
+                fontsize=6,
+            )
+
+            if normalize or metric == "effective_support_fraction":
+                ax.set_ylim(0, 1)
+            else:
+                vmax = max(all_values)
+                positive = [value for value in all_values if value > 0]
+
+                if metric == "relative_l1_change" and positive:
+                    ax.set_yscale("symlog", linthresh=min(positive))
+
+                ax.set_ylim(0, vmax * 1.05 if vmax > 0 else 1)
+
+            ax.set_title(
+                group,
+                fontsize=9,
+            )
+
+            if legend is None:
+                handles, labels = ax.get_legend_handles_labels()
+
+                if handles:
+                    legend = (
+                        handles,
+                        labels,
+                    )
+
+        for ax in axes.flat[len(self.REPORT_GROUPS) :]:
+            ax.axis("off")
+
+        if legend:
+            fig.legend(
+                *legend,
+                loc="upper right",
+                fontsize=8,
+            )
+
+        fig.suptitle(
+            f"{title}: {family}",
+            fontsize=15,
+        )
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    def _plot_magnitude_model_overview_page(
+        self,
+        pdf,
+        rows,
+        metric,
+        title,
+    ):
+        models = [
+            model
+            for model in self.model_names
+            if any(row["model_name"] == model for row in rows)
+        ]
+
+        components = [
+            component
+            for component in self.components
+            if any(
+                row["view"] == "full" and row["component"] == component for row in rows
+            )
+        ]
+
+        lookup = {
+            (
+                row["data_scope"],
+                row["model_name"],
+                row["component"],
+            ): row.get(
+                metric,
+                np.nan,
+            )
+            for row in rows
+            if (row["view"] == "full" and row["data_scope"] in self.REPORT_GROUPS)
+        }
+
+        scale = self._magnitude_scale(list(lookup.values()), metric)
+
+        if not models or not components or scale is None:
+            return
+
+        fig, axes = plt.subplots(
+            5,
+            3,
+            figsize=(18, 22),
+            squeeze=False,
+            constrained_layout=True,
+        )
+
+        image = None
+
+        for ax, group in zip(
+            axes.flat,
+            self.REPORT_GROUPS,
+        ):
+            matrix = np.asarray(
+                [
+                    [
+                        lookup.get(
+                            (
+                                group,
+                                model,
+                                component,
+                            ),
+                            np.nan,
+                        )
+                        for component in components
+                    ]
+                    for model in models
+                ],
+                dtype=np.float64,
+            )
+
+            image = ax.imshow(
+                matrix,
+                aspect="auto",
+                **scale,
+            )
+
+            ax.set_yticks(
+                range(len(models)),
+                models,
+                fontsize=7,
+            )
+
+            ax.set_xticks(
+                range(len(components)),
+                components,
+                rotation=60,
+                ha="right",
+                fontsize=6,
+            )
+
+            ax.set_title(
+                group,
+                fontsize=9,
+            )
+
+        for ax in axes.flat[len(self.REPORT_GROUPS) :]:
+            ax.axis("off")
+
+        fig.colorbar(
+            image,
+            ax=axes.ravel().tolist(),
+            fraction=0.012,
+            pad=0.01,
+        )
+
+        fig.suptitle(
+            f"{title}\n" f"{metric.replace('_', ' ')}",
+            fontsize=15,
+        )
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    def _plot_magnitude_model_depth_page(
+        self,
+        pdf,
+        rows,
+        component,
+        metric,
+        title,
+    ):
+        selected = [
+            row
+            for row in rows
+            if (
+                row["component"] == component
+                and row["view"] == "layer"
+                and row["data_scope"] in self.REPORT_GROUPS
+            )
+        ]
+
+        models = [
+            model
+            for model in self.model_names
+            if any(row["model_name"] == model for row in rows)
+        ]
+
+        lookup = {
+            (
+                row["data_scope"],
+                row["model_name"],
+                int(row["layer"]),
+            ): row.get(
+                metric,
+                np.nan,
+            )
+            for row in selected
+        }
+
+        scale = self._magnitude_scale(list(lookup.values()), metric)
+
+        if not models or scale is None:
+            return
+
+        fig, axes = plt.subplots(
+            5,
+            3,
+            figsize=(18, 22),
+            squeeze=False,
+            constrained_layout=True,
+        )
+
+        image = None
+
+        for ax, group in zip(
+            axes.flat,
+            self.REPORT_GROUPS,
+        ):
+            matrix = np.asarray(
+                [
+                    [
+                        lookup.get(
+                            (
+                                group,
+                                model,
+                                layer,
+                            ),
+                            np.nan,
+                        )
+                        for layer in range(self.L)
+                    ]
+                    for model in models
+                ],
+                dtype=np.float64,
+            )
+
+            image = ax.imshow(
+                matrix,
+                aspect="auto",
+                **scale,
+            )
+
+            ax.set_yticks(
+                range(len(models)),
+                models,
+                fontsize=7,
+            )
+
+            ax.set_xticks(
+                range(self.L),
+                [f"L{i:02d}" for i in range(self.L)],
+                rotation=90,
+                fontsize=6,
+            )
+
+            ax.set_title(
+                group,
+                fontsize=9,
+            )
+
+        for ax in axes.flat[len(self.REPORT_GROUPS) :]:
+            ax.axis("off")
+
+        fig.colorbar(
+            image,
+            ax=axes.ravel().tolist(),
+            fraction=0.012,
+            pad=0.01,
+        )
+
+        fig.suptitle(
+            f"{title}: {component}\n" f"{metric.replace('_', ' ')}",
+            fontsize=15,
+        )
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    def _save_magnitude_reports(
+        self,
+        rows,
+    ):
+        if not self.create_plots:
+            return
+
+        configs = sorted(
+            {
+                (
+                    row["representation"],
+                    row["signature"],
+                )
+                for row in rows
+            }
+        )
+
+        depth_components = tuple(
+            dict.fromkeys(
+                component
+                for _, components in self.MAGNITUDE_DEPTH_FAMILIES
+                for component in components
+            )
+        )
+
+        for (
+            representation,
+            signature,
+        ) in tqdm(
+            configs,
+            desc="Saving magnitude reports",
+            disable=not self.verbose,
+        ):
+            config_rows = [
+                row
+                for row in rows
+                if (
+                    row["representation"] == representation
+                    and row["signature"] == signature
+                )
+            ]
+
+            overview_metrics = [
+                "mean_absolute_value",
+                "effective_support_fraction",
+            ]
+
+            if representation == "delta":
+                overview_metrics.append("relative_l1_change")
+
+            for model in self.model_names:
+                model_rows = [row for row in config_rows if row["model_name"] == model]
+
+                if not model_rows:
+                    continue
+
+                path = (
+                    self.save_dir
+                    / "magnitude_analysis"
+                    / "reports"
+                    / "by_model"
+                    / representation
+                    / signature
+                    / f"{model}.pdf"
+                )
+
+                path.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                with PdfPages(path) as pdf:
+                    for metric in overview_metrics:
+                        self._plot_magnitude_overview_page(
+                            pdf,
+                            model_rows,
+                            metric,
+                            self.REPORT_GROUPS,
+                            (
+                                f"{model} | "
+                                f"{representation} | "
+                                f"{signature} | "
+                                "report groups"
+                            ),
+                        )
+
+                    for metric in overview_metrics:
+                        self._plot_magnitude_overview_page(
+                            pdf,
+                            model_rows,
+                            metric,
+                            self.DATASET_NAMES,
+                            (
+                                f"{model} | "
+                                f"{representation} | "
+                                f"{signature} | "
+                                "datasets"
+                            ),
+                        )
+
+                    for (
+                        family,
+                        components,
+                    ) in self.MAGNITUDE_DEPTH_FAMILIES:
+
+                        self._plot_magnitude_depth_family_page(
+                            pdf,
+                            model_rows,
+                            family,
+                            components,
+                            "l1_norm",
+                            "Depth allocation",
+                            normalize=True,
+                        )
+
+                        self._plot_magnitude_depth_family_page(
+                            pdf,
+                            model_rows,
+                            family,
+                            components,
+                            "effective_support_fraction",
+                            "Effective support by depth",
+                        )
+
+                        if representation == "delta":
+                            self._plot_magnitude_depth_family_page(
+                                pdf,
+                                model_rows,
+                                family,
+                                components,
+                                "relative_l1_change",
+                                "Relative L1 change by depth",
+                            )
+
+            path = (
+                self.save_dir
+                / "magnitude_analysis"
+                / "reports"
+                / "model_comparison"
+                / representation
+                / f"{signature}.pdf"
+            )
+
+            path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            with PdfPages(path) as pdf:
+                for metric in overview_metrics:
+                    self._plot_magnitude_model_overview_page(
+                        pdf,
+                        config_rows,
+                        metric,
+                        ("Model comparison | " f"{representation} | " f"{signature}"),
+                    )
+
+                depth_metrics = [
+                    "l1_norm",
+                    "effective_support_fraction",
+                ]
+
+                if representation == "delta":
+                    depth_metrics.append("relative_l1_change")
+
+                for component in depth_components:
+                    for metric in depth_metrics:
+                        self._plot_magnitude_model_depth_page(
+                            pdf,
+                            config_rows,
+                            component,
+                            metric,
+                            (
+                                "Model comparison | "
+                                f"{representation} | "
+                                f"{signature}"
+                            ),
+                        )
+
+    def _save_separation_reports(
         self,
         rows,
     ):
@@ -2315,7 +3142,7 @@ class VTABFunctionalSemanticsAnalyzer:
             signature,
         ) in tqdm(
             configs,
-            desc=("Saving interpretability " "reports"),
+            desc="Saving interpretability reports",
             disable=not self.verbose,
         ):
             config_rows = [
@@ -2401,16 +3228,15 @@ class VTABFunctionalSemanticsAnalyzer:
                         ),
                     )
 
-                    for component in self.components:
-                        axes = self.COMPONENTS[component][1]
-
-                        if axes[0] == "layer":
-                            self._plot_model_depth_page(
-                                pdf,
-                                config_rows,
-                                component,
-                                agreement,
-                            )
+                    for component in dict.fromkeys(
+                        spec[0] for spec in self.DEPTH_REPORTS
+                    ):
+                        self._plot_model_depth_page(
+                            pdf,
+                            config_rows,
+                            component,
+                            agreement,
+                        )
 
     def analyze(self):
         self._log("Starting VTAB functional-semantic analysis.")
@@ -2435,7 +3261,8 @@ class VTABFunctionalSemanticsAnalyzer:
         self._save_metadata()
         self._save_magnitude(magnitude)
         self._save_separation(separation)
-        self._save_reports(separation)
+        self._save_magnitude_reports(magnitude)
+        self._save_separation_reports(separation)
 
         self._log("Analysis complete. " f"Results saved to: " f"{self.save_dir}")
 
