@@ -18,12 +18,7 @@ class VTABFunctionalSemanticsAnalyzer:
     L, H, D, K, MLP_DIM = 12, 12, 768, 64, 3072
 
     AXIS_VALUES = {
-        "site": (
-            "attention_read",
-            "attention_write",
-            "mlp_read",
-            "mlp_write",
-        ),
+        "site": ("attention_read", "attention_write", "mlp_read", "mlp_write"),
         "token_group": ("cls", "patch"),
         "query_group": ("cls", "patch"),
         "destination_group": ("cls", "patch"),
@@ -44,18 +39,9 @@ class VTABFunctionalSemanticsAnalyzer:
             (L, 4, 2, D),
             ("layer", "site", "token_group", "residual_channel"),
         ),
-        "final_cls_readout": (
-            (D,),
-            ("residual_channel",),
-        ),
-        "attention_qk_route": (
-            (L, H, 7),
-            ("layer", "head", "route"),
-        ),
-        "attention_ov_route": (
-            (L, H, 7),
-            ("layer", "head", "route"),
-        ),
+        "final_cls_readout": ((D,), ("residual_channel",)),
+        "attention_qk_route": ((L, H, 7), ("layer", "head", "route")),
+        "attention_ov_route": ((L, H, 7), ("layer", "head", "route")),
         "attention_qk_channel": (
             (L, H, 2, K),
             ("layer", "head", "query_group", "head_channel"),
@@ -76,18 +62,12 @@ class VTABFunctionalSemanticsAnalyzer:
             (L, H, 2),
             ("layer", "head", "destination_group"),
         ),
-        "sublayer_update": (
-            (L, 2),
-            ("layer", "sublayer"),
-        ),
+        "sublayer_update": ((L, 2), ("layer", "sublayer")),
         "sublayer_token_update": (
             (L, 2, 2),
             ("layer", "sublayer", "token_group"),
         ),
-        "attention_head_update": (
-            (L, H),
-            ("layer", "head"),
-        ),
+        "attention_head_update": ((L, H), ("layer", "head")),
     }
 
     COMPONENT_FAMILY = {
@@ -105,8 +85,6 @@ class VTABFunctionalSemanticsAnalyzer:
         "final_cls_readout": "final_readout",
     }
 
-    # Fix only semantically meaningful architectural axes.
-    # Latent residual/head/neuron coordinates remain population dimensions.
     VIEW_AXES = {
         "sublayer_update": (
             ("sublayer",),
@@ -218,42 +196,18 @@ class VTABFunctionalSemanticsAnalyzer:
             "negatives": NATURAL + SPECIALIZED,
         },
         "domain_remote_sensing": {
-            "anchors": (
-                "vtab_eurosat",
-                "vtab_resisc45",
-            ),
-            "positives": (
-                "vtab_eurosat",
-                "vtab_resisc45",
-            ),
-            "negatives": (
-                "vtab_patch_camelyon",
-                "vtab_retinopathy",
-            ),
+            "anchors": ("vtab_eurosat", "vtab_resisc45"),
+            "positives": ("vtab_eurosat", "vtab_resisc45"),
+            "negatives": ("vtab_patch_camelyon", "vtab_retinopathy"),
         },
         "domain_medical": {
-            "anchors": (
-                "vtab_patch_camelyon",
-                "vtab_retinopathy",
-            ),
-            "positives": (
-                "vtab_patch_camelyon",
-                "vtab_retinopathy",
-            ),
-            "negatives": (
-                "vtab_eurosat",
-                "vtab_resisc45",
-            ),
+            "anchors": ("vtab_patch_camelyon", "vtab_retinopathy"),
+            "positives": ("vtab_patch_camelyon", "vtab_retinopathy"),
+            "negatives": ("vtab_eurosat", "vtab_resisc45"),
         },
         "source_clevr": {
-            "anchors": (
-                "vtab_clevr_count",
-                "vtab_clevr_distance",
-            ),
-            "positives": (
-                "vtab_clevr_count",
-                "vtab_clevr_distance",
-            ),
+            "anchors": ("vtab_clevr_count", "vtab_clevr_distance"),
+            "positives": ("vtab_clevr_count", "vtab_clevr_distance"),
             "negatives": (
                 "vtab_dmlab",
                 "vtab_dsprites_location",
@@ -433,8 +387,6 @@ class VTABFunctionalSemanticsAnalyzer:
         "vector_dim",
     )
 
-    # Native depth geometry used by within-model reports.
-    # Every cell remains a non-scalar task embedding.
     DEPTH_REPORTS = (
         (
             "sublayer_update",
@@ -520,13 +472,10 @@ class VTABFunctionalSemanticsAnalyzer:
         verbose=True,
     ):
         self.model_names = tuple(model_names)
-
         self.model_groups = {
             name: tuple(models) for name, models in model_groups.items()
         }
-
         self.signature_paths = tuple(tuple(paths) for paths in signature_paths)
-
         self.save_dir = Path(save_dir)
         self.create_plots = bool(create_plots)
         self.verbose = bool(verbose)
@@ -535,15 +484,14 @@ class VTABFunctionalSemanticsAnalyzer:
             raise ValueError("model_names must be unique.")
 
         if self.REFERENCE_MODEL not in self.model_names:
-            raise ValueError(f"model_names must contain " f"'{self.REFERENCE_MODEL}'.")
+            raise ValueError(f"model_names must contain '{self.REFERENCE_MODEL}'.")
 
         if len(self.signature_paths) != len(self.model_names):
-            raise ValueError("signature_paths must contain " "one sequence per model.")
+            raise ValueError("signature_paths must contain one sequence per model.")
 
         if any(len(paths) != len(self.DATASET_NAMES) for paths in self.signature_paths):
             raise ValueError(
-                f"Each model must have "
-                f"{len(self.DATASET_NAMES)} paths "
+                f"Each model must have {len(self.DATASET_NAMES)} paths "
                 "ordered as DATASET_NAMES."
             )
 
@@ -552,41 +500,32 @@ class VTABFunctionalSemanticsAnalyzer:
         for name, models in self.model_groups.items():
             if not models or len(set(models)) != len(models):
                 raise ValueError(
-                    f"Model group '{name}' must be "
-                    "non-empty and contain unique models."
+                    f"Model group '{name}' must be non-empty "
+                    "and contain unique models."
                 )
 
             unknown = set(models) - set(self.model_names)
 
             if unknown:
-                raise ValueError(f"Unknown models in '{name}': " f"{sorted(unknown)}.")
+                raise ValueError(f"Unknown models in '{name}': {sorted(unknown)}.")
 
             average = f"{name}_average"
 
             if average in self.model_names or average in average_names:
-                raise ValueError("Conflicting model-group " f"average name: {average}.")
+                raise ValueError(f"Conflicting model-group average name: {average}.")
 
             average_names.add(average)
 
         self.components = tuple(self.COMPONENTS)
-
         self.dataset_index = {name: i for i, name in enumerate(self.DATASET_NAMES)}
-
         self.views = self._build_views()
 
     def _log(self, message):
         if self.verbose:
-            print(
-                message,
-                flush=True,
-            )
+            print(message, flush=True)
 
     @classmethod
-    def _axis_values(
-        cls,
-        component,
-        axis,
-    ):
+    def _axis_values(cls, component, axis):
         shape, axes = cls.COMPONENTS[component]
 
         if axis == "layer":
@@ -595,21 +534,14 @@ class VTABFunctionalSemanticsAnalyzer:
         return cls.AXIS_VALUES[axis]
 
     @classmethod
-    def _axis_index(
-        cls,
-        axis,
-        value,
-    ):
+    def _axis_index(cls, axis, value):
         if axis == "layer":
             return int(value)
 
         return cls.AXIS_VALUES[axis].index(value)
 
     @staticmethod
-    def _view_description(
-        selectors,
-        vector_axes,
-    ):
+    def _view_description(selectors, vector_axes):
         if not selectors:
             return "Full component signature."
 
@@ -622,7 +554,6 @@ class VTABFunctionalSemanticsAnalyzer:
 
         for component in self.components:
             shape, axes = self.COMPONENTS[component]
-
             family = self.COMPONENT_FAMILY[component]
 
             views.append(
@@ -638,16 +569,9 @@ class VTABFunctionalSemanticsAnalyzer:
                 }
             )
 
-            for fixed_axes in self.VIEW_AXES.get(
-                component,
-                (),
-            ):
+            for fixed_axes in self.VIEW_AXES.get(component, ()):
                 value_lists = (
-                    self._axis_values(
-                        component,
-                        axis,
-                    )
-                    for axis in fixed_axes
+                    self._axis_values(component, axis) for axis in fixed_axes
                 )
 
                 for values in product(*value_lists):
@@ -664,8 +588,6 @@ class VTABFunctionalSemanticsAnalyzer:
                         size for size, axis in zip(shape, axes) if axis not in selectors
                     )
 
-                    # Scalar cells are not valid
-                    # task embeddings.
                     if vector_dim < 2:
                         continue
 
@@ -680,7 +602,7 @@ class VTABFunctionalSemanticsAnalyzer:
                             "family": family,
                             "component": component,
                             "view": view,
-                            "view_id": (f"{component}/" f"{view}/{suffix}"),
+                            "view_id": (f"{component}/" f"{view}/" f"{suffix}"),
                             "selectors": selectors,
                             "vector_axes": vector_axes,
                             "vector_dim": vector_dim,
@@ -708,6 +630,7 @@ class VTABFunctionalSemanticsAnalyzer:
             desc="Loading signatures",
             disable=not self.verbose,
         ) as pbar:
+
             for model_idx, model in enumerate(self.model_names):
                 loaded = {
                     signature: {component: [] for component in self.components}
@@ -723,7 +646,7 @@ class VTABFunctionalSemanticsAnalyzer:
                                 key = f"{signature}__" f"{component}"
 
                                 if key not in data:
-                                    raise KeyError(f"Missing '{key}' " f"in {path}.")
+                                    raise KeyError(f"Missing '{key}' in {path}.")
 
                                 x = np.asarray(
                                     data[key],
@@ -757,10 +680,7 @@ class VTABFunctionalSemanticsAnalyzer:
 
         return signatures
 
-    def _make_delta_signatures(
-        self,
-        raw,
-    ):
+    def _make_delta_signatures(self, raw):
         return {
             signature: {
                 model: {
@@ -776,11 +696,7 @@ class VTABFunctionalSemanticsAnalyzer:
             for signature in self.SIGNATURES
         }
 
-    def _has_prompts(
-        self,
-        raw,
-        model,
-    ):
+    def _has_prompts(self, raw, model):
         return any(
             np.any(raw["P"][model][component]) for component in self.PROMPT_COMPONENTS
         )
@@ -813,13 +729,7 @@ class VTABFunctionalSemanticsAnalyzer:
             support,
         )
 
-    def _compute_magnitude(
-        self,
-        representations,
-        raw,
-    ):
-        # Do not mix downstream VTAB
-        # magnitude with the ImageNet reference.
+    def _compute_magnitude(self, representations, raw):
         scopes = {
             "vtab_mean": np.arange(len(self.DATASET_NAMES) - 1),
             "imagenet_val": np.asarray([len(self.DATASET_NAMES) - 1]),
@@ -827,33 +737,17 @@ class VTABFunctionalSemanticsAnalyzer:
 
         rows = []
 
-        for (
-            representation,
-            signature_types,
-        ) in representations.items():
-
-            for (
-                signature,
-                models,
-            ) in signature_types.items():
-
+        for representation, signature_types in representations.items():
+            for signature, models in signature_types.items():
                 reference = raw[signature][self.REFERENCE_MODEL]
 
-                for (
-                    model,
-                    components,
-                ) in models.items():
-
+                for model, components in models.items():
                     has_prompts = self._has_prompts(
                         raw,
                         model,
                     )
 
-                    for (
-                        component,
-                        values,
-                    ) in components.items():
-
+                    for component, values in components.items():
                         if component in self.PROMPT_COMPONENTS and not has_prompts:
                             continue
 
@@ -886,19 +780,11 @@ class VTABFunctionalSemanticsAnalyzer:
                                 for layer in range(shape[0])
                             ]
 
-                        for (
-                            view,
-                            layer,
-                            vectors,
-                        ) in variants:
-
+                        for view, layer, vectors in variants:
                             ref = reference[component]
 
                             if view == "layer":
-                                ref = ref[
-                                    :,
-                                    layer,
-                                ]
+                                ref = ref[:, layer]
 
                             ref_l1 = (
                                 np.abs(ref)
@@ -911,11 +797,7 @@ class VTABFunctionalSemanticsAnalyzer:
 
                             delta_l1 = np.abs(vectors).sum(axis=1)
 
-                            for (
-                                scope,
-                                indices,
-                            ) in scopes.items():
-
+                            for scope, indices in scopes.items():
                                 stats = np.asarray(
                                     [
                                         self._magnitude_stats(vectors[i])
@@ -984,9 +866,7 @@ class VTABFunctionalSemanticsAnalyzer:
         view,
     ):
         component = view["component"]
-
         x = signatures[model][component]
-
         axes = self.COMPONENTS[component][1]
 
         index = [slice(None)] + [
@@ -1008,27 +888,20 @@ class VTABFunctionalSemanticsAnalyzer:
 
         if vectors.shape[1] != view["vector_dim"]:
             raise RuntimeError(
-                f"View "
-                f"'{view['view_id']}' "
+                f"View '{view['view_id']}' "
                 f"has dimension "
-                f"{vectors.shape[1]}, "
-                f"expected "
+                f"{vectors.shape[1]}, expected "
                 f"{view['vector_dim']}."
             )
 
         return vectors
 
     @staticmethod
-    def _hellinger_matrix(
-        vectors,
-    ):
+    def _hellinger_matrix(vectors):
         if np.any(vectors < 0):
-            raise ValueError(
-                "Hellinger distance " "requires nonnegative " "signatures."
-            )
+            raise ValueError("Hellinger distance requires " "nonnegative signatures.")
 
         sums = vectors.sum(axis=1)
-
         valid = sums > 0
 
         roots = np.zeros_like(vectors)
@@ -1054,8 +927,6 @@ class VTABFunctionalSemanticsAnalyzer:
             )
         )
 
-        # Preserve the original
-        # zero-vector convention.
         matrix[
             ~valid,
             :,
@@ -1081,9 +952,7 @@ class VTABFunctionalSemanticsAnalyzer:
         return matrix
 
     @staticmethod
-    def _angular_matrix(
-        vectors,
-    ):
+    def _angular_matrix(vectors):
         norms = np.linalg.norm(
             vectors,
             axis=1,
@@ -1134,14 +1003,11 @@ class VTABFunctionalSemanticsAnalyzer:
         return matrix
 
     @staticmethod
-    def _pairwise_normalized_cosine_matrix(
-        vectors,
-    ):
+    def _pairwise_normalized_cosine_matrix(vectors):
         if np.any(vectors < 0):
             raise ValueError(
-                "Task2Vec pairwise-normalized "
-                "cosine requires nonnegative "
-                "signatures."
+                "Task2Vec pairwise-normalized cosine "
+                "requires nonnegative signatures."
             )
 
         n = len(vectors)
@@ -1228,7 +1094,7 @@ class VTABFunctionalSemanticsAnalyzer:
             peers = [x for x in positives if x != anchor]
 
             if not peers or not negatives:
-                raise ValueError(f"Group '{group}' " "has no valid comparisons.")
+                raise ValueError(f"Group '{group}' has no " "valid comparisons.")
 
             positive = matrix[
                 anchor,
@@ -1282,11 +1148,7 @@ class VTABFunctionalSemanticsAnalyzer:
             for group in self.GROUPS
         }
 
-        for (
-            name,
-            groups,
-        ) in self.METAGROUPS.items():
-
+        for name, groups in self.METAGROUPS.items():
             scores[name] = tuple(
                 float(np.mean([scores[group][i] for group in groups])) for i in range(2)
             )
@@ -1363,14 +1225,8 @@ class VTABFunctionalSemanticsAnalyzer:
                 )
                 for model in representations[representation][signature]
             )
-            for (
-                representation,
-                signature_metrics,
-            ) in policy.items()
-            for (
-                signature,
-                metrics,
-            ) in signature_metrics.items()
+            for representation, signature_metrics in policy.items()
+            for signature, metrics in signature_metrics.items()
         )
 
         rows = []
@@ -1381,28 +1237,18 @@ class VTABFunctionalSemanticsAnalyzer:
             disable=not self.verbose,
         ) as pbar:
 
-            for (
-                representation,
-                signature_metrics,
-            ) in policy.items():
-
-                for (
-                    signature,
-                    metrics,
-                ) in signature_metrics.items():
-
+            for representation, signature_metrics in policy.items():
+                for signature, metrics in signature_metrics.items():
                     signatures = representations[representation][signature]
 
                     for metric in metrics:
                         for model in signatures:
-
                             has_prompts = self._has_prompts(
                                 raw,
                                 model,
                             )
 
                             for view in self.views:
-
                                 if (
                                     view["component"] in self.PROMPT_COMPONENTS
                                     and not has_prompts
@@ -1415,8 +1261,6 @@ class VTABFunctionalSemanticsAnalyzer:
                                     view,
                                 )
 
-                                # Matrix is transient:
-                                # compute -> score -> discard.
                                 matrix = self._distance_matrix(
                                     metric,
                                     vectors,
@@ -1476,17 +1320,8 @@ class VTABFunctionalSemanticsAnalyzer:
 
         averages = []
 
-        for (
-            representation,
-            signature,
-            metric,
-        ) in configs:
-
-            for (
-                group_name,
-                models,
-            ) in self.model_groups.items():
-
+        for representation, signature, metric in configs:
+            for group_name, models in self.model_groups.items():
                 view_sets = [
                     {
                         row["view_id"]
@@ -1503,9 +1338,6 @@ class VTABFunctionalSemanticsAnalyzer:
 
                 common = set.intersection(*view_sets) if view_sets else set()
 
-                # A group average exists only
-                # for views present in every
-                # member model.
                 for view_id in sorted(common):
                     members = [
                         row_map[
@@ -1544,15 +1376,33 @@ class VTABFunctionalSemanticsAnalyzer:
             exist_ok=True,
         )
 
+        # Remove only columns unused by every row of this specific CSV.
+        if rows:
+            columns = tuple(
+                column
+                for column in columns
+                if any(
+                    row.get(
+                        column,
+                        "",
+                    )
+                    not in (
+                        "",
+                        None,
+                    )
+                    for row in rows
+                )
+            )
+
         with open(
             path,
             "w",
             newline="",
         ) as file:
-
             writer = csv.DictWriter(
                 file,
                 fieldnames=columns,
+                extrasaction="ignore",
             )
 
             writer.writeheader()
@@ -1674,8 +1524,6 @@ class VTABFunctionalSemanticsAnalyzer:
             ),
         )
 
-        # Makes the prompt-delta
-        # interpretation explicit.
         representation_rows = [
             {
                 "representation": "raw",
@@ -1714,27 +1562,152 @@ class VTABFunctionalSemanticsAnalyzer:
             ),
         )
 
+        self._write_csv(
+            root / "output_schema.csv",
+            [
+                {
+                    "analysis": "separation",
+                    "path": ("separation_analysis/" "results.csv"),
+                    "contents": ("All semantic views " "and configurations."),
+                },
+                {
+                    "analysis": "separation",
+                    "path": (
+                        "separation_analysis/"
+                        "overview/{representation}/"
+                        "{distance_metric}/"
+                        "{signature}.csv"
+                    ),
+                    "contents": ("Full-component views " "only."),
+                },
+                {
+                    "analysis": "separation",
+                    "path": ("separation_analysis/" "{family}/results.csv"),
+                    "contents": ("All semantic views " "for one component family."),
+                },
+                {
+                    "analysis": "separation",
+                    "path": (
+                        "separation_analysis/"
+                        "{family}/overview/"
+                        "{representation}/"
+                        "{distance_metric}/"
+                        "{signature}.csv"
+                    ),
+                    "contents": ("Full-component views " "for one component family."),
+                },
+                {
+                    "analysis": "magnitude",
+                    "path": ("magnitude_analysis/" "results.csv"),
+                    "contents": ("All full/layer " "magnitude rows."),
+                },
+                {
+                    "analysis": "magnitude",
+                    "path": (
+                        "magnitude_analysis/"
+                        "overview/{representation}/"
+                        "{signature}.csv"
+                    ),
+                    "contents": ("Full-component " "magnitude rows only."),
+                },
+                {
+                    "analysis": "all_csv",
+                    "path": "*",
+                    "contents": (
+                        "Columns empty for every " "row in a CSV are omitted."
+                    ),
+                },
+            ],
+            (
+                "analysis",
+                "path",
+                "contents",
+            ),
+        )
+
     def _save_magnitude(
         self,
         rows,
     ):
-        self._write_csv(
-            self.save_dir / "magnitude_analysis" / "magnitude.csv",
-            rows,
-            (
-                "representation",
-                "signature",
-                "model_name",
-                "component",
-                "view",
-                "layer",
-                "dataset_scope",
-                "l1_norm",
-                "mean_absolute_value",
-                "effective_support_fraction",
-                "relative_l1_change",
-            ),
+        columns = (
+            "representation",
+            "signature",
+            "model_name",
+            "component",
+            "view",
+            "layer",
+            "dataset_scope",
+            "l1_norm",
+            "mean_absolute_value",
+            "effective_support_fraction",
+            "relative_l1_change",
         )
+
+        root = self.save_dir / "magnitude_analysis"
+
+        self._write_csv(
+            root / "results.csv",
+            rows,
+            columns,
+        )
+
+        full = [row for row in rows if row["view"] == "full"]
+
+        for representation in (
+            "raw",
+            "delta",
+        ):
+            for signature in self.SIGNATURES:
+                self._write_csv(
+                    root / "overview" / representation / f"{signature}.csv",
+                    [
+                        row
+                        for row in full
+                        if (
+                            row["representation"] == representation
+                            and row["signature"] == signature
+                        )
+                    ],
+                    columns,
+                )
+
+    def _save_separation_overviews(
+        self,
+        rows,
+        root,
+        columns,
+    ):
+        full = [row for row in rows if row["view"] == "full"]
+
+        for representation, policy in (
+            (
+                "raw",
+                self.RAW_METRICS,
+            ),
+            (
+                "delta",
+                self.DELTA_METRICS,
+            ),
+        ):
+            for signature, metrics in policy.items():
+                for metric in metrics:
+                    self._write_csv(
+                        root
+                        / "overview"
+                        / representation
+                        / metric
+                        / f"{signature}.csv",
+                        [
+                            row
+                            for row in full
+                            if (
+                                row["representation"] == representation
+                                and row["signature"] == signature
+                                and row["distance_metric"] == metric
+                            )
+                        ],
+                        columns,
+                    )
 
     def _save_separation(
         self,
@@ -1747,25 +1720,32 @@ class VTABFunctionalSemanticsAnalyzer:
 
         root = self.save_dir / "separation_analysis"
 
-        # Single source of truth.
         self._write_csv(
             root / "results.csv",
             rows,
             columns,
         )
 
-        # Whole-component overview.
-        self._write_csv(
-            root / "overview.csv",
-            [row for row in rows if row["view"] == "full"],
+        self._save_separation_overviews(
+            rows,
+            root,
             columns,
         )
 
-        # Readable family subsets.
         for family in dict.fromkeys(self.COMPONENT_FAMILY.values()):
+            family_rows = [row for row in rows if row["family"] == family]
+
+            family_root = root / family
+
             self._write_csv(
-                root / family / "results.csv",
-                [row for row in rows if row["family"] == family],
+                family_root / "results.csv",
+                family_rows,
+                columns,
+            )
+
+            self._save_separation_overviews(
+                family_rows,
+                family_root,
                 columns,
             )
 
@@ -2018,13 +1998,13 @@ class VTABFunctionalSemanticsAnalyzer:
                 ax.axis("off")
                 continue
 
-            # One column means the valid
-            # per-layer task embedding has
-            # no additional semantic axis.
             if matrix.shape[1] == 1:
                 ax.plot(
                     range(self.L),
-                    matrix[:, 0],
+                    matrix[
+                        :,
+                        0,
+                    ],
                     marker="o",
                     markersize=2,
                 )
@@ -2216,8 +2196,6 @@ class VTABFunctionalSemanticsAnalyzer:
         if not selected:
             return
 
-        # Include promptless models as NaN/N/A
-        # rows rather than silently dropping them.
         models = [
             model
             for model in self.model_names
@@ -2318,8 +2296,6 @@ class VTABFunctionalSemanticsAnalyzer:
         if not self.create_plots:
             return
 
-        # Plot only actual models.
-        # Group averages remain in CSV.
         real_rows = [row for row in rows if row["model_name"] in self.model_names]
 
         configs = sorted(
@@ -2342,7 +2318,6 @@ class VTABFunctionalSemanticsAnalyzer:
             desc=("Saving interpretability " "reports"),
             disable=not self.verbose,
         ):
-
             config_rows = [
                 row
                 for row in real_rows
@@ -2352,11 +2327,6 @@ class VTABFunctionalSemanticsAnalyzer:
                     and row["signature"] == signature
                 )
             ]
-
-            # ----------------------------------------------------------
-            # Per-model reports:
-            # preserve native layer x semantic-axis geometry.
-            # ----------------------------------------------------------
 
             for model in self.model_names:
                 model_rows = [row for row in config_rows if row["model_name"] == model]
@@ -2402,11 +2372,6 @@ class VTABFunctionalSemanticsAnalyzer:
                                 agreement,
                             )
 
-            # ----------------------------------------------------------
-            # Cross-model reports:
-            # model x component and model x layer views.
-            # ----------------------------------------------------------
-
             path = (
                 self.save_dir
                 / "separation_analysis"
@@ -2448,7 +2413,7 @@ class VTABFunctionalSemanticsAnalyzer:
                             )
 
     def analyze(self):
-        self._log("Starting VTAB " "functional-semantic analysis.")
+        self._log("Starting VTAB functional-semantic analysis.")
 
         raw = self._load_signatures()
 
@@ -2468,11 +2433,8 @@ class VTABFunctionalSemanticsAnalyzer:
         )
 
         self._save_metadata()
-
         self._save_magnitude(magnitude)
-
         self._save_separation(separation)
-
         self._save_reports(separation)
 
         self._log("Analysis complete. " f"Results saved to: " f"{self.save_dir}")
