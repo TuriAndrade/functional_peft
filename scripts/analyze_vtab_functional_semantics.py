@@ -17,7 +17,6 @@ def _build_parser():
     parser.add_argument("--save-dir", type=str, default=None)
     parser.add_argument("--save-name", type=str, default=None)
 
-    parser.add_argument("--create-plots", action="store_true")
     parser.add_argument("--verbose", action="store_true")
 
     return parser
@@ -37,7 +36,6 @@ def main():
         model_groups=args.model_groups,
         signature_paths=args.signature_paths,
         save_dir=save_dir,
-        create_plots=args.create_plots,
         verbose=args.verbose,
     )
 

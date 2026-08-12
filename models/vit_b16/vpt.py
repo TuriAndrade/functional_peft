@@ -329,7 +329,7 @@ class ViTB16VPT(nn.Module):
         # [layer, prompt token]
         #
         # Scales each complete prompt state before its Q/K/V projections.
-        # These scores define the prompt space used by C and R.
+        # These scores define prompt-component coupling used by C and G.
         self.coupling_gates = gate((n_layers, n_prompts))
 
         # Coarse components are derived exactly from fine per-sample scores.
@@ -983,12 +983,23 @@ class ViTB16VPT(nn.Module):
         """
         Estimate:
 
-        P: functional participation
-        F: diagonal model Fisher
-        S: F / P
-        C: prompt-component Fisher-score correlation
-        R_layer: prompt-subspace alignment per layer
-        R_global: alignment with the complete prompt subspace
+        P: shared functional participation
+
+        Model distribution y ~ p(y | x):
+        F_m: diagonal model Fisher
+        S_m: F_m / P
+        C_m: prompt-component score correlation
+        G_layer_m: RMS C_m across prompts at each prompt layer
+        G_global_m: RMS C_m across all prompt layers and prompts
+
+        Empirical distribution y = y*:
+        U_e: mean functional score
+        F_e: empirical squared-score second moment
+        S_e: F_e / P
+        B_e: U_e^2 / F_e
+        C_e: centered prompt-component score correlation
+        G_layer_e: RMS C_e across prompts at each prompt layer
+        G_global_e: RMS C_e across all prompt layers and prompts
         """
         if mc_samples < 1:
             raise ValueError("mc_samples must be positive")
@@ -1010,26 +1021,57 @@ class ViTB16VPT(nn.Module):
         device = gates[0].device
 
         participation_sum = gates[0].new_zeros(total_size)
-        fisher_sum = gates[0].new_zeros(total_size)
+
+        fisher_sum_m = gates[0].new_zeros(total_size)
+        score_sum_e = gates[0].new_zeros(total_size)
+        fisher_sum_e = gates[0].new_zeros(total_size)
 
         if use_prompts:
             coupling_size = n_layers * n_prompts
 
-            cross_sum = gates[0].new_zeros(
-                total_size,
-                coupling_size,
-            )
+            cross_sum_m = gates[0].new_zeros(total_size, coupling_size)
+            coupling_square_sum_m = gates[0].new_zeros(coupling_size)
 
-            coupling_gram_sum = gates[0].new_zeros(
-                coupling_size,
-                coupling_size,
-            )
+            cross_sum_e = gates[0].new_zeros(total_size, coupling_size)
+            coupling_score_sum_e = gates[0].new_zeros(coupling_size)
+            coupling_square_sum_e = gates[0].new_zeros(coupling_size)
 
         params = (*gates, self.coupling_gates) if use_prompts else gates
 
+        def build_scores(raw_scores):
+            scores = dict(zip(gate_names, raw_scores[: len(gates)]))
+
+            stream_scores = scores["residual_stream_channel"]
+
+            scores["sublayer_token_update"] = torch.stack(
+                (
+                    stream_scores[:, :, 1].sum(dim=-1),
+                    stream_scores[:, :, 3].sum(dim=-1),
+                ),
+                dim=2,
+            )
+
+            scores["sublayer_update"] = scores["sublayer_token_update"].sum(dim=-1)
+
+            scores["attention_head_update"] = scores["attention_ov_route"].sum(
+                dim=-1
+            ) + scores["prompt_to_backbone_ov_route"].sum(dim=-1)
+
+            functional_scores = torch.cat(
+                [scores[name].flatten(start_dim=1) for name in names],
+                dim=1,
+            )
+
+            coupling_scores = (
+                raw_scores[-1].flatten(start_dim=1) if use_prompts else None
+            )
+
+            return functional_scores, coupling_scores
+
         bases = {}
         input_count = 0
-        sample_count = 0
+        sample_count_m = 0
+        sample_count_e = 0
 
         iterator = tqdm(loader, desc="Functional signatures") if verbose else loader
 
@@ -1038,12 +1080,16 @@ class ViTB16VPT(nn.Module):
                 device,
                 non_blocking=True,
             )
+            y = batch[1].to(
+                device=device,
+                dtype=torch.long,
+                non_blocking=True,
+            )
 
             with torch.no_grad():
                 for value in self.functional_participation.values():
                     value.zero_()
 
-            # Model Fisher: sample labels from p(y | x).
             log_probs = self(x).log_softmax(dim=-1)
 
             participation_sum.add_(
@@ -1052,26 +1098,30 @@ class ViTB16VPT(nn.Module):
                 )
             )
 
-            input_count += x.shape[0]
+            batch_size = x.shape[0]
+            input_count += batch_size
 
-            labels = torch.multinomial(
+            # Model Fisher scores: y ~ p(y | x).
+            labels_m = torch.multinomial(
                 log_probs.detach().exp(),
                 mc_samples,
                 replacement=True,
             )
 
-            selected = log_probs.gather(
-                1,
-                labels,
-            ).flatten()
+            selected_m = log_probs.gather(1, labels_m).flatten()
 
-            n_samples = selected.numel()
+            # Empirical scores: y = ground-truth label.
+            selected_e = log_probs.gather(1, y.reshape(-1, 1)).flatten()
 
-            basis = bases.get(n_samples)
+            n_m = selected_m.numel()
+            n_e = selected_e.numel()
+            selected = torch.cat((selected_m, selected_e))
+
+            basis = bases.get(selected.numel())
 
             if basis is None:
-                basis = bases[n_samples] = torch.eye(
-                    n_samples,
+                basis = bases[selected.numel()] = torch.eye(
+                    selected.numel(),
                     device=device,
                     dtype=selected.dtype,
                 )
@@ -1083,55 +1133,39 @@ class ViTB16VPT(nn.Module):
                 is_grads_batched=True,
             )
 
-            scores = dict(
-                zip(
-                    gate_names,
-                    raw_scores[: len(gates)],
-                )
-            )
+            functional_scores, coupling_scores = build_scores(raw_scores)
 
-            # Exact coarse sublayer scores.
-            stream_scores = scores["residual_stream_channel"]
+            functional_m = functional_scores[:n_m]
+            functional_e = functional_scores[n_m:]
 
-            # [sample, layer, sublayer, token group]
-            scores["sublayer_token_update"] = torch.stack(
-                (
-                    stream_scores[:, :, 1].sum(dim=-1),
-                    stream_scores[:, :, 3].sum(dim=-1),
-                ),
-                dim=2,
-            )
+            fisher_sum_m.add_(functional_m.square().sum(dim=0))
 
-            # [sample, layer, sublayer]
-            scores["sublayer_update"] = scores["sublayer_token_update"].sum(dim=-1)
-
-            # Exact coarse head-output scores.
-            scores["attention_head_update"] = scores["attention_ov_route"].sum(
-                dim=-1
-            ) + scores["prompt_to_backbone_ov_route"].sum(dim=-1)
-
-            functional_scores = torch.cat(
-                [scores[name].flatten(start_dim=1) for name in names],
-                dim=1,
-            )
-
-            fisher_sum.add_(functional_scores.square().sum(dim=0))
+            score_sum_e.add_(functional_e.sum(dim=0))
+            fisher_sum_e.add_(functional_e.square().sum(dim=0))
 
             if use_prompts:
-                coupling_scores = raw_scores[-1].flatten(start_dim=1)
+                coupling_m = coupling_scores[:n_m]
+                coupling_e = coupling_scores[n_m:]
 
-                cross_sum.add_(functional_scores.T @ coupling_scores)
+                cross_sum_m.addmm_(functional_m.T, coupling_m)
+                coupling_square_sum_m.add_(coupling_m.square().sum(dim=0))
 
-                coupling_gram_sum.add_(coupling_scores.T @ coupling_scores)
+                cross_sum_e.addmm_(functional_e.T, coupling_e)
+                coupling_score_sum_e.add_(coupling_e.sum(dim=0))
+                coupling_square_sum_e.add_(coupling_e.square().sum(dim=0))
 
-            sample_count += n_samples
+            sample_count_m += n_m
+            sample_count_e += n_e
 
-        if sample_count == 0:
+        if input_count == 0:
             self._set_gate_grads(False)
             raise ValueError("loader is empty")
 
-        participation = participation_sum / input_count
-        fisher = fisher_sum / sample_count
+        participation = participation_sum.div_(input_count)
+        fisher_m = fisher_sum_m.div_(sample_count_m)
+        mean_e = score_sum_e.div_(sample_count_e)
+        fisher_e = fisher_sum_e.div_(sample_count_e)
+        variance_e = (fisher_e - mean_e.square()).clamp_min_(0)
 
         def unpack(value, tail=()):
             return {
@@ -1146,107 +1180,130 @@ class ViTB16VPT(nn.Module):
                 )
             }
 
+        def make_S(F_signature):
+            signature = {}
+
+            for name in names:
+                p = P_signature[name]
+                f = F_signature[name]
+                threshold = eps * p.amax().clamp_min(1.0)
+
+                signature[name] = torch.where(
+                    p > threshold,
+                    f / p.clamp_min(threshold),
+                    torch.zeros_like(f),
+                )
+
+            return signature
+
         P_signature = unpack(participation)
-        F_signature = unpack(fisher)
+        F_m_signature = unpack(fisher_m)
+        S_m_signature = make_S(F_m_signature)
 
-        S_signature = {}
+        U_e_signature = unpack(mean_e)
+        F_e_signature = unpack(fisher_e)
+        S_e_signature = make_S(F_e_signature)
 
-        for name in names:
-            p = P_signature[name]
-            f = F_signature[name]
-
-            threshold = eps * p.amax().clamp_min(1.0)
-
-            S_signature[name] = torch.where(
-                p > threshold,
-                f / p.clamp_min(threshold),
-                torch.zeros_like(f),
-            )
+        bias_e = mean_e.square()
+        bias_e.div_(fisher_e).nan_to_num_(
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_(0, 1)
+        B_e_signature = unpack(bias_e)
 
         if use_prompts:
-            cross = cross_sum / sample_count
-            coupling_gram = coupling_gram_sum / sample_count
-            coupling_fisher = coupling_gram.diagonal()
+            coupling_second_m = coupling_square_sum_m.div_(sample_count_m)
 
-            C_signature = unpack(
-                cross / (fisher[:, None] * coupling_fisher[None]).sqrt().clamp_min(eps),
-                (n_layers, n_prompts),
+            C_m = cross_sum_m.div_(sample_count_m)
+            C_m.div_(fisher_m.sqrt()[:, None])
+            C_m.div_(coupling_second_m.sqrt()[None])
+            C_m.nan_to_num_(
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_(-1, 1)
+
+            coupling_mean_e = coupling_score_sum_e.div_(sample_count_e)
+            coupling_second_e = coupling_square_sum_e.div_(sample_count_e)
+            coupling_variance_e = (
+                coupling_second_e - coupling_mean_e.square()
+            ).clamp_min_(0)
+
+            C_e = cross_sum_e.div_(sample_count_e)
+            C_e.addmm_(
+                mean_e[:, None],
+                coupling_mean_e[None],
+                alpha=-1.0,
+            )
+            C_e.div_(variance_e.sqrt()[:, None])
+            C_e.div_(coupling_variance_e.sqrt()[None])
+            C_e.nan_to_num_(
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_(-1, 1)
+
+            C_m_view = C_m.reshape(total_size, n_layers, n_prompts)
+            C_e_view = C_e.reshape(total_size, n_layers, n_prompts)
+
+            G_layer_m = torch.linalg.vector_norm(C_m_view, dim=-1).div_(
+                math.sqrt(n_prompts)
+            )
+            G_layer_e = torch.linalg.vector_norm(C_e_view, dim=-1).div_(
+                math.sqrt(n_prompts)
             )
 
-            cross_layer = cross.reshape(
-                total_size,
-                n_layers,
-                n_prompts,
+            G_global_m = torch.linalg.vector_norm(G_layer_m, dim=-1).div_(
+                math.sqrt(n_layers)
+            )
+            G_global_e = torch.linalg.vector_norm(G_layer_e, dim=-1).div_(
+                math.sqrt(n_layers)
             )
 
-            layer_gram = (
-                coupling_gram.reshape(
-                    n_layers,
-                    n_prompts,
-                    n_layers,
-                    n_prompts,
-                )
-                .diagonal(
-                    dim1=0,
-                    dim2=2,
-                )
-                .permute(2, 0, 1)
-            )
-
-            layer_pinv = torch.linalg.pinv(
-                layer_gram,
-                hermitian=True,
-            )
-
-            global_pinv = torch.linalg.pinv(
-                coupling_gram,
-                hermitian=True,
-            )
-
-            R_layer_squared = torch.einsum(
-                "glp,lpq,glq->gl",
-                cross_layer,
-                layer_pinv,
-                cross_layer,
-            ) / fisher[:, None].clamp_min(eps)
-
-            R_global_squared = (cross @ global_pinv * cross).sum(
-                dim=-1
-            ) / fisher.clamp_min(eps)
-
-            R_layer_signature = unpack(
-                R_layer_squared.clamp(0, 1).sqrt(),
-                (n_layers,),
-            )
-
-            R_global_signature = unpack(R_global_squared.clamp(0, 1).sqrt())
+            C_m_signature = unpack(C_m, (n_layers, n_prompts))
+            C_e_signature = unpack(C_e, (n_layers, n_prompts))
+            G_layer_m_signature = unpack(G_layer_m, (n_layers,))
+            G_layer_e_signature = unpack(G_layer_e, (n_layers,))
+            G_global_m_signature = unpack(G_global_m)
+            G_global_e_signature = unpack(G_global_e)
 
         else:
-            C_signature = unpack(
-                fisher.new_zeros(
-                    total_size,
-                    0,
-                ),
+            C_m_signature = unpack(
+                fisher_m.new_zeros(total_size, n_layers, 0),
+                (n_layers, 0),
+            )
+            C_e_signature = unpack(
+                fisher_e.new_zeros(total_size, n_layers, 0),
                 (n_layers, 0),
             )
 
-            R_layer_signature = unpack(
-                fisher.new_zeros(
-                    total_size,
-                    n_layers,
-                ),
+            G_layer_m_signature = unpack(
+                fisher_m.new_zeros(total_size, n_layers),
+                (n_layers,),
+            )
+            G_layer_e_signature = unpack(
+                fisher_e.new_zeros(total_size, n_layers),
                 (n_layers,),
             )
 
-            R_global_signature = unpack(fisher.new_zeros(total_size))
+            G_global_m_signature = unpack(fisher_m.new_zeros(total_size))
+            G_global_e_signature = unpack(fisher_e.new_zeros(total_size))
 
         self._set_gate_grads(False)
 
         return {
-            "F": F_signature,
-            "S": S_signature,
             "P": P_signature,
-            "C": C_signature,
-            "R_layer": R_layer_signature,
-            "R_global": R_global_signature,
+            "F_m": F_m_signature,
+            "S_m": S_m_signature,
+            "C_m": C_m_signature,
+            "G_layer_m": G_layer_m_signature,
+            "G_global_m": G_global_m_signature,
+            "U_e": U_e_signature,
+            "F_e": F_e_signature,
+            "S_e": S_e_signature,
+            "B_e": B_e_signature,
+            "C_e": C_e_signature,
+            "G_layer_e": G_layer_e_signature,
+            "G_global_e": G_global_e_signature,
         }

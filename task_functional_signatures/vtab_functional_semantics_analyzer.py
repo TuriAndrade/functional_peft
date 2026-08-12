@@ -1,13 +1,11 @@
-import csv
+import base64
+import gzip
+import json
 import math
 from itertools import product
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.colors import SymLogNorm
-from scipy.stats import t as student_t
 from tqdm.auto import tqdm
 
 
@@ -87,7 +85,10 @@ class VTABFunctionalSemanticsAnalyzer:
     }
 
     VIEW_AXES = {
-        "sublayer_update": (("sublayer",), ("layer",)),
+        "sublayer_update": (
+            ("sublayer",),
+            ("layer",),
+        ),
         "sublayer_token_update": (
             ("sublayer",),
             ("token_group",),
@@ -358,113 +359,13 @@ class VTABFunctionalSemanticsAnalyzer:
 
     DELTA_METRICS = {signature: ("angular",) for signature in SIGNATURES}
 
-    RESULT_META_COLUMNS = (
-        "representation",
-        "signature",
-        "distance_metric",
-        "model_name",
-        "family",
-        "component",
-        "view",
-        "view_id",
-        "layer",
-        "site",
-        "sublayer",
-        "token_group",
-        "query_group",
-        "destination_group",
-        "route",
-        "vector_axes",
-        "vector_dim",
-    )
-
-    DEPTH_REPORTS = (
-        (
-            "sublayer_update",
-            "layer",
-            (),
-            "Sublayer balance by layer",
-        ),
-        (
-            "sublayer_token_update",
-            "layer",
-            (),
-            "Attention/MLP × CLS/patch organization by layer",
-        ),
-        (
-            "sublayer_token_update",
-            "layer_sublayer",
-            ("sublayer",),
-            "CLS/patch balance by layer and sublayer",
-        ),
-        (
-            "residual_stream_channel",
-            "layer_site_token_group",
-            ("site", "token_group"),
-            "Residual flow by layer, site, and token group",
-        ),
-        (
-            "attention_qk_route",
-            "layer_route",
-            ("route",),
-            "QK routing by layer and route",
-        ),
-        (
-            "attention_ov_route",
-            "layer_route",
-            ("route",),
-            "OV transport by layer and route",
-        ),
-        (
-            "prompt_to_backbone_qk_route",
-            "layer_destination_group",
-            ("destination_group",),
-            "Prompt QK influence by layer and destination",
-        ),
-        (
-            "prompt_to_backbone_ov_route",
-            "layer_destination_group",
-            ("destination_group",),
-            "Prompt OV influence by layer and destination",
-        ),
-    )
-
     MAGNITUDE_METRICS = (
         "l1_norm",
         "mean_absolute_value",
         "effective_support_fraction",
         "relative_l1_change",
     )
-
-    MAGNITUDE_DEPTH_FAMILIES = (
-        (
-            "Backbone computation",
-            ("sublayer_update", "sublayer_token_update"),
-        ),
-        (
-            "Residual flow",
-            ("residual_stream_channel",),
-        ),
-        (
-            "Attention routing",
-            ("attention_qk_route", "attention_ov_route"),
-        ),
-        (
-            "Feature content",
-            (
-                "attention_qk_channel",
-                "attention_ov_channel",
-                "mlp_neuron",
-            ),
-        ),
-        (
-            "Prompt influence",
-            (
-                "prompt_to_backbone_qk_route",
-                "prompt_to_backbone_ov_route",
-            ),
-        ),
-    )
+    AVERAGE_KEY = "__average__"
 
     def __init__(
         self,
@@ -472,10 +373,8 @@ class VTABFunctionalSemanticsAnalyzer:
         model_groups,
         signature_paths,
         save_dir,
-        create_plots=False,
         verbose=True,
-        confidence=0.95,
-        decimal_places=2,
+        decimal_places=3,
     ):
         self.model_names = tuple(model_names)
         self.model_groups = {
@@ -483,13 +382,8 @@ class VTABFunctionalSemanticsAnalyzer:
         }
         self.signature_paths = tuple(tuple(paths) for paths in signature_paths)
         self.save_dir = Path(save_dir)
-        self.create_plots = bool(create_plots)
         self.verbose = bool(verbose)
-        self.confidence = float(confidence)
         self.decimal_places = int(decimal_places)
-
-        if not 0 < self.confidence < 1:
-            raise ValueError("confidence must be in (0, 1).")
 
         if self.decimal_places != decimal_places or self.decimal_places < 0:
             raise ValueError("decimal_places must be a nonnegative integer.")
@@ -510,6 +404,7 @@ class VTABFunctionalSemanticsAnalyzer:
             )
 
         average_names = set()
+        known = set(self.model_names)
 
         for name, models in self.model_groups.items():
             if not models or len(set(models)) != len(models):
@@ -518,14 +413,14 @@ class VTABFunctionalSemanticsAnalyzer:
                     "and contain unique models."
                 )
 
-            unknown = set(models) - set(self.model_names)
+            unknown = set(models) - known
 
             if unknown:
                 raise ValueError(f"Unknown models in '{name}': {sorted(unknown)}.")
 
             average = f"{name}_average"
 
-            if average in self.model_names or average in average_names:
+            if average in known or average in average_names:
                 raise ValueError(f"Conflicting model-group average name: {average}.")
 
             average_names.add(average)
@@ -533,6 +428,12 @@ class VTABFunctionalSemanticsAnalyzer:
         self.components = tuple(self.COMPONENTS)
         self.dataset_index = {name: i for i, name in enumerate(self.DATASET_NAMES)}
         self.views = self._build_views()
+
+        self.separation_slots = tuple(
+            (group, anchor)
+            for group, spec in self.GROUPS.items()
+            for anchor in (*spec["anchors"], self.AVERAGE_KEY)
+        )
 
     def _log(self, message):
         if self.verbose:
@@ -584,17 +485,10 @@ class VTABFunctionalSemanticsAnalyzer:
             )
 
             for fixed_axes in self.VIEW_AXES.get(component, ()):
-                value_lists = (
-                    self._axis_values(component, axis) for axis in fixed_axes
-                )
-
-                for values in product(*value_lists):
-                    selectors = dict(
-                        zip(
-                            fixed_axes,
-                            values,
-                        )
-                    )
+                for values in product(
+                    *(self._axis_values(component, axis) for axis in fixed_axes)
+                ):
+                    selectors = dict(zip(fixed_axes, values))
 
                     vector_axes = tuple(axis for axis in axes if axis not in selectors)
 
@@ -644,7 +538,6 @@ class VTABFunctionalSemanticsAnalyzer:
             desc="Loading signatures",
             disable=not self.verbose,
         ) as pbar:
-
             for model_idx, model in enumerate(self.model_names):
                 loaded = {
                     signature: {component: [] for component in self.components}
@@ -669,17 +562,14 @@ class VTABFunctionalSemanticsAnalyzer:
 
                                 if x.shape != expected:
                                     raise ValueError(
-                                        f"Invalid shape for "
-                                        f"'{key}' in {path}: "
-                                        f"{x.shape}, expected "
-                                        f"{expected}."
+                                        f"Invalid shape for '{key}' "
+                                        f"in {path}: {x.shape}, "
+                                        f"expected {expected}."
                                     )
 
                                 if not np.all(np.isfinite(x)):
                                     raise ValueError(
-                                        f"Non-finite values "
-                                        f"in '{key}' from "
-                                        f"{path}."
+                                        f"Non-finite values in " f"'{key}' from {path}."
                                     )
 
                                 loaded[signature][component].append(x)
@@ -715,193 +605,6 @@ class VTABFunctionalSemanticsAnalyzer:
             np.any(raw["P"][model][component]) for component in self.PROMPT_COMPONENTS
         )
 
-    @staticmethod
-    def _magnitude_stats(x):
-        x = np.abs(
-            np.asarray(
-                x,
-                dtype=np.float64,
-            ).reshape(-1)
-        )
-
-        l1 = float(x.sum())
-
-        if not l1:
-            return (
-                0.0,
-                float(x.mean()),
-                0.0,
-            )
-
-        p = x[x > 0] / l1
-
-        support = float(np.exp(-np.sum(p * np.log(p))) / x.size)
-
-        return (
-            l1,
-            float(x.mean()),
-            support,
-        )
-
-    def _report_group_anchors(self, group):
-        if group in self.GROUPS:
-            return self.GROUPS[group]["anchors"]
-
-        return tuple(
-            dict.fromkeys(
-                dataset
-                for member in self.METAGROUPS[group]
-                for dataset in self.GROUPS[member]["anchors"]
-            )
-        )
-
-    def _compute_magnitude(
-        self,
-        representations,
-        raw,
-    ):
-        views = {view["view_id"]: view for view in self.views}
-
-        scopes = [
-            (
-                group,
-                np.asarray(
-                    [
-                        self.dataset_index[name]
-                        for name in self._report_group_anchors(group)
-                    ]
-                ),
-            )
-            for group in self.REPORT_GROUPS
-        ] + [
-            (
-                name,
-                np.asarray([i]),
-            )
-            for i, name in enumerate(self.DATASET_NAMES)
-        ]
-
-        rows = []
-
-        for representation, signature_types in representations.items():
-            for signature, models in signature_types.items():
-                reference = raw[signature][self.REFERENCE_MODEL]
-
-                for model, components in models.items():
-                    has_prompts = self._has_prompts(
-                        raw,
-                        model,
-                    )
-
-                    for component, values in components.items():
-                        if component in self.PROMPT_COMPONENTS and not has_prompts:
-                            continue
-
-                        shape, axes = self.COMPONENTS[component]
-                        full = views[f"{component}/full"]
-
-                        variants = [
-                            (
-                                full,
-                                values.reshape(
-                                    len(values),
-                                    -1,
-                                ),
-                            )
-                        ]
-
-                        if axes[0] == "layer":
-                            variants += [
-                                (
-                                    views[f"{component}/layer/layer={layer}"],
-                                    values[
-                                        :,
-                                        layer,
-                                    ].reshape(
-                                        len(values),
-                                        -1,
-                                    ),
-                                )
-                                for layer in range(shape[0])
-                            ]
-
-                        for view, vectors in variants:
-                            layer = view["selectors"].get(
-                                "layer",
-                                "",
-                            )
-
-                            ref = reference[component]
-
-                            if layer != "":
-                                ref = ref[:, layer]
-
-                            ref_l1 = (
-                                np.abs(ref)
-                                .reshape(
-                                    len(ref),
-                                    -1,
-                                )
-                                .sum(axis=1)
-                            )
-
-                            value_l1 = np.abs(vectors).sum(axis=1)
-
-                            for data_scope, indices in scopes:
-                                stats = np.asarray(
-                                    [
-                                        self._magnitude_stats(vectors[i])
-                                        for i in indices
-                                    ],
-                                    dtype=np.float64,
-                                )
-
-                                relative = ""
-
-                                if representation == "delta":
-                                    ratio = np.divide(
-                                        value_l1[indices],
-                                        ref_l1[indices],
-                                        out=np.full(
-                                            len(indices),
-                                            np.nan,
-                                            dtype=np.float64,
-                                        ),
-                                        where=(ref_l1[indices] > 0),
-                                    )
-
-                                    finite = ratio[np.isfinite(ratio)]
-
-                                    relative = (
-                                        float(finite.mean()) if finite.size else np.nan
-                                    )
-
-                                rows.append(
-                                    {
-                                        "representation": representation,
-                                        "signature": signature,
-                                        "model_name": model,
-                                        "data_scope": data_scope,
-                                        "family": view["family"],
-                                        "component": component,
-                                        "view": view["view"],
-                                        "view_id": view["view_id"],
-                                        "layer": layer,
-                                        "vector_axes": "|".join(view["vector_axes"]),
-                                        "vector_dim": view["vector_dim"],
-                                        "l1_norm": float(stats[:, 0].mean()),
-                                        "mean_absolute_value": float(
-                                            stats[:, 1].mean()
-                                        ),
-                                        "effective_support_fraction": float(
-                                            stats[:, 2].mean()
-                                        ),
-                                        "relative_l1_change": relative,
-                                    }
-                                )
-
-        return rows
-
     def _extract_vectors(
         self,
         signatures,
@@ -932,9 +635,8 @@ class VTABFunctionalSemanticsAnalyzer:
         if vectors.shape[1] != view["vector_dim"]:
             raise RuntimeError(
                 f"View '{view['view_id']}' "
-                f"has dimension "
-                f"{vectors.shape[1]}, expected "
-                f"{view['vector_dim']}."
+                f"has dimension {vectors.shape[1]}, "
+                f"expected {view['vector_dim']}."
             )
 
         return vectors
@@ -942,20 +644,14 @@ class VTABFunctionalSemanticsAnalyzer:
     @staticmethod
     def _hellinger_matrix(vectors):
         if np.any(vectors < 0):
-            raise ValueError("Hellinger distance requires " "nonnegative signatures.")
+            raise ValueError("Hellinger distance requires nonnegative signatures.")
 
         sums = vectors.sum(axis=1)
         valid = sums > 0
 
         roots = np.zeros_like(vectors)
 
-        roots[valid] = np.sqrt(
-            vectors[valid]
-            / sums[
-                valid,
-                None,
-            ]
-        )
+        roots[valid] = np.sqrt(vectors[valid] / sums[valid, None])
 
         similarity = np.clip(
             roots @ roots.T,
@@ -972,12 +668,7 @@ class VTABFunctionalSemanticsAnalyzer:
 
         matrix[~valid, :] = 1.0
         matrix[:, ~valid] = 1.0
-        matrix[
-            np.ix_(
-                ~valid,
-                ~valid,
-            )
-        ] = 0.0
+        matrix[np.ix_(~valid, ~valid)] = 0.0
 
         np.fill_diagonal(
             matrix,
@@ -997,13 +688,7 @@ class VTABFunctionalSemanticsAnalyzer:
 
         normalized = np.zeros_like(vectors)
 
-        normalized[valid] = (
-            vectors[valid]
-            / norms[
-                valid,
-                None,
-            ]
-        )
+        normalized[valid] = vectors[valid] / norms[valid, None]
 
         similarity = np.clip(
             normalized @ normalized.T,
@@ -1015,12 +700,7 @@ class VTABFunctionalSemanticsAnalyzer:
 
         matrix[~valid, :] = 1.0
         matrix[:, ~valid] = 1.0
-        matrix[
-            np.ix_(
-                ~valid,
-                ~valid,
-            )
-        ] = 0.0
+        matrix[np.ix_(~valid, ~valid)] = 0.0
 
         np.fill_diagonal(
             matrix,
@@ -1101,16 +781,15 @@ class VTABFunctionalSemanticsAnalyzer:
     ):
         spec = self.GROUPS[group]
 
-        anchors = [self.dataset_index[x] for x in spec["anchors"]]
-
         positives = [self.dataset_index[x] for x in spec["positives"]]
 
         negatives = [self.dataset_index[x] for x in spec["negatives"]]
 
-        ranking = []
-        geometric = []
+        scores = {}
 
-        for anchor in anchors:
+        for anchor_name in spec["anchors"]:
+            anchor = self.dataset_index[anchor_name]
+
             peers = [x for x in positives if x != anchor]
 
             if not peers or not negatives:
@@ -1129,12 +808,9 @@ class VTABFunctionalSemanticsAnalyzer:
             p = positive[:, None]
             n = negative[None, :]
 
-            ranking.append(
-                float(((p < n).sum() + 0.5 * (p == n).sum()) / (p.size * n.size))
-            )
+            ranking = float(((p < n).sum() + 0.5 * (p == n).sum()) / (p.size * n.size))
 
             d_pos = float(positive.mean())
-
             d_neg = float(negative.mean())
 
             denominator = max(
@@ -1142,78 +818,20 @@ class VTABFunctionalSemanticsAnalyzer:
                 d_neg,
             )
 
-            geometric.append((d_neg - d_pos) / denominator if denominator else 0.0)
+            geometric = (d_neg - d_pos) / denominator if denominator else 0.0
 
-        return (
-            float(np.mean(ranking)),
-            float(np.mean(geometric)),
+            scores[anchor_name] = (
+                ranking,
+                float(geometric),
+            )
+
+        anchor_scores = list(scores.values())
+
+        scores[self.AVERAGE_KEY] = tuple(
+            float(np.mean([score[i] for score in anchor_scores])) for i in range(2)
         )
 
-    def _separation_scores(
-        self,
-        matrix,
-    ):
-        scores = {
-            group: self._group_scores(
-                matrix,
-                group,
-            )
-            for group in self.GROUPS
-        }
-
-        for name, groups in self.METAGROUPS.items():
-            scores[name] = tuple(
-                float(np.mean([scores[group][i] for group in groups])) for i in range(2)
-            )
-
-        return {
-            f"{group}__{metric}": scores[group][i]
-            for group in self.REPORT_GROUPS
-            for i, metric in enumerate(self.AGREEMENT_METRICS)
-        }
-
-    def _result_row(
-        self,
-        representation,
-        signature,
-        metric,
-        model,
-        view,
-        scores,
-    ):
-        selectors = view["selectors"]
-
-        row = {
-            "representation": representation,
-            "signature": signature,
-            "distance_metric": metric,
-            "model_name": model,
-            "family": view["family"],
-            "component": view["component"],
-            "view": view["view"],
-            "view_id": view["view_id"],
-            **{
-                axis: selectors.get(
-                    axis,
-                    "",
-                )
-                for axis in (
-                    "layer",
-                    "site",
-                    "sublayer",
-                    "token_group",
-                    "query_group",
-                    "destination_group",
-                    "route",
-                )
-            },
-            "vector_axes": "|".join(view["vector_axes"]),
-            "vector_dim": view["vector_dim"],
-        }
-
-        row.update(scores)
-
-        return row
+        return scores
 
     def _compute_separation(
         self,
@@ -1224,6 +842,8 @@ class VTABFunctionalSemanticsAnalyzer:
             "raw": self.RAW_METRICS,
             "delta": self.DELTA_METRICS,
         }
+
+        records = []
 
         total = sum(
             len(metrics)
@@ -1242,15 +862,15 @@ class VTABFunctionalSemanticsAnalyzer:
             for signature, metrics in signature_metrics.items()
         )
 
-        rows = []
-
         with tqdm(
             total=total,
-            desc="Computing semantic views",
+            desc="Computing separation",
             disable=not self.verbose,
         ) as pbar:
-
-            for representation, signature_metrics in policy.items():
+            for (
+                representation,
+                signature_metrics,
+            ) in policy.items():
                 for signature, metrics in signature_metrics.items():
                     signatures = representations[representation][signature]
 
@@ -1279,278 +899,207 @@ class VTABFunctionalSemanticsAnalyzer:
                                     vectors,
                                 )
 
-                                scores = self._separation_scores(matrix)
+                                group_scores = {
+                                    group: self._group_scores(
+                                        matrix,
+                                        group,
+                                    )
+                                    for group in self.GROUPS
+                                }
 
-                                rows.append(
-                                    self._result_row(
+                                scores = []
+
+                                for group, anchor in self.separation_slots:
+                                    scores.extend(group_scores[group][anchor])
+
+                                records.append(
+                                    [
                                         representation,
                                         signature,
                                         metric,
                                         model,
-                                        view,
+                                        view["view_id"],
                                         scores,
-                                    )
+                                    ]
                                 )
 
                                 pbar.update()
 
-        return rows + self._model_group_averages(rows)
-
-    def _score_columns(self):
-        return tuple(
-            f"{group}__{metric}"
-            for group in self.REPORT_GROUPS
-            for metric in self.AGREEMENT_METRICS
-        )
-
-    def _model_group_averages(
-        self,
-        rows,
-    ):
-        score_columns = self._score_columns()
-
-        row_map = {
-            (
-                row["representation"],
-                row["signature"],
-                row["distance_metric"],
-                row["model_name"],
-                row["view_id"],
-            ): row
-            for row in rows
-        }
-
-        configs = sorted(
-            {
-                (
-                    row["representation"],
-                    row["signature"],
-                    row["distance_metric"],
-                )
-                for row in rows
-            }
-        )
-
-        averages = []
-
-        for representation, signature, metric in configs:
-            for group_name, models in self.model_groups.items():
-                view_sets = [
-                    {
-                        row["view_id"]
-                        for row in rows
-                        if (
-                            row["representation"] == representation
-                            and row["signature"] == signature
-                            and row["distance_metric"] == metric
-                            and row["model_name"] == model
-                        )
-                    }
-                    for model in models
-                ]
-
-                common = set.intersection(*view_sets) if view_sets else set()
-
-                for view_id in sorted(common):
-                    members = [
-                        row_map[
-                            (
-                                representation,
-                                signature,
-                                metric,
-                                model,
-                                view_id,
-                            )
-                        ]
-                        for model in models
-                    ]
-
-                    row = dict(members[0])
-
-                    row["model_name"] = f"{group_name}_average"
-
-                    for column in score_columns:
-                        row[column] = float(
-                            np.mean([member[column] for member in members])
-                        )
-
-                    averages.append(row)
-
-        return averages
-
-    def _format_number(self, value):
-        if value in ("", None):
-            return ""
-
-        value = float(value)
-
-        if not np.isfinite(value):
-            return ""
-
-        decimals = self.decimal_places
-
-        if value:
-            decimals = max(
-                self.decimal_places,
-                int(math.ceil(-math.log10(abs(value)))),
-            )
-
-        return f"{value:.{decimals}f}"
-
-    def _mean_ci(self, values):
-        values = np.asarray(
-            values,
-            dtype=np.float64,
-        )
-
-        values = values[np.isfinite(values)]
-
-        if not values.size:
-            return np.nan, np.nan
-
-        mean = float(values.mean())
-
-        if values.size < 2:
-            return mean, np.nan
-
-        critical = student_t.ppf(
-            (1 + self.confidence) / 2,
-            values.size - 1,
-        )
-
-        return (
-            mean,
-            float(critical * values.std(ddof=1) / np.sqrt(values.size)),
-        )
-
-    def _format_magnitude_rows(self, rows):
-        lookup = {
-            (
-                row["representation"],
-                row["signature"],
-                row["model_name"],
-                row["component"],
-                row["view_id"],
-                row["data_scope"],
-            ): row
-            for row in rows
-        }
-
-        out = []
-
-        for row in rows:
-            formatted = dict(row)
-            group = row["data_scope"]
-
-            for metric in self.MAGNITUDE_METRICS:
-                value = row.get(
-                    metric,
-                    "",
-                )
-
-                if value in ("", None):
-                    continue
-
-                ci = np.nan
-
-                if group in self.REPORT_GROUPS:
-                    values = [
-                        lookup[
-                            (
-                                row["representation"],
-                                row["signature"],
-                                row["model_name"],
-                                row["component"],
-                                row["view_id"],
-                                dataset,
-                            )
-                        ].get(
-                            metric,
-                            np.nan,
-                        )
-                        for dataset in self._report_group_anchors(group)
-                    ]
-
-                    _, ci = self._mean_ci(values)
-
-                text = self._format_number(value)
-
-                if text and np.isfinite(ci):
-                    text += f" +- " f"{self._format_number(ci)}"
-
-                formatted[metric] = text
-
-            out.append(formatted)
-
-        return out
-
-    def _format_separation_rows(self, rows):
-        metrics = self._score_columns()
-
-        return [
-            {
-                **row,
-                **{metric: self._format_number(row[metric]) for metric in metrics},
-            }
-            for row in rows
-        ]
+        return records
 
     @staticmethod
-    def _write_csv(
-        path,
-        rows,
-        columns,
-    ):
-        path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
+    def _magnitude_matrix(vectors):
+        x = np.abs(
+            np.asarray(
+                vectors,
+                dtype=np.float64,
+            )
         )
 
-        if rows:
-            columns = tuple(
-                column
-                for column in columns
-                if any(
-                    row.get(
-                        column,
-                        "",
+        l1 = x.sum(axis=1)
+        mean = x.mean(axis=1)
+
+        p = np.divide(
+            x,
+            l1[:, None],
+            out=np.zeros_like(x),
+            where=l1[:, None] > 0,
+        )
+
+        logp = np.zeros_like(p)
+
+        np.log(
+            p,
+            out=logp,
+            where=p > 0,
+        )
+
+        support = np.exp(-(p * logp).sum(axis=1)) / x.shape[1]
+
+        support[l1 == 0] = 0.0
+
+        return l1, mean, support
+
+    def _compute_magnitude(
+        self,
+        representations,
+        raw,
+    ):
+        records = []
+
+        total = sum(
+            sum(
+                sum(
+                    (view["component"] not in self.PROMPT_COMPONENTS)
+                    or self._has_prompts(
+                        raw,
+                        model,
                     )
-                    not in (
-                        "",
-                        None,
-                    )
-                    for row in rows
+                    for view in self.views
                 )
+                for model in representations[representation][signature]
             )
+            for representation in representations
+            for signature in self.SIGNATURES
+        )
 
-        with open(
-            path,
-            "w",
-            newline="",
-        ) as file:
-            writer = csv.DictWriter(
-                file,
-                fieldnames=columns,
-                extrasaction="ignore",
-            )
+        with tqdm(
+            total=total,
+            desc="Computing magnitude",
+            disable=not self.verbose,
+        ) as pbar:
+            for (
+                representation,
+                signature_types,
+            ) in representations.items():
+                for signature, models in signature_types.items():
+                    reference_l1 = None
 
-            writer.writeheader()
-            writer.writerows(rows)
+                    if representation == "delta":
+                        reference_l1 = {
+                            view["view_id"]: np.abs(
+                                self._extract_vectors(
+                                    raw[signature],
+                                    self.REFERENCE_MODEL,
+                                    view,
+                                )
+                            ).sum(axis=1)
+                            for view in self.views
+                        }
 
-    def _save_metadata(self):
-        root = self.save_dir / "metadata"
+                    for model in models:
+                        has_prompts = self._has_prompts(
+                            raw,
+                            model,
+                        )
 
-        component_rows = [
+                        for view in self.views:
+                            if (
+                                view["component"] in self.PROMPT_COMPONENTS
+                                and not has_prompts
+                            ):
+                                continue
+
+                            vectors = self._extract_vectors(
+                                models,
+                                model,
+                                view,
+                            )
+
+                            l1, mean, support = self._magnitude_matrix(vectors)
+
+                            relative = np.full(
+                                len(self.DATASET_NAMES),
+                                np.nan,
+                            )
+
+                            if representation == "delta":
+                                ref_l1 = reference_l1[view["view_id"]]
+
+                                relative = np.divide(
+                                    l1,
+                                    ref_l1,
+                                    out=relative,
+                                    where=ref_l1 > 0,
+                                )
+
+                            values = []
+
+                            for i in range(len(self.DATASET_NAMES)):
+                                values.extend(
+                                    (
+                                        float(l1[i]),
+                                        float(mean[i]),
+                                        float(support[i]),
+                                        (
+                                            float(relative[i])
+                                            if np.isfinite(relative[i])
+                                            else None
+                                        ),
+                                    )
+                                )
+
+                            records.append(
+                                [
+                                    representation,
+                                    signature,
+                                    model,
+                                    view["view_id"],
+                                    values,
+                                ]
+                            )
+
+                            pbar.update()
+
+        return records
+
+    def _payload(
+        self,
+        separation,
+        magnitude,
+    ):
+        models = [
             {
-                "component": component,
+                "name": model,
+                "type": "individual",
+                "members": [],
+            }
+            for model in self.model_names
+        ] + [
+            {
+                "name": f"{name}_average",
+                "type": "group_average",
+                "members": list(members),
+            }
+            for name, members in self.model_groups.items()
+        ]
+
+        components = [
+            {
+                "name": component,
                 "family": self.COMPONENT_FAMILY[component],
-                "shape": "x".join(
-                    map(
-                        str,
-                        shape,
-                    )
-                ),
-                "axes": "|".join(axes),
+                "shape": list(shape),
+                "axes": list(axes),
             }
             for component, (
                 shape,
@@ -1558,1685 +1107,1950 @@ class VTABFunctionalSemanticsAnalyzer:
             ) in self.COMPONENTS.items()
         ]
 
-        self._write_csv(
-            root / "component_schema.csv",
-            component_rows,
-            (
-                "component",
-                "family",
-                "shape",
-                "axes",
-            ),
-        )
+        relations = []
 
-        selector_axes = (
-            "layer",
-            "site",
-            "sublayer",
-            "token_group",
-            "query_group",
-            "destination_group",
-            "route",
-        )
+        for name in self.REPORT_GROUPS:
+            if name in self.GROUPS:
+                spec = self.GROUPS[name]
 
-        view_rows = []
-
-        for view in self.views:
-            view_rows.append(
-                {
-                    "family": view["family"],
-                    "component": view["component"],
-                    "view": view["view"],
-                    "view_id": view["view_id"],
-                    **{
-                        axis: view["selectors"].get(
-                            axis,
-                            "",
-                        )
-                        for axis in selector_axes
-                    },
-                    "vector_axes": "|".join(view["vector_axes"]),
-                    "vector_dim": view["vector_dim"],
-                    "description": view["description"],
-                }
-            )
-
-        self._write_csv(
-            root / "view_schema.csv",
-            view_rows,
-            (
-                "family",
-                "component",
-                "view",
-                "view_id",
-                *selector_axes,
-                "vector_axes",
-                "vector_dim",
-                "description",
-            ),
-        )
-
-        semantic_rows = [
-            {
-                "group": group,
-                "type": "relation",
-                "anchors": "|".join(spec["anchors"]),
-                "positives": "|".join(spec["positives"]),
-                "negatives": "|".join(spec["negatives"]),
-                "members": "",
-                "magnitude_anchors": "|".join(spec["anchors"]),
-            }
-            for group, spec in self.GROUPS.items()
-        ]
-
-        semantic_rows += [
-            {
-                "group": name,
-                "type": "metagroup",
-                "anchors": "",
-                "positives": "",
-                "negatives": "",
-                "members": "|".join(groups),
-                "magnitude_anchors": "|".join(self._report_group_anchors(name)),
-            }
-            for name, groups in self.METAGROUPS.items()
-        ]
-
-        self._write_csv(
-            root / "semantic_groups.csv",
-            semantic_rows,
-            (
-                "group",
-                "type",
-                "anchors",
-                "positives",
-                "negatives",
-                "members",
-                "magnitude_anchors",
-            ),
-        )
-
-        representation_rows = [
-            {
-                "representation": "raw",
-                "definition": (
-                    "Absolute functional " "signature for each " "model and task."
-                ),
-                "prompt_components": (
-                    "Absolute prompt-to-" "backbone signal when " "prompts exist."
-                ),
-            },
-            {
-                "representation": "delta",
-                "definition": (
-                    f"Model signature minus "
-                    f"{self.REFERENCE_MODEL} "
-                    "signature for the same "
-                    "task."
-                ),
-                "prompt_components": (
-                    "For prompt-specific "
-                    "components the reference "
-                    "mechanism is absent, so "
-                    "delta equals the introduced "
-                    "prompt signal."
-                ),
-            },
-        ]
-
-        self._write_csv(
-            root / "representation_schema.csv",
-            representation_rows,
-            (
-                "representation",
-                "definition",
-                "prompt_components",
-            ),
-        )
-
-        self._write_csv(
-            root / "output_schema.csv",
-            [
-                {
-                    "analysis": "separation",
-                    "path": "separation_analysis/results.csv",
-                    "contents": "All semantic views and configurations.",
-                },
-                {
-                    "analysis": "separation",
-                    "path": (
-                        "separation_analysis/overview/"
-                        "{representation}/{distance_metric}/"
-                        "{signature}.csv"
-                    ),
-                    "contents": "Full-component views only.",
-                },
-                {
-                    "analysis": "separation",
-                    "path": "separation_analysis/{family}/results.csv",
-                    "contents": "All semantic views for one component family.",
-                },
-                {
-                    "analysis": "separation",
-                    "path": (
-                        "separation_analysis/{family}/overview/"
-                        "{representation}/{distance_metric}/"
-                        "{signature}.csv"
-                    ),
-                    "contents": "Full-component views for one component family.",
-                },
-                {
-                    "analysis": "magnitude",
-                    "path": "magnitude_analysis/results.csv",
-                    "contents": (
-                        "All full/layer magnitude rows for each "
-                        "report-group anchor aggregate and dataset."
-                    ),
-                },
-                {
-                    "analysis": "magnitude",
-                    "path": (
-                        "magnitude_analysis/overview/"
-                        "{representation}/{signature}.csv"
-                    ),
-                    "contents": (
-                        "Full-component magnitude rows for each "
-                        "report-group anchor aggregate and dataset."
-                    ),
-                },
-                {
-                    "analysis": "magnitude",
-                    "path": (
-                        "magnitude_analysis/reports/by_model/"
-                        "{representation}/{signature}/{model}.pdf"
-                    ),
-                    "contents": "Per-model magnitude overview and depth reports.",
-                },
-                {
-                    "analysis": "magnitude",
-                    "path": (
-                        "magnitude_analysis/reports/model_comparison/"
-                        "{representation}/{signature}.pdf"
-                    ),
-                    "contents": "Cross-model magnitude overview and depth reports.",
-                },
-                {
-                    "analysis": "all_csv",
-                    "path": "*",
-                    "contents": (
-                        "Empty columns are omitted; analysis metrics "
-                        "use adaptive display precision, and magnitude "
-                        f"group means include {self.confidence:.0%} "
-                        "Student-t confidence intervals."
-                    ),
-                },
-            ],
-            (
-                "analysis",
-                "path",
-                "contents",
-            ),
-        )
-
-    def _save_magnitude(self, rows):
-        columns = (
-            "representation",
-            "signature",
-            "model_name",
-            "data_scope",
-            "family",
-            "component",
-            "view",
-            "view_id",
-            "layer",
-            "vector_axes",
-            "vector_dim",
-            *self.MAGNITUDE_METRICS,
-        )
-
-        root = self.save_dir / "magnitude_analysis"
-
-        display = self._format_magnitude_rows(rows)
-
-        self._write_csv(
-            root / "results.csv",
-            display,
-            columns,
-        )
-
-        full = [row for row in display if row["view"] == "full"]
-
-        for representation in (
-            "raw",
-            "delta",
-        ):
-            for signature in self.SIGNATURES:
-                self._write_csv(
-                    root / "overview" / representation / f"{signature}.csv",
-                    [
-                        row
-                        for row in full
-                        if (
-                            row["representation"] == representation
-                            and row["signature"] == signature
-                        )
-                    ],
-                    columns,
+                relations.append(
+                    {
+                        "name": name,
+                        "type": "relation",
+                        "anchors": list(spec["anchors"]),
+                        "positives": list(spec["positives"]),
+                        "negatives": list(spec["negatives"]),
+                        "members": [],
+                    }
                 )
-
-    def _save_separation_overviews(
-        self,
-        rows,
-        root,
-        columns,
-    ):
-        full = [row for row in rows if row["view"] == "full"]
-
-        for representation, policy in (
-            (
-                "raw",
-                self.RAW_METRICS,
-            ),
-            (
-                "delta",
-                self.DELTA_METRICS,
-            ),
-        ):
-            for signature, metrics in policy.items():
-                for metric in metrics:
-                    self._write_csv(
-                        root
-                        / "overview"
-                        / representation
-                        / metric
-                        / f"{signature}.csv",
-                        [
-                            row
-                            for row in full
-                            if (
-                                row["representation"] == representation
-                                and row["signature"] == signature
-                                and row["distance_metric"] == metric
-                            )
-                        ],
-                        columns,
-                    )
-
-    def _save_separation(
-        self,
-        rows,
-    ):
-        columns = (
-            *self.RESULT_META_COLUMNS,
-            *self._score_columns(),
-        )
-
-        root = self.save_dir / "separation_analysis"
-
-        display = self._format_separation_rows(rows)
-
-        self._write_csv(
-            root / "results.csv",
-            display,
-            columns,
-        )
-
-        self._save_separation_overviews(
-            display,
-            root,
-            columns,
-        )
-
-        for family in dict.fromkeys(self.COMPONENT_FAMILY.values()):
-            family_rows = [row for row in display if row["family"] == family]
-
-            family_root = root / family
-
-            self._write_csv(
-                family_root / "results.csv",
-                family_rows,
-                columns,
-            )
-
-            self._save_separation_overviews(
-                family_rows,
-                family_root,
-                columns,
-            )
-
-    @staticmethod
-    def _short_label(
-        axis,
-        value,
-    ):
-        names = {
-            "attention_read": "attn-read",
-            "attention_write": "attn-write",
-            "mlp_read": "mlp-read",
-            "mlp_write": "mlp-write",
-            "attention": "attn",
-            "cls<-cls": "CLS<-CLS",
-            "cls<-patch": "CLS<-P",
-            "patch<-cls": "P<-CLS",
-            "patch<-patch_self": "P<-P self",
-            "patch<-patch_local": "P<-P local",
-            "patch<-patch_medium": "P<-P medium",
-            "patch<-patch_global": "P<-P global",
-        }
-
-        if axis == "layer":
-            return f"L{int(value):02d}"
-
-        return names.get(
-            str(value),
-            str(value),
-        )
-
-    def _native_matrix(
-        self,
-        rows,
-        component,
-        view_name,
-        col_axes,
-        group,
-        agreement,
-    ):
-        selected = [
-            row
-            for row in rows
-            if (row["component"] == component and row["view"] == view_name)
-        ]
-
-        if not selected:
-            return None, None
-
-        layers = list(range(self.L))
-
-        cols = (
-            list(
-                product(
-                    *(
-                        self._axis_values(
-                            component,
-                            axis,
-                        )
-                        for axis in col_axes
-                    )
-                )
-            )
-            if col_axes
-            else [()]
-        )
-
-        lookup = {
-            (
-                int(row["layer"]),
-                tuple(row[axis] for axis in col_axes),
-            ): row[f"{group}__" f"{agreement}"]
-            for row in selected
-        }
-
-        matrix = np.full(
-            (
-                len(layers),
-                len(cols),
-            ),
-            np.nan,
-            dtype=np.float64,
-        )
-
-        for i, layer in enumerate(layers):
-            for j, values in enumerate(cols):
-                matrix[
-                    i,
-                    j,
-                ] = lookup.get(
-                    (
-                        layer,
-                        tuple(values),
-                    ),
-                    np.nan,
-                )
-
-        labels = [
-            (
-                " / ".join(
-                    self._short_label(
-                        axis,
-                        value,
-                    )
-                    for axis, value in zip(
-                        col_axes,
-                        values,
-                    )
-                )
-                if col_axes
-                else "profile"
-            )
-            for values in cols
-        ]
-
-        return matrix, labels
-
-    @staticmethod
-    def _limits(
-        agreement,
-    ):
-        if agreement == "ranking_agreement":
-            return (
-                0.0,
-                1.0,
-                0.5,
-            )
-
-        return (
-            -1.0,
-            1.0,
-            0.0,
-        )
-
-    def _plot_overview_page(
-        self,
-        pdf,
-        rows,
-        agreement,
-        title,
-    ):
-        full = [row for row in rows if row["view"] == "full"]
-
-        if not full:
-            return
-
-        components = [
-            component
-            for component in self.components
-            if any(row["component"] == component for row in full)
-        ]
-
-        lookup = {row["component"]: row for row in full}
-
-        matrix = np.asarray(
-            [
-                [
-                    lookup[component][f"{group}__" f"{agreement}"]
-                    for component in components
-                ]
-                for group in self.REPORT_GROUPS
-            ],
-            dtype=np.float64,
-        )
-
-        vmin, vmax, baseline = self._limits(agreement)
-
-        fig, ax = plt.subplots(figsize=(15, 9))
-
-        image = ax.imshow(
-            matrix,
-            aspect="auto",
-            vmin=vmin,
-            vmax=vmax,
-        )
-
-        ax.set_yticks(
-            range(len(self.REPORT_GROUPS)),
-            self.REPORT_GROUPS,
-        )
-
-        ax.set_xticks(
-            range(len(components)),
-            components,
-            rotation=55,
-            ha="right",
-        )
-
-        ax.set_title(
-            f"{title}\n" f"{agreement.replace('_', ' ')} " f"| neutral={baseline:g}"
-        )
-
-        fig.colorbar(
-            image,
-            ax=ax,
-            fraction=0.025,
-            pad=0.02,
-        )
-
-        fig.tight_layout()
-
-        pdf.savefig(fig)
-        plt.close(fig)
-
-    def _plot_native_page(
-        self,
-        pdf,
-        rows,
-        spec,
-        agreement,
-    ):
-        (
-            component,
-            view_name,
-            col_axes,
-            title,
-        ) = spec
-
-        if not any(
-            row["component"] == component and row["view"] == view_name for row in rows
-        ):
-            return
-
-        vmin, vmax, baseline = self._limits(agreement)
-
-        fig, axes = plt.subplots(
-            5,
-            3,
-            figsize=(18, 22),
-            squeeze=False,
-            constrained_layout=True,
-        )
-
-        image = None
-
-        for ax, group in zip(
-            axes.flat,
-            self.REPORT_GROUPS,
-        ):
-            matrix, labels = self._native_matrix(
-                rows,
-                component,
-                view_name,
-                col_axes,
-                group,
-                agreement,
-            )
-
-            if matrix is None:
-                ax.axis("off")
-                continue
-
-            if matrix.shape[1] == 1:
-                ax.plot(
-                    range(self.L),
-                    matrix[
-                        :,
-                        0,
-                    ],
-                    marker="o",
-                    markersize=2,
-                )
-
-                ax.axhline(
-                    baseline,
-                    linewidth=0.8,
-                    linestyle="--",
-                )
-
-                ax.set_ylim(
-                    vmin,
-                    vmax,
-                )
-
-                ax.set_xticks(
-                    range(self.L),
-                    [f"L{i:02d}" for i in range(self.L)],
-                    rotation=90,
-                    fontsize=6,
-                )
-
             else:
-                image = ax.imshow(
-                    matrix,
-                    aspect="auto",
-                    vmin=vmin,
-                    vmax=vmax,
+                relations.append(
+                    {
+                        "name": name,
+                        "type": "metagroup",
+                        "anchors": [],
+                        "positives": [],
+                        "negatives": [],
+                        "members": list(self.METAGROUPS[name]),
+                    }
                 )
-
-                ax.set_yticks(
-                    range(self.L),
-                    [f"L{i:02d}" for i in range(self.L)],
-                    fontsize=6,
-                )
-
-                ax.set_xticks(
-                    range(len(labels)),
-                    labels,
-                    rotation=60,
-                    ha="right",
-                    fontsize=6,
-                )
-
-            ax.set_title(
-                group,
-                fontsize=9,
-            )
-
-        for ax in axes.flat[len(self.REPORT_GROUPS) :]:
-            ax.axis("off")
-
-        if image is not None:
-            fig.colorbar(
-                image,
-                ax=axes.ravel().tolist(),
-                fraction=0.012,
-                pad=0.01,
-            )
-
-        fig.suptitle(
-            f"{title}\n" f"{agreement.replace('_', ' ')}",
-            fontsize=15,
-        )
-
-        pdf.savefig(fig)
-        plt.close(fig)
-
-    def _plot_model_overview_page(
-        self,
-        pdf,
-        rows,
-        agreement,
-        title,
-    ):
-        models = [
-            model
-            for model in self.model_names
-            if any(row["model_name"] == model for row in rows)
-        ]
-
-        components = [
-            component
-            for component in self.components
-            if any(
-                row["view"] == "full" and row["component"] == component for row in rows
-            )
-        ]
-
-        vmin, vmax, baseline = self._limits(agreement)
-
-        fig, axes = plt.subplots(
-            5,
-            3,
-            figsize=(18, 22),
-            squeeze=False,
-            constrained_layout=True,
-        )
-
-        image = None
-
-        for ax, group in zip(
-            axes.flat,
-            self.REPORT_GROUPS,
-        ):
-            lookup = {
-                (
-                    row["model_name"],
-                    row["component"],
-                ): row[f"{group}__" f"{agreement}"]
-                for row in rows
-                if row["view"] == "full"
-            }
-
-            matrix = np.asarray(
-                [
-                    [
-                        lookup.get(
-                            (
-                                model,
-                                component,
-                            ),
-                            np.nan,
-                        )
-                        for component in components
-                    ]
-                    for model in models
-                ],
-                dtype=np.float64,
-            )
-
-            image = ax.imshow(
-                matrix,
-                aspect="auto",
-                vmin=vmin,
-                vmax=vmax,
-            )
-
-            ax.set_yticks(
-                range(len(models)),
-                models,
-                fontsize=7,
-            )
-
-            ax.set_xticks(
-                range(len(components)),
-                components,
-                rotation=60,
-                ha="right",
-                fontsize=6,
-            )
-
-            ax.set_title(
-                group,
-                fontsize=9,
-            )
-
-        for ax in axes.flat[len(self.REPORT_GROUPS) :]:
-            ax.axis("off")
-
-        fig.colorbar(
-            image,
-            ax=axes.ravel().tolist(),
-            fraction=0.012,
-            pad=0.01,
-        )
-
-        fig.suptitle(
-            f"{title}\n" f"{agreement.replace('_', ' ')} " f"| neutral={baseline:g}",
-            fontsize=15,
-        )
-
-        pdf.savefig(fig)
-        plt.close(fig)
-
-    def _plot_model_depth_page(
-        self,
-        pdf,
-        rows,
-        component,
-        agreement,
-    ):
-        selected = [
-            row
-            for row in rows
-            if (row["component"] == component and row["view"] == "layer")
-        ]
-
-        if not selected:
-            return
-
-        models = [
-            model
-            for model in self.model_names
-            if any(row["model_name"] == model for row in rows)
-        ]
-
-        vmin, vmax, baseline = self._limits(agreement)
-
-        fig, axes = plt.subplots(
-            5,
-            3,
-            figsize=(18, 22),
-            squeeze=False,
-            constrained_layout=True,
-        )
-
-        image = None
-
-        for ax, group in zip(
-            axes.flat,
-            self.REPORT_GROUPS,
-        ):
-            lookup = {
-                (
-                    row["model_name"],
-                    int(row["layer"]),
-                ): row[f"{group}__" f"{agreement}"]
-                for row in selected
-            }
-
-            matrix = np.asarray(
-                [
-                    [
-                        lookup.get(
-                            (
-                                model,
-                                layer,
-                            ),
-                            np.nan,
-                        )
-                        for layer in range(self.L)
-                    ]
-                    for model in models
-                ],
-                dtype=np.float64,
-            )
-
-            image = ax.imshow(
-                matrix,
-                aspect="auto",
-                vmin=vmin,
-                vmax=vmax,
-            )
-
-            ax.set_yticks(
-                range(len(models)),
-                models,
-                fontsize=7,
-            )
-
-            ax.set_xticks(
-                range(self.L),
-                [f"L{i:02d}" for i in range(self.L)],
-                rotation=90,
-                fontsize=6,
-            )
-
-            ax.set_title(
-                group,
-                fontsize=9,
-            )
-
-        for ax in axes.flat[len(self.REPORT_GROUPS) :]:
-            ax.axis("off")
-
-        fig.colorbar(
-            image,
-            ax=axes.ravel().tolist(),
-            fraction=0.012,
-            pad=0.01,
-        )
-
-        fig.suptitle(
-            f"Cross-model depth: "
-            f"{component}\n"
-            f"{agreement.replace('_', ' ')} "
-            f"| neutral={baseline:g}",
-            fontsize=15,
-        )
-
-        pdf.savefig(fig)
-        plt.close(fig)
-
-    @staticmethod
-    def _magnitude_scale(values, metric):
-        values = np.asarray(values, dtype=np.float64)
-        values = values[np.isfinite(values)]
-
-        if not values.size:
-            return None
-
-        if metric == "effective_support_fraction":
-            return {"vmin": 0.0, "vmax": 1.0}
-
-        vmax = float(values.max())
-        positive = values[values > 0]
-
-        if not positive.size or vmax <= positive.min():
-            return {"vmin": 0.0, "vmax": vmax if vmax > 0 else 1.0}
 
         return {
-            "norm": SymLogNorm(
-                linthresh=float(positive.min()),
-                vmin=0.0,
-                vmax=vmax,
-            )
+            "datasets": list(self.DATASET_NAMES),
+            "reference_model": self.REFERENCE_MODEL,
+            "models": models,
+            "components": components,
+            "views": list(self.views),
+            "relations": relations,
+            "relation_order": list(self.REPORT_GROUPS),
+            "separation_slots": [list(slot) for slot in self.separation_slots],
+            "separation_metrics": list(self.AGREEMENT_METRICS),
+            "raw_metrics": {
+                key: list(value) for key, value in self.RAW_METRICS.items()
+            },
+            "delta_metrics": {
+                key: list(value) for key, value in self.DELTA_METRICS.items()
+            },
+            "magnitude_metrics": list(self.MAGNITUDE_METRICS),
+            "decimal_places": self.decimal_places,
+            "separation": separation,
+            "magnitude": magnitude,
         }
 
-    def _plot_magnitude_overview_page(
-        self,
-        pdf,
-        rows,
-        metric,
-        scopes,
-        title,
-    ):
-        full = [row for row in rows if row["view"] == "full"]
+    @staticmethod
+    def _html_template():
+        return r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+>
+<title>VTAB Functional Semantics</title>
+<style>
+:root {
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system,
+        BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #18181b;
+    background: #fafafa;
+}
 
-        components = [
-            component
-            for component in self.components
-            if any(row["component"] == component for row in full)
-        ]
+* {
+    box-sizing: border-box;
+}
 
-        lookup = {
-            (
-                row["data_scope"],
-                row["component"],
-            ): row.get(
-                metric,
-                np.nan,
+body {
+    margin: 0;
+}
+
+main {
+    max-width: 1800px;
+    margin: auto;
+    padding: 24px;
+}
+
+h1 {
+    margin: 0 0 18px;
+    font-size: 22px;
+}
+
+.controls {
+    display: grid;
+    grid-template-columns: repeat(
+        auto-fit,
+        minmax(170px, 1fr)
+    );
+    gap: 10px;
+    margin-bottom: 14px;
+}
+
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.field label {
+    font-size: 11px;
+    font-weight: 700;
+    color: #71717a;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+select,
+input {
+    width: 100%;
+    padding: 8px 9px;
+    border: 1px solid #d4d4d8;
+    border-radius: 6px;
+    background: white;
+    color: #18181b;
+}
+
+.hidden {
+    display: none !important;
+}
+
+.status {
+    margin: 8px 0;
+    font-size: 12px;
+    color: #71717a;
+}
+
+.table-wrap {
+    overflow: auto;
+    max-height: 72vh;
+    border: 1px solid #e4e4e7;
+    border-radius: 8px;
+    background: white;
+}
+
+table {
+    min-width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 13px;
+}
+
+th,
+td {
+    padding: 8px 10px;
+    border-right: 1px solid #f0f0f2;
+    border-bottom: 1px solid #f0f0f2;
+    white-space: nowrap;
+    text-align: right;
+}
+
+th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: #f4f4f5;
+    font-weight: 650;
+}
+
+th:first-child,
+td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: white;
+    text-align: left;
+}
+
+th:first-child {
+    z-index: 3;
+    background: #f4f4f5;
+}
+
+td.value {
+    cursor: pointer;
+    font-variant-numeric: tabular-nums;
+}
+
+td.value:hover {
+    background: #f4f4f5;
+}
+
+td.na {
+    color: #a1a1aa;
+}
+
+.average td {
+    background: #fafafa;
+    font-weight: 650;
+}
+
+.average td:first-child {
+    background: #fafafa;
+}
+
+dialog {
+    width: min(650px, 92vw);
+    max-width: 650px;
+    padding: 0;
+    border: 0;
+    border-radius: 10px;
+    box-shadow: 0 20px 60px #0003;
+}
+
+dialog::backdrop {
+    background: #0005;
+}
+
+.dialog-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 18px;
+    border-bottom: 1px solid #e4e4e7;
+}
+
+.dialog-head h2 {
+    margin: 0;
+    font-size: 16px;
+}
+
+.dialog-head button {
+    border: 0;
+    background: transparent;
+    font-size: 20px;
+    cursor: pointer;
+}
+
+.details {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 7px 14px;
+    padding: 16px 18px;
+    font-size: 13px;
+}
+
+.details dt {
+    font-weight: 650;
+    color: #52525b;
+}
+
+.details dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+}
+
+.loading {
+    padding: 40px;
+    color: #71717a;
+    text-align: center;
+}
+
+@media (max-width: 700px) {
+    main {
+        padding: 14px;
+    }
+
+    .controls {
+        grid-template-columns: 1fr 1fr;
+    }
+}
+</style>
+</head>
+
+<body>
+<main>
+<h1>VTAB Functional Semantics</h1>
+
+<div id="loading" class="loading">
+    Loading embedded results…
+</div>
+
+<div id="app" class="hidden">
+    <div class="controls">
+        <div class="field">
+            <label>Analysis</label>
+            <select id="analysis">
+                <option>Separation</option>
+                <option>Magnitude</option>
+            </select>
+        </div>
+
+        <div class="field">
+            <label>Compare</label>
+            <select id="compare">
+                <option>Datasets</option>
+                <option>Models</option>
+            </select>
+        </div>
+
+        <div class="field">
+            <label>Signature</label>
+            <select id="signature">
+                <option>F</option>
+                <option>P</option>
+                <option>S</option>
+            </select>
+        </div>
+
+        <div class="field">
+            <label>Representation</label>
+            <select id="representation">
+                <option>raw</option>
+                <option>delta</option>
+            </select>
+        </div>
+
+        <div class="field separation-only">
+            <label>Distance</label>
+            <input
+                id="distance"
+                list="distance-list"
+                autocomplete="off"
+            >
+            <datalist id="distance-list"></datalist>
+        </div>
+
+        <div class="field separation-only">
+            <label>Agreement</label>
+            <select id="agreement"></select>
+        </div>
+
+        <div class="field magnitude-only">
+            <label>Magnitude metric</label>
+            <input
+                id="magnitudeMetric"
+                list="magnitude-list"
+                autocomplete="off"
+            >
+            <datalist id="magnitude-list"></datalist>
+        </div>
+
+        <div class="field">
+            <label>Relation</label>
+            <input
+                id="relation"
+                list="relation-list"
+                autocomplete="off"
+            >
+            <datalist id="relation-list"></datalist>
+        </div>
+
+        <div class="field model-control">
+            <label>Model</label>
+            <input
+                id="model"
+                list="model-list"
+                autocomplete="off"
+            >
+            <datalist id="model-list"></datalist>
+        </div>
+
+        <div class="field dataset-control hidden">
+            <label>Dataset</label>
+            <input
+                id="dataset"
+                list="dataset-list"
+                autocomplete="off"
+            >
+            <datalist id="dataset-list"></datalist>
+        </div>
+
+        <div class="field">
+            <label>Component</label>
+            <input
+                id="component"
+                list="component-list"
+                autocomplete="off"
+            >
+            <datalist id="component-list"></datalist>
+        </div>
+
+        <div class="field view-control">
+            <label>View</label>
+            <input
+                id="view"
+                list="view-list"
+                autocomplete="off"
+            >
+            <datalist id="view-list"></datalist>
+        </div>
+
+        <div class="field layer-control hidden">
+            <label>Layer</label>
+            <select id="layer"></select>
+        </div>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <div class="table-wrap">
+        <table id="matrix"></table>
+    </div>
+</div>
+</main>
+
+<dialog id="dialog">
+    <div class="dialog-head">
+        <h2>Result details</h2>
+        <button
+            id="closeDialog"
+            aria-label="Close"
+        >×</button>
+    </div>
+
+    <dl id="details" class="details"></dl>
+</dialog>
+
+<script
+    id="payload"
+    type="application/octet-stream"
+>__PAYLOAD__</script>
+
+<script>
+(async () => {
+    const $ = id => document.getElementById(id);
+
+    const encoded = $("payload").textContent.trim();
+
+    if (!("DecompressionStream" in window)) {
+        $("loading").textContent =
+            "This browser does not support DecompressionStream. " +
+            "Use a current Chromium, Firefox, or Safari browser.";
+        return;
+    }
+
+    const bytes = Uint8Array.from(
+        atob(encoded),
+        c => c.charCodeAt(0)
+    );
+
+    const stream = new Blob([bytes])
+        .stream()
+        .pipeThrough(
+            new DecompressionStream("gzip")
+        );
+
+    const D = JSON.parse(
+        await new Response(stream).text()
+    );
+
+    const models = new Map(
+        D.models.map(x => [x.name, x])
+    );
+
+    const relations = new Map(
+        D.relations.map(x => [x.name, x])
+    );
+
+    const views = new Map(
+        D.views.map(x => [x.view_id, x])
+    );
+
+    const separationSlots = new Map(
+        D.separation_slots.map(
+            (x, i) => [x[0] + "|" + x[1], i]
+        )
+    );
+
+    const separationIndex = new Map(
+        D.separation.map(
+            row => [
+                [
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                    row[4],
+                ].join("|"),
+                row[5],
+            ]
+        )
+    );
+
+    const magnitudeIndex = new Map(
+        D.magnitude.map(
+            row => [
+                [
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                ].join("|"),
+                row[4],
+            ]
+        )
+    );
+
+    const separationCache = new Map();
+    const magnitudeCache = new Map();
+
+    const AVG = "__average__";
+    const ALL = "Full components";
+
+    const analysis = $("analysis");
+    const compare = $("compare");
+    const signature = $("signature");
+    const representation = $("representation");
+    const distance = $("distance");
+    const agreement = $("agreement");
+    const magnitudeMetric = $("magnitudeMetric");
+    const relation = $("relation");
+    const model = $("model");
+    const dataset = $("dataset");
+    const component = $("component");
+    const view = $("view");
+    const layer = $("layer");
+
+    function setChoices(
+        input,
+        listId,
+        values,
+        preferred,
+    ) {
+        const datalist = $(listId);
+
+        datalist.replaceChildren(
+            ...values.map(
+                value => Object.assign(
+                    document.createElement("option"),
+                    {value},
+                )
             )
-            for row in full
+        );
+
+        input.value = values.includes(input.value)
+            ? input.value
+            : (
+                values.includes(preferred)
+                    ? preferred
+                    : values[0] || ""
+            );
+    }
+
+    function setSelect(
+        select,
+        values,
+        preferred,
+    ) {
+        select.replaceChildren(
+            ...values.map(
+                value => Object.assign(
+                    document.createElement("option"),
+                    {
+                        value,
+                        textContent: value,
+                    },
+                )
+            )
+        );
+
+        select.value = values.includes(preferred)
+            ? preferred
+            : values[0] || "";
+    }
+
+    function validateInput(
+        input,
+        listId,
+    ) {
+        const values = [
+            ...$(listId).options,
+        ].map(
+            option => option.value
+        );
+
+        if (!values.includes(input.value)) {
+            input.value = values[0] || "";
+        }
+    }
+
+    function relationAnchors(name) {
+        const item = relations.get(name);
+
+        if (!item) {
+            return [];
         }
 
-        matrix = np.asarray(
+        if (item.type === "relation") {
+            return item.anchors;
+        }
+
+        return [
+            ...new Set(
+                item.members.flatMap(
+                    relationAnchors
+                )
+            ),
+        ];
+    }
+
+    function baseRelation(
+        name,
+        anchor,
+    ) {
+        const item = relations.get(name);
+
+        if (!item) {
+            return null;
+        }
+
+        if (item.type === "relation") {
+            return item.anchors.includes(anchor)
+                ? name
+                : null;
+        }
+
+        return (
+            item.members.find(
+                member => relationAnchors(
+                    member
+                ).includes(anchor)
+            )
+            || null
+        );
+    }
+
+    function mean(values) {
+        const valid = values.filter(
+            value => (
+                value !== null
+                && Number.isFinite(value)
+            )
+        );
+
+        if (!valid.length) {
+            return null;
+        }
+
+        return (
+            valid.reduce(
+                (a, b) => a + b,
+                0,
+            )
+            / valid.length
+        );
+    }
+
+    function separationArray(
+        representationName,
+        signatureName,
+        distanceName,
+        modelName,
+        viewId,
+    ) {
+        const key = [
+            representationName,
+            signatureName,
+            distanceName,
+            modelName,
+            viewId,
+        ].join("|");
+
+        if (separationCache.has(key)) {
+            return separationCache.get(key);
+        }
+
+        const modelSpec = models.get(modelName);
+        let result = null;
+
+        if (modelSpec?.type === "individual") {
+            result = (
+                separationIndex.get(key)
+                || null
+            );
+        } else if (modelSpec) {
+            const arrays = modelSpec.members.map(
+                member => separationArray(
+                    representationName,
+                    signatureName,
+                    distanceName,
+                    member,
+                    viewId,
+                )
+            );
+
+            if (arrays.every(Boolean)) {
+                result = arrays[0].map(
+                    (_, i) => mean(
+                        arrays.map(
+                            array => array[i]
+                        )
+                    )
+                );
+            }
+        }
+
+        separationCache.set(
+            key,
+            result,
+        );
+
+        return result;
+    }
+
+    function separationValue(
+        representationName,
+        signatureName,
+        distanceName,
+        modelName,
+        viewId,
+        relationName,
+        anchor,
+        agreementName,
+    ) {
+        const values = separationArray(
+            representationName,
+            signatureName,
+            distanceName,
+            modelName,
+            viewId,
+        );
+
+        if (!values) {
+            return null;
+        }
+
+        const agreementIndex = (
+            D.separation_metrics.indexOf(
+                agreementName
+            )
+        );
+
+        const relationSpec = relations.get(
+            relationName
+        );
+
+        if (
+            !relationSpec
+            || agreementIndex < 0
+        ) {
+            return null;
+        }
+
+        if (relationSpec.type === "relation") {
+            const slot = separationSlots.get(
+                relationName + "|" + anchor
+            );
+
+            if (slot === undefined) {
+                return null;
+            }
+
+            return values[
+                slot
+                * D.separation_metrics.length
+                + agreementIndex
+            ];
+        }
+
+        if (anchor === AVG) {
+            return mean(
+                relationSpec.members.map(
+                    member => separationValue(
+                        representationName,
+                        signatureName,
+                        distanceName,
+                        modelName,
+                        viewId,
+                        member,
+                        AVG,
+                        agreementName,
+                    )
+                )
+            );
+        }
+
+        const member = baseRelation(
+            relationName,
+            anchor,
+        );
+
+        return member
+            ? separationValue(
+                representationName,
+                signatureName,
+                distanceName,
+                modelName,
+                viewId,
+                member,
+                anchor,
+                agreementName,
+            )
+            : null;
+    }
+
+    function magnitudeArray(
+        representationName,
+        signatureName,
+        modelName,
+        viewId,
+    ) {
+        const key = [
+            representationName,
+            signatureName,
+            modelName,
+            viewId,
+        ].join("|");
+
+        if (magnitudeCache.has(key)) {
+            return magnitudeCache.get(key);
+        }
+
+        const modelSpec = models.get(modelName);
+        let result = null;
+
+        if (modelSpec?.type === "individual") {
+            result = (
+                magnitudeIndex.get(key)
+                || null
+            );
+        } else if (modelSpec) {
+            const arrays = modelSpec.members.map(
+                member => magnitudeArray(
+                    representationName,
+                    signatureName,
+                    member,
+                    viewId,
+                )
+            );
+
+            if (arrays.every(Boolean)) {
+                result = arrays[0].map(
+                    (_, i) => mean(
+                        arrays.map(
+                            array => array[i]
+                        )
+                    )
+                );
+            }
+        }
+
+        magnitudeCache.set(
+            key,
+            result,
+        );
+
+        return result;
+    }
+
+    function magnitudeValue(
+        representationName,
+        signatureName,
+        modelName,
+        viewId,
+        relationName,
+        anchor,
+        metricName,
+    ) {
+        const values = magnitudeArray(
+            representationName,
+            signatureName,
+            modelName,
+            viewId,
+        );
+
+        if (!values) {
+            return null;
+        }
+
+        const metricIndex = (
+            D.magnitude_metrics.indexOf(
+                metricName
+            )
+        );
+
+        if (metricIndex < 0) {
+            return null;
+        }
+
+        function datasetValue(name) {
+            const datasetIndex = (
+                D.datasets.indexOf(name)
+            );
+
+            if (datasetIndex < 0) {
+                return null;
+            }
+
+            return values[
+                datasetIndex
+                * D.magnitude_metrics.length
+                + metricIndex
+            ];
+        }
+
+        if (anchor === AVG) {
+            return mean(
+                relationAnchors(
+                    relationName
+                ).map(
+                    datasetValue
+                )
+            );
+        }
+
+        return datasetValue(anchor);
+    }
+
+    function distanceOptions() {
+        const policy = (
+            representation.value === "raw"
+                ? D.raw_metrics
+                : D.delta_metrics
+        );
+
+        return (
+            policy[signature.value]
+            || []
+        );
+    }
+
+    function modelOptions() {
+        const individual = D.models
+            .filter(
+                item => item.type === "individual"
+            )
+            .map(
+                item => item.name
+            );
+
+        const averages = D.models.filter(
+            item => item.type === "group_average"
+        );
+
+        if (representation.value === "delta") {
+            return [
+                ...individual.filter(
+                    name => (
+                        name !== D.reference_model
+                    )
+                ),
+                ...averages
+                    .filter(
+                        item => (
+                            !item.members.includes(
+                                D.reference_model
+                            )
+                        )
+                    )
+                    .map(
+                        item => item.name
+                    ),
+            ];
+        }
+
+        return [
+            ...individual,
+            ...averages.map(
+                item => item.name
+            ),
+        ];
+    }
+
+    function componentViews(name) {
+        return [
+            ...new Set(
+                D.views
+                    .filter(
+                        item => (
+                            item.component === name
+                        )
+                    )
+                    .map(
+                        item => item.view
+                    )
+            ),
+        ];
+    }
+
+    function viewAxes(
+        name,
+        viewName,
+    ) {
+        return [
+            ...new Set(
+                D.views
+                    .filter(
+                        item => (
+                            item.component === name
+                            && item.view === viewName
+                        )
+                    )
+                    .flatMap(
+                        item => (
+                            Object.keys(
+                                item.selectors
+                            )
+                        )
+                    )
+            ),
+        ];
+    }
+
+    function shortValue(value) {
+        const names = {
+            "attention_read": "attn read",
+            "attention_write": "attn write",
+            "mlp_read": "MLP read",
+            "mlp_write": "MLP write",
+            "attention": "attention",
+            "mlp": "MLP",
+            "cls<-cls": "CLS ← CLS",
+            "cls<-patch": "CLS ← patch",
+            "patch<-cls": "patch ← CLS",
+            "patch<-patch_self":
+                "patch ← patch self",
+            "patch<-patch_local":
+                "patch ← patch local",
+            "patch<-patch_medium":
+                "patch ← patch medium",
+            "patch<-patch_global":
+                "patch ← patch global",
+        };
+
+        return (
+            names[String(value)]
+            || String(value)
+        );
+    }
+
+    function columns() {
+        if (component.value === ALL) {
+            return D.components.map(
+                item => ({
+                    label: item.name,
+                    viewId:
+                        item.name + "/full",
+                    view: views.get(
+                        item.name + "/full"
+                    ),
+                })
+            );
+        }
+
+        const full = views.get(
+            component.value + "/full"
+        );
+
+        if (view.value === "full") {
+            return [
+                {
+                    label: "Full",
+                    viewId: full.view_id,
+                    view: full,
+                },
+            ];
+        }
+
+        let items = D.views.filter(
+            item => (
+                item.component
+                    === component.value
+                && item.view
+                    === view.value
+            )
+        );
+
+        const axes = viewAxes(
+            component.value,
+            view.value,
+        );
+
+        if (
+            axes.includes("layer")
+            && axes.length > 1
+        ) {
+            items = items.filter(
+                item => (
+                    Number(
+                        item.selectors.layer
+                    )
+                    === Number(layer.value)
+                )
+            );
+        }
+
+        function label(item) {
+            const selectors = (
+                Object.entries(
+                    item.selectors
+                ).filter(
+                    ([axis]) => !(
+                        axis === "layer"
+                        && axes.length > 1
+                    )
+                )
+            );
+
+            if (!selectors.length) {
+                return item.view;
+            }
+
+            return selectors
+                .map(
+                    ([axis, value]) => (
+                        axis === "layer"
+                            ? (
+                                "L"
+                                + String(value)
+                                    .padStart(
+                                        2,
+                                        "0",
+                                    )
+                            )
+                            : shortValue(value)
+                    )
+                )
+                .join(" / ");
+        }
+
+        return [
+            {
+                label: "Full",
+                viewId: full.view_id,
+                view: full,
+            },
+            ...items.map(
+                item => ({
+                    label: label(item),
+                    viewId: item.view_id,
+                    view: item,
+                })
+            ),
+        ];
+    }
+
+    function valueFor(
+        modelName,
+        anchor,
+        column,
+    ) {
+        if (analysis.value === "Separation") {
+            return separationValue(
+                representation.value,
+                signature.value,
+                distance.value,
+                modelName,
+                column.viewId,
+                relation.value,
+                anchor,
+                agreement.value,
+            );
+        }
+
+        return magnitudeValue(
+            representation.value,
+            signature.value,
+            modelName,
+            column.viewId,
+            relation.value,
+            anchor,
+            magnitudeMetric.value,
+        );
+    }
+
+    function format(value) {
+        if (
+            value === null
+            || !Number.isFinite(value)
+        ) {
+            return "—";
+        }
+
+        return Number(value).toFixed(
+            D.decimal_places
+        );
+    }
+
+    function availableModel(
+        name,
+        columns,
+        anchor,
+    ) {
+        return columns.some(
+            column => (
+                valueFor(
+                    name,
+                    anchor,
+                    column,
+                ) !== null
+            )
+        );
+    }
+
+    function updateControls() {
+        document
+            .querySelectorAll(
+                ".separation-only"
+            )
+            .forEach(
+                item => item.classList.toggle(
+                    "hidden",
+                    analysis.value
+                        !== "Separation",
+                )
+            );
+
+        document
+            .querySelectorAll(
+                ".magnitude-only"
+            )
+            .forEach(
+                item => item.classList.toggle(
+                    "hidden",
+                    analysis.value
+                        !== "Magnitude",
+                )
+            );
+
+        document
+            .querySelectorAll(
+                ".model-control"
+            )
+            .forEach(
+                item => item.classList.toggle(
+                    "hidden",
+                    compare.value
+                        !== "Datasets",
+                )
+            );
+
+        document
+            .querySelectorAll(
+                ".dataset-control"
+            )
+            .forEach(
+                item => item.classList.toggle(
+                    "hidden",
+                    compare.value
+                        !== "Models",
+                )
+            );
+
+        setChoices(
+            relation,
+            "relation-list",
+            D.relation_order,
+            relation.value
+                || D.relation_order[0],
+        );
+
+        setChoices(
+            component,
+            "component-list",
             [
-                [
-                    lookup.get(
-                        (
-                            scope,
-                            component,
-                        ),
-                        np.nan,
-                    )
-                    for component in components
-                ]
-                for scope in scopes
+                ALL,
+                ...D.components.map(
+                    item => item.name
+                ),
             ],
-            dtype=np.float64,
-        )
+            component.value || ALL,
+        );
 
-        scale = self._magnitude_scale(matrix, metric)
+        if (analysis.value === "Separation") {
+            setChoices(
+                distance,
+                "distance-list",
+                distanceOptions(),
+                distance.value,
+            );
 
-        if not components or scale is None:
-            return
-
-        fig, ax = plt.subplots(
-            figsize=(
-                15,
-                11 if len(scopes) > 15 else 9,
-            )
-        )
-
-        image = ax.imshow(
-            matrix,
-            aspect="auto",
-            **scale,
-        )
-
-        ax.set_yticks(
-            range(len(scopes)),
-            scopes,
-            fontsize=7,
-        )
-
-        ax.set_xticks(
-            range(len(components)),
-            components,
-            rotation=55,
-            ha="right",
-            fontsize=7,
-        )
-
-        ax.set_title(f"{title}\n" f"{metric.replace('_', ' ')}")
-
-        fig.colorbar(
-            image,
-            ax=ax,
-            fraction=0.025,
-            pad=0.02,
-        )
-
-        fig.tight_layout()
-
-        pdf.savefig(fig)
-        plt.close(fig)
-
-    def _plot_magnitude_depth_family_page(
-        self,
-        pdf,
-        rows,
-        family,
-        components,
-        metric,
-        title,
-        normalize=False,
-    ):
-        selected = [
-            row
-            for row in rows
-            if (
-                row["view"] == "layer"
-                and row["component"] in components
-                and row["data_scope"] in self.REPORT_GROUPS
-            )
-        ]
-
-        if not selected:
-            return
-
-        lookup = {
-            (
-                row["data_scope"],
-                row["component"],
-                int(row["layer"]),
-            ): row.get(
-                metric,
-                np.nan,
-            )
-            for row in selected
-        }
-
-        curves = {}
-        all_values = []
-
-        for group in self.REPORT_GROUPS:
-            for component in components:
-                y = np.asarray(
-                    [
-                        lookup.get(
-                            (
-                                group,
-                                component,
-                                layer,
-                            ),
-                            np.nan,
-                        )
-                        for layer in range(self.L)
-                    ],
-                    dtype=np.float64,
+            setSelect(
+                agreement,
+                D.separation_metrics,
+                agreement.value,
+            );
+        } else {
+            const metrics = (
+                D.magnitude_metrics.filter(
+                    name => (
+                        representation.value
+                            === "delta"
+                        || name
+                            !== "relative_l1_change"
+                    )
                 )
+            );
 
-                if normalize and np.isfinite(y).any():
-                    total = np.nansum(y)
-
-                    y = y / total if total > 0 else y
-
-                curves[
-                    group,
-                    component,
-                ] = y
-
-                all_values.extend(y[np.isfinite(y)])
-
-        if not all_values:
-            return
-
-        fig, axes = plt.subplots(
-            5,
-            3,
-            figsize=(18, 22),
-            squeeze=False,
-            constrained_layout=True,
-        )
-
-        legend = None
-
-        for ax, group in zip(
-            axes.flat,
-            self.REPORT_GROUPS,
-        ):
-            for component in components:
-                y = curves[
-                    group,
-                    component,
-                ]
-
-                if np.isfinite(y).any():
-                    ax.plot(
-                        range(self.L),
-                        y,
-                        marker="o",
-                        markersize=2,
-                        label=component,
-                    )
-
-            ax.set_xticks(
-                range(self.L),
-                [f"L{i:02d}" for i in range(self.L)],
-                rotation=90,
-                fontsize=6,
-            )
-
-            if normalize or metric == "effective_support_fraction":
-                ax.set_ylim(0, 1)
-            else:
-                vmax = max(all_values)
-                positive = [value for value in all_values if value > 0]
-
-                if metric == "relative_l1_change" and positive:
-                    ax.set_yscale("symlog", linthresh=min(positive))
-
-                ax.set_ylim(0, vmax * 1.05 if vmax > 0 else 1)
-
-            ax.set_title(
-                group,
-                fontsize=9,
-            )
-
-            if legend is None:
-                handles, labels = ax.get_legend_handles_labels()
-
-                if handles:
-                    legend = (
-                        handles,
-                        labels,
-                    )
-
-        for ax in axes.flat[len(self.REPORT_GROUPS) :]:
-            ax.axis("off")
-
-        if legend:
-            fig.legend(
-                *legend,
-                loc="upper right",
-                fontsize=8,
-            )
-
-        fig.suptitle(
-            f"{title}: {family}",
-            fontsize=15,
-        )
-
-        pdf.savefig(fig)
-        plt.close(fig)
-
-    def _plot_magnitude_model_overview_page(
-        self,
-        pdf,
-        rows,
-        metric,
-        title,
-    ):
-        models = [
-            model
-            for model in self.model_names
-            if any(row["model_name"] == model for row in rows)
-        ]
-
-        components = [
-            component
-            for component in self.components
-            if any(
-                row["view"] == "full" and row["component"] == component for row in rows
-            )
-        ]
-
-        lookup = {
-            (
-                row["data_scope"],
-                row["model_name"],
-                row["component"],
-            ): row.get(
-                metric,
-                np.nan,
-            )
-            for row in rows
-            if (row["view"] == "full" and row["data_scope"] in self.REPORT_GROUPS)
+            setChoices(
+                magnitudeMetric,
+                "magnitude-list",
+                metrics,
+                magnitudeMetric.value,
+            );
         }
 
-        scale = self._magnitude_scale(list(lookup.values()), metric)
+        const availableModels = modelOptions();
 
-        if not models or not components or scale is None:
-            return
+        setChoices(
+            model,
+            "model-list",
+            availableModels,
+            model.value
+                || availableModels[0],
+        );
 
-        fig, axes = plt.subplots(
-            5,
-            3,
-            figsize=(18, 22),
-            squeeze=False,
-            constrained_layout=True,
-        )
+        const datasets = [
+            ...relationAnchors(
+                relation.value
+            ),
+            AVG,
+        ];
 
-        image = None
+        setChoices(
+            dataset,
+            "dataset-list",
+            datasets,
+            dataset.value || datasets[0],
+        );
 
-        for ax, group in zip(
-            axes.flat,
-            self.REPORT_GROUPS,
-        ):
-            matrix = np.asarray(
+        if (component.value === ALL) {
+            document
+                .querySelector(
+                    ".view-control"
+                )
+                .classList.add("hidden");
+
+            document
+                .querySelector(
+                    ".layer-control"
+                )
+                .classList.add("hidden");
+
+            return;
+        }
+
+        document
+            .querySelector(
+                ".view-control"
+            )
+            .classList.remove("hidden");
+
+        const availableViews = componentViews(
+            component.value
+        );
+
+        setChoices(
+            view,
+            "view-list",
+            availableViews,
+            view.value
+                || availableViews[0],
+        );
+
+        const axes = viewAxes(
+            component.value,
+            view.value,
+        );
+
+        const layered = (
+            axes.includes("layer")
+            && axes.length > 1
+        );
+
+        document
+            .querySelector(
+                ".layer-control"
+            )
+            .classList.toggle(
+                "hidden",
+                !layered,
+            );
+
+        if (layered) {
+            setSelect(
+                layer,
                 [
-                    [
-                        lookup.get(
-                            (
-                                group,
-                                model,
-                                component,
-                            ),
-                            np.nan,
-                        )
-                        for component in components
-                    ]
-                    for model in models
-                ],
-                dtype=np.float64,
-            )
-
-            image = ax.imshow(
-                matrix,
-                aspect="auto",
-                **scale,
-            )
-
-            ax.set_yticks(
-                range(len(models)),
-                models,
-                fontsize=7,
-            )
-
-            ax.set_xticks(
-                range(len(components)),
-                components,
-                rotation=60,
-                ha="right",
-                fontsize=6,
-            )
-
-            ax.set_title(
-                group,
-                fontsize=9,
-            )
-
-        for ax in axes.flat[len(self.REPORT_GROUPS) :]:
-            ax.axis("off")
-
-        fig.colorbar(
-            image,
-            ax=axes.ravel().tolist(),
-            fraction=0.012,
-            pad=0.01,
-        )
-
-        fig.suptitle(
-            f"{title}\n" f"{metric.replace('_', ' ')}",
-            fontsize=15,
-        )
-
-        pdf.savefig(fig)
-        plt.close(fig)
-
-    def _plot_magnitude_model_depth_page(
-        self,
-        pdf,
-        rows,
-        component,
-        metric,
-        title,
-    ):
-        selected = [
-            row
-            for row in rows
-            if (
-                row["component"] == component
-                and row["view"] == "layer"
-                and row["data_scope"] in self.REPORT_GROUPS
-            )
-        ]
-
-        models = [
-            model
-            for model in self.model_names
-            if any(row["model_name"] == model for row in rows)
-        ]
-
-        lookup = {
-            (
-                row["data_scope"],
-                row["model_name"],
-                int(row["layer"]),
-            ): row.get(
-                metric,
-                np.nan,
-            )
-            for row in selected
+                    ...Array(12).keys(),
+                ].map(String),
+                layer.value || "0",
+            );
         }
+    }
 
-        scale = self._magnitude_scale(list(lookup.values()), metric)
-
-        if not models or scale is None:
-            return
-
-        fig, axes = plt.subplots(
-            5,
-            3,
-            figsize=(18, 22),
-            squeeze=False,
-            constrained_layout=True,
-        )
-
-        image = None
-
-        for ax, group in zip(
-            axes.flat,
-            self.REPORT_GROUPS,
-        ):
-            matrix = np.asarray(
-                [
-                    [
-                        lookup.get(
-                            (
-                                group,
-                                model,
-                                layer,
-                            ),
-                            np.nan,
-                        )
-                        for layer in range(self.L)
-                    ]
-                    for model in models
-                ],
-                dtype=np.float64,
-            )
-
-            image = ax.imshow(
-                matrix,
-                aspect="auto",
-                **scale,
-            )
-
-            ax.set_yticks(
-                range(len(models)),
-                models,
-                fontsize=7,
-            )
-
-            ax.set_xticks(
-                range(self.L),
-                [f"L{i:02d}" for i in range(self.L)],
-                rotation=90,
-                fontsize=6,
-            )
-
-            ax.set_title(
-                group,
-                fontsize=9,
-            )
-
-        for ax in axes.flat[len(self.REPORT_GROUPS) :]:
-            ax.axis("off")
-
-        fig.colorbar(
-            image,
-            ax=axes.ravel().tolist(),
-            fraction=0.012,
-            pad=0.01,
-        )
-
-        fig.suptitle(
-            f"{title}: {component}\n" f"{metric.replace('_', ' ')}",
-            fontsize=15,
-        )
-
-        pdf.savefig(fig)
-        plt.close(fig)
-
-    def _save_magnitude_reports(
-        self,
-        rows,
-    ):
-        if not self.create_plots:
-            return
-
-        configs = sorted(
-            {
-                (
-                    row["representation"],
-                    row["signature"],
-                )
-                for row in rows
-            }
-        )
-
-        depth_components = tuple(
-            dict.fromkeys(
-                component
-                for _, components in self.MAGNITUDE_DEPTH_FAMILIES
-                for component in components
-            )
-        )
-
-        for (
-            representation,
-            signature,
-        ) in tqdm(
-            configs,
-            desc="Saving magnitude reports",
-            disable=not self.verbose,
-        ):
-            config_rows = [
-                row
-                for row in rows
-                if (
-                    row["representation"] == representation
-                    and row["signature"] == signature
-                )
-            ]
-
-            overview_metrics = [
-                "mean_absolute_value",
-                "effective_support_fraction",
-            ]
-
-            if representation == "delta":
-                overview_metrics.append("relative_l1_change")
-
-            for model in self.model_names:
-                model_rows = [row for row in config_rows if row["model_name"] == model]
-
-                if not model_rows:
-                    continue
-
-                path = (
-                    self.save_dir
-                    / "magnitude_analysis"
-                    / "reports"
-                    / "by_model"
-                    / representation
-                    / signature
-                    / f"{model}.pdf"
-                )
-
-                path.parent.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-                with PdfPages(path) as pdf:
-                    for metric in overview_metrics:
-                        self._plot_magnitude_overview_page(
-                            pdf,
-                            model_rows,
-                            metric,
-                            self.REPORT_GROUPS,
-                            (
-                                f"{model} | "
-                                f"{representation} | "
-                                f"{signature} | "
-                                "report groups"
-                            ),
-                        )
-
-                    for metric in overview_metrics:
-                        self._plot_magnitude_overview_page(
-                            pdf,
-                            model_rows,
-                            metric,
-                            self.DATASET_NAMES,
-                            (
-                                f"{model} | "
-                                f"{representation} | "
-                                f"{signature} | "
-                                "datasets"
-                            ),
-                        )
-
-                    for (
-                        family,
-                        components,
-                    ) in self.MAGNITUDE_DEPTH_FAMILIES:
-
-                        self._plot_magnitude_depth_family_page(
-                            pdf,
-                            model_rows,
-                            family,
-                            components,
-                            "l1_norm",
-                            "Depth allocation",
-                            normalize=True,
-                        )
-
-                        self._plot_magnitude_depth_family_page(
-                            pdf,
-                            model_rows,
-                            family,
-                            components,
-                            "effective_support_fraction",
-                            "Effective support by depth",
-                        )
-
-                        if representation == "delta":
-                            self._plot_magnitude_depth_family_page(
-                                pdf,
-                                model_rows,
-                                family,
-                                components,
-                                "relative_l1_change",
-                                "Relative L1 change by depth",
-                            )
-
-            path = (
-                self.save_dir
-                / "magnitude_analysis"
-                / "reports"
-                / "model_comparison"
-                / representation
-                / f"{signature}.pdf"
-            )
-
-            path.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-            with PdfPages(path) as pdf:
-                for metric in overview_metrics:
-                    self._plot_magnitude_model_overview_page(
-                        pdf,
-                        config_rows,
-                        metric,
-                        ("Model comparison | " f"{representation} | " f"{signature}"),
+    function detailRows(
+        modelName,
+        anchor,
+        column,
+        value,
+    ) {
+        const rows = [
+            [
+                "Value",
+                value === null
+                    ? "N/A"
+                    : String(value),
+            ],
+            ["Analysis", analysis.value],
+            ["Compare", compare.value],
+            ["Signature", signature.value],
+            [
+                "Representation",
+                representation.value,
+            ],
+            ["Relation", relation.value],
+            [
+                "Dataset / aggregate",
+                anchor === AVG
+                    ? (
+                        relation.value
+                        + " average"
                     )
-
-                depth_metrics = [
-                    "l1_norm",
-                    "effective_support_fraction",
-                ]
-
-                if representation == "delta":
-                    depth_metrics.append("relative_l1_change")
-
-                for component in depth_components:
-                    for metric in depth_metrics:
-                        self._plot_magnitude_model_depth_page(
-                            pdf,
-                            config_rows,
-                            component,
-                            metric,
-                            (
-                                "Model comparison | "
-                                f"{representation} | "
-                                f"{signature}"
-                            ),
-                        )
-
-    def _save_separation_reports(
-        self,
-        rows,
-    ):
-        if not self.create_plots:
-            return
-
-        real_rows = [row for row in rows if row["model_name"] in self.model_names]
-
-        configs = sorted(
-            {
+                    : anchor,
+            ],
+            ["Model", modelName],
+            ["Family", column.view.family],
+            [
+                "Component",
+                column.view.component,
+            ],
+            ["View", column.view.view],
+            [
+                "Selectors",
                 (
-                    row["representation"],
-                    row["distance_metric"],
-                    row["signature"],
-                )
-                for row in real_rows
-            }
-        )
-
-        for (
-            representation,
-            metric,
-            signature,
-        ) in tqdm(
-            configs,
-            desc="Saving interpretability reports",
-            disable=not self.verbose,
-        ):
-            config_rows = [
-                row
-                for row in real_rows
-                if (
-                    row["representation"] == representation
-                    and row["distance_metric"] == metric
-                    and row["signature"] == signature
-                )
-            ]
-
-            for model in self.model_names:
-                model_rows = [row for row in config_rows if row["model_name"] == model]
-
-                if not model_rows:
-                    continue
-
-                path = (
-                    self.save_dir
-                    / "separation_analysis"
-                    / "reports"
-                    / "by_model"
-                    / representation
-                    / metric
-                    / signature
-                    / f"{model}.pdf"
-                )
-
-                path.parent.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-                with PdfPages(path) as pdf:
-                    for agreement in self.AGREEMENT_METRICS:
-                        self._plot_overview_page(
-                            pdf,
-                            model_rows,
-                            agreement,
-                            (
-                                f"{model} | "
-                                f"{representation} | "
-                                f"{signature} | "
-                                f"{metric}"
-                            ),
+                    Object.entries(
+                        column.view.selectors
+                    )
+                    .map(
+                        ([key, item]) => (
+                            `${key}=${item}`
                         )
+                    )
+                    .join(", ")
+                    || "none"
+                ),
+            ],
+            [
+                "Vector axes",
+                column.view.vector_axes.join(
+                    " × "
+                ),
+            ],
+            [
+                "Vector dimension",
+                column.view.vector_dim,
+            ],
+        ];
 
-                        for spec in self.DEPTH_REPORTS:
-                            self._plot_native_page(
-                                pdf,
-                                model_rows,
-                                spec,
-                                agreement,
-                            )
+        if (analysis.value === "Separation") {
+            rows.splice(
+                6,
+                0,
+                [
+                    "Distance",
+                    distance.value,
+                ],
+                [
+                    "Agreement",
+                    agreement.value,
+                ],
+            );
 
-            path = (
-                self.save_dir
-                / "separation_analysis"
-                / "reports"
-                / "model_comparison"
-                / representation
-                / metric
-                / f"{signature}.pdf"
-            )
+            let relationSpec = relations.get(
+                relation.value
+            );
 
-            path.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
+            if (
+                relationSpec?.type
+                    === "metagroup"
+                && anchor !== AVG
+            ) {
+                relationSpec = relations.get(
+                    baseRelation(
+                        relation.value,
+                        anchor,
+                    )
+                );
+            }
 
-            with PdfPages(path) as pdf:
-                for agreement in self.AGREEMENT_METRICS:
-                    self._plot_model_overview_page(
-                        pdf,
-                        config_rows,
-                        agreement,
-                        (
-                            "Model comparison | "
-                            f"{representation} | "
-                            f"{signature} | "
-                            f"{metric}"
+            if (
+                relationSpec?.type
+                    === "relation"
+            ) {
+                rows.push(
+                    [
+                        "Positive set",
+                        relationSpec.positives.join(
+                            ", "
                         ),
-                    )
+                    ],
+                    [
+                        "Negative set",
+                        relationSpec.negatives.join(
+                            ", "
+                        ),
+                    ],
+                );
+            } else if (
+                relationSpec?.type
+                    === "metagroup"
+            ) {
+                rows.push(
+                    [
+                        "Member relations",
+                        relationSpec.members.join(
+                            ", "
+                        ),
+                    ]
+                );
+            }
+        } else {
+            rows.splice(
+                6,
+                0,
+                [
+                    "Magnitude metric",
+                    magnitudeMetric.value,
+                ],
+            );
+        }
 
-                    for component in dict.fromkeys(
-                        spec[0] for spec in self.DEPTH_REPORTS
-                    ):
-                        self._plot_model_depth_page(
-                            pdf,
-                            config_rows,
-                            component,
-                            agreement,
+        const modelSpec = models.get(
+            modelName
+        );
+
+        if (
+            modelSpec?.type
+                === "group_average"
+        ) {
+            rows.push(
+                [
+                    "Model-group members",
+                    modelSpec.members.join(
+                        ", "
+                    ),
+                ]
+            );
+        }
+
+        return rows;
+    }
+
+    function openDetails(
+        modelName,
+        anchor,
+        column,
+        value,
+    ) {
+        const details = $("details");
+
+        details.replaceChildren();
+
+        for (
+            const [key, item]
+            of detailRows(
+                modelName,
+                anchor,
+                column,
+                value,
+            )
+        ) {
+            const dt = document.createElement(
+                "dt"
+            );
+
+            const dd = document.createElement(
+                "dd"
+            );
+
+            dt.textContent = key;
+            dd.textContent = item;
+
+            details.append(
+                dt,
+                dd,
+            );
+        }
+
+        $("dialog").showModal();
+    }
+
+    function render() {
+        updateControls();
+
+        const currentColumns = columns();
+        let rows;
+
+        if (compare.value === "Datasets") {
+            rows = [
+                ...relationAnchors(
+                    relation.value
+                ),
+                AVG,
+            ].map(
+                anchor => ({
+                    label: (
+                        anchor === AVG
+                            ? (
+                                relation.value
+                                + " average"
+                            )
+                            : anchor
+                    ),
+                    model: model.value,
+                    anchor,
+                    average: anchor === AVG,
+                })
+            );
+        } else {
+            const anchor = dataset.value;
+
+            rows = modelOptions()
+                .filter(
+                    name => availableModel(
+                        name,
+                        currentColumns,
+                        anchor,
+                    )
+                )
+                .map(
+                    name => ({
+                        label: name,
+                        model: name,
+                        anchor,
+                        average: (
+                            models.get(name)?.type
+                            === "group_average"
+                        ),
+                    })
+                );
+        }
+
+        const table = $("matrix");
+
+        table.replaceChildren();
+
+        const thead = document.createElement(
+            "thead"
+        );
+
+        const header = document.createElement(
+            "tr"
+        );
+
+        const first = document.createElement(
+            "th"
+        );
+
+        first.textContent = (
+            compare.value === "Datasets"
+                ? "Dataset"
+                : "Model"
+        );
+
+        header.append(first);
+
+        for (const column of currentColumns) {
+            const th = document.createElement(
+                "th"
+            );
+
+            th.textContent = column.label;
+            th.title = column.view.view_id;
+
+            header.append(th);
+        }
+
+        thead.append(header);
+        table.append(thead);
+
+        const tbody = document.createElement(
+            "tbody"
+        );
+
+        for (const row of rows) {
+            const tr = document.createElement(
+                "tr"
+            );
+
+            if (row.average) {
+                tr.classList.add("average");
+            }
+
+            const name = document.createElement(
+                "td"
+            );
+
+            name.textContent = row.label;
+            tr.append(name);
+
+            for (
+                const column
+                of currentColumns
+            ) {
+                const value = valueFor(
+                    row.model,
+                    row.anchor,
+                    column,
+                );
+
+                const td = document.createElement(
+                    "td"
+                );
+
+                td.textContent = format(value);
+
+                td.className = (
+                    value === null
+                        ? "na"
+                        : "value"
+                );
+
+                if (value !== null) {
+                    td.tabIndex = 0;
+
+                    td.addEventListener(
+                        "click",
+                        () => openDetails(
+                            row.model,
+                            row.anchor,
+                            column,
+                            value,
+                        ),
+                    );
+
+                    td.addEventListener(
+                        "keydown",
+                        event => {
+                            if (
+                                event.key
+                                === "Enter"
+                            ) {
+                                openDetails(
+                                    row.model,
+                                    row.anchor,
+                                    column,
+                                    value,
+                                );
+                            }
+                        },
+                    );
+                }
+
+                tr.append(td);
+            }
+
+            tbody.append(tr);
+        }
+
+        table.append(tbody);
+
+        $("status").textContent = (
+            `${rows.length} rows × `
+            + `${currentColumns.length} columns`
+            + ` · values shown to `
+            + `${D.decimal_places} decimals; `
+            + `full precision is retained `
+            + `in the embedded data.`
+        );
+    }
+
+    setSelect(
+        agreement,
+        D.separation_metrics,
+        D.separation_metrics[0],
+    );
+
+    setSelect(
+        layer,
+        [
+            ...Array(12).keys(),
+        ].map(String),
+        "0",
+    );
+
+    setChoices(
+        relation,
+        "relation-list",
+        D.relation_order,
+        D.relation_order[0],
+    );
+
+    setChoices(
+        component,
+        "component-list",
+        [
+            ALL,
+            ...D.components.map(
+                item => item.name
+            ),
+        ],
+        ALL,
+    );
+
+    setChoices(
+        model,
+        "model-list",
+        modelOptions(),
+        modelOptions()[0],
+    );
+
+    setChoices(
+        dataset,
+        "dataset-list",
+        [
+            ...relationAnchors(
+                relation.value
+            ),
+            AVG,
+        ],
+        relationAnchors(
+            relation.value
+        )[0],
+    );
+
+    setChoices(
+        distance,
+        "distance-list",
+        distanceOptions(),
+        distanceOptions()[0],
+    );
+
+    setChoices(
+        magnitudeMetric,
+        "magnitude-list",
+        D.magnitude_metrics,
+        D.magnitude_metrics[0],
+    );
+
+    for (
+        const element
+        of [
+            analysis,
+            compare,
+            signature,
+            representation,
+            distance,
+            agreement,
+            magnitudeMetric,
+            relation,
+            model,
+            dataset,
+            component,
+            view,
+            layer,
+        ]
+    ) {
+        element.addEventListener(
+            "change",
+            () => {
+                if (
+                    element.tagName === "INPUT"
+                ) {
+                    const list = (
+                        element.getAttribute(
+                            "list"
                         )
+                    );
+
+                    if (list) {
+                        validateInput(
+                            element,
+                            list,
+                        );
+                    }
+                }
+
+                render();
+            },
+        );
+    }
+
+    $("closeDialog").onclick = () => (
+        $("dialog").close()
+    );
+
+    $("dialog").addEventListener(
+        "click",
+        event => {
+            if (
+                event.target
+                === $("dialog")
+            ) {
+                $("dialog").close();
+            }
+        },
+    );
+
+    $("loading").classList.add("hidden");
+    $("app").classList.remove("hidden");
+
+    render();
+})().catch(
+    error => {
+        console.error(error);
+
+        document.getElementById(
+            "loading"
+        ).textContent = (
+            "Failed to load analysis: "
+            + error.message
+        );
+    }
+);
+</script>
+</body>
+</html>"""
+
+    def _save_html(
+        self,
+        separation,
+        magnitude,
+    ):
+        payload = json.dumps(
+            self._payload(
+                separation,
+                magnitude,
+            ),
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+
+        encoded = base64.b64encode(
+            gzip.compress(
+                payload,
+                compresslevel=9,
+            )
+        ).decode("ascii")
+
+        html = self._html_template().replace(
+            "__PAYLOAD__",
+            encoded,
+        )
+
+        self.save_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        path = self.save_dir / "analysis.html"
+
+        path.write_text(
+            html,
+            encoding="utf-8",
+        )
+
+        return path
 
     def analyze(self):
         self._log("Starting VTAB functional-semantic analysis.")
@@ -3248,25 +3062,25 @@ class VTABFunctionalSemanticsAnalyzer:
             "delta": self._make_delta_signatures(raw),
         }
 
-        magnitude = self._compute_magnitude(
-            representations,
-            raw,
-        )
-
         separation = self._compute_separation(
             representations,
             raw,
         )
 
-        self._save_metadata()
-        self._save_magnitude(magnitude)
-        self._save_separation(separation)
-        self._save_magnitude_reports(magnitude)
-        self._save_separation_reports(separation)
+        magnitude = self._compute_magnitude(
+            representations,
+            raw,
+        )
 
-        self._log("Analysis complete. " f"Results saved to: " f"{self.save_dir}")
+        path = self._save_html(
+            separation,
+            magnitude,
+        )
+
+        self._log(f"Analysis complete. " f"Results saved to: {path}")
 
         return {
+            "html": path,
             "magnitude": magnitude,
             "separation": separation,
         }

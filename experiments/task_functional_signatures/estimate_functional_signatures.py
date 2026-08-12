@@ -11,7 +11,7 @@ _COMMON_ARGS = {
     "verbose": True,
 }
 
-_METHODS = ("vpt", "linear_probe")
+_METHODS = ("full_ft", "vpt", "linear_probe")
 
 
 def build_args(
