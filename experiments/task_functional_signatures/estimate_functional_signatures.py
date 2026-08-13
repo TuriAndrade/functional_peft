@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import List, Dict, Tuple
 
@@ -19,6 +20,7 @@ def build_args(
     ckpt_name: str = "model.pt",
 ) -> Tuple[List[Dict], str, str]:
     experiments_dir = Path(__file__).resolve().parent.parent
+    functional_signatures_dir = Path(os.environ["FUNCTIONAL_SIGNATURES_DIR"])
 
     args = []
 
@@ -35,6 +37,10 @@ def build_args(
                 for p in eval_dir.iterdir()
                 if p.is_dir() and p.name.endswith(f"_{_RUN_SEED}")
             ):
+                save_dir = functional_signatures_dir / model_path.relative_to(
+                    experiments_dir
+                )
+
                 args.append(
                     {
                         **_COMMON_ARGS,
@@ -42,7 +48,7 @@ def build_args(
                         "backbone_name": backbone_name,
                         "model_path": str(model_path),
                         "ckpt_name": ckpt_name,
-                        "save_dir": str(model_path),
+                        "save_dir": str(save_dir),
                         "save_name": None,
                     }
                 )
