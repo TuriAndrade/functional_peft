@@ -246,8 +246,8 @@ class ViTB16VPT(nn.Module):
         Create functional gates, participation accumulators, fixed route masks,
         output-space metrics, and an instrumented ViT forward pass.
 
-        Every gate is initialized to one, so the patched forward is identical
-        to the original forward at the functional evaluation point.
+        Every gate is initialized to one, so the patched forward is exactly
+        identical to the original forward at the functional evaluation point.
         """
         if hasattr(self, "functional_gates"):
             return
@@ -282,15 +282,21 @@ class ViTB16VPT(nn.Module):
                 #   1 = patches
                 #
                 # Scales the normalized pretrained residual-stream channels
-                # consumed by each sublayer. Prompt-token channels are excluded
-                # and pass unchanged.
+                # consumed by each sublayer. This measures which channels of
+                # the fixed pretrained representation each computation uses.
+                # Prompt-token channels pass unchanged.
                 "sublayer_input_channel": gate((n_layers, 2, 2, embed_dim)),
                 # [layer, head, route]
                 #
-                # QK/selection-side routing. Each gate scales the pre-softmax
-                # attention logits belonging to one backbone-to-backbone route,
-                # measuring the functional importance of where a head selects
-                # information from.
+                # Attention-selection gate. For a route r, multiplying its
+                # unnormalized attention odds by g_r is implemented as
+                #
+                #   softmax(Z + log(g_r) M_r).
+                #
+                # Thus the gate changes the relative probability allocated to
+                # that route while preserving softmax normalization. Unlike
+                # multiplying raw logits, this intervention is invariant to
+                # arbitrary row-wise shifts of the attention logits.
                 #
                 # route:
                 #   0 = CLS   <- CLS
@@ -303,12 +309,14 @@ class ViTB16VPT(nn.Module):
                 "attention_head_selection_route": gate((n_layers, n_heads, 7)),
                 # [layer, head, route]
                 #
-                # OV/transport-side routing. Each gate scales the contribution
-                # carried through one backbone-to-backbone route after the
-                # attention distribution is formed, measuring the functional
-                # importance of the content transported through that route.
+                # Attention-transport gate. After attention probabilities have
+                # been formed, scales the A_ij V_j contribution carried through
+                # each route before the head output projection W_O.
                 #
-                # Routes use the same seven source/destination categories above.
+                # This measures the functional importance of the information
+                # actually transported through each source/destination route.
+                #
+                # Routes use the same seven categories defined above.
                 "attention_head_transport_route": gate((n_layers, n_heads, 7)),
                 # [layer, processed token group, hidden MLP neuron]
                 #
@@ -316,9 +324,9 @@ class ViTB16VPT(nn.Module):
                 #   0 = CLS
                 #   1 = patches
                 #
-                # Scales each post-activation hidden MLP neuron before W_2,
-                # measuring the functional importance of each frozen nonlinear
-                # MLP computation for CLS and patch tokens separately.
+                # Scales each post-activation hidden MLP neuron before W_2.
+                # This measures the importance of each nonlinear computation in
+                # the frozen MLP basis.
                 "mlp_neuron": gate((n_layers, 2, mlp_dim)),
                 # [layer, sublayer, token group]
                 #
@@ -336,20 +344,20 @@ class ViTB16VPT(nn.Module):
                 "sublayer_token_update": gate((n_layers, 2, 2)),
                 # [residual channel]
                 #
-                # Scales each channel of the final normalized CLS representation
-                # immediately before the task classifier.
+                # Scales each channel of the final normalized CLS
+                # representation immediately before the task classifier.
                 "final_cls_readout_channel": gate((embed_dim,)),
                 # [layer, head, destination group]
                 #
-                # VPT-specific QK/selection routes whose source is any prompt
-                # token and whose destination is:
+                # VPT-specific attention-selection routes whose source is any
+                # prompt token and whose destination is:
                 #   0 = CLS
                 #   1 = patches
                 "prompt_attention_head_selection_route": gate((n_layers, n_heads, 2)),
                 # [layer, head, destination group]
                 #
-                # VPT-specific OV/transport routes whose source is any prompt
-                # token and whose destination is:
+                # VPT-specific attention-transport routes whose source is any
+                # prompt token and whose destination is:
                 #   0 = CLS
                 #   1 = patches
                 "prompt_attention_head_transport_route": gate((n_layers, n_heads, 2)),
@@ -363,9 +371,8 @@ class ViTB16VPT(nn.Module):
         # variables used by C and G.
         self.coupling_gates = gate((n_layers, n_prompts))
 
-        # Coarse components are exact tied-gate derivatives constructed from
-        # the fine per-sample functional scores. Their participation values are
-        # recorded directly at the corresponding computation.
+        # Coarse component scores are exact tied-gate derivatives constructed
+        # from the fine per-sample scores.
         self._functional_shapes = {
             **{
                 name: tuple(value.shape)
@@ -373,34 +380,32 @@ class ViTB16VPT(nn.Module):
             },
             # [layer, sublayer]
             #
-            # Complete attention/MLP residual update, aggregated over CLS and
+            # Complete attention/MLP residual update aggregated over CLS and
             # patch destinations.
             "sublayer_update": (n_layers, 2),
             # [layer, route]
             #
-            # Head-aggregated QK/selection importance for each of the seven
-            # backbone-to-backbone attention routes.
+            # Head-aggregated attention-selection organization.
             "attention_selection_route": (n_layers, 7),
             # [layer, route]
             #
-            # Head-aggregated OV/transport importance for each of the seven
-            # backbone-to-backbone attention routes.
+            # Head-aggregated attention-transport organization.
             "attention_transport_route": (n_layers, 7),
             # [layer, head]
             #
-            # Complete output of each attention head delivered to backbone
-            # destinations. Its score includes both backbone-source and
-            # prompt-source transport contributions.
+            # Complete output contribution of each attention head to backbone
+            # destinations. Includes both backbone-source and prompt-source
+            # transport.
             "attention_head_output": (n_layers, n_heads),
             # [layer, destination group]
             #
-            # Head-aggregated prompt->backbone QK/selection routes:
+            # Head-aggregated prompt -> backbone selection:
             #   0 = prompt -> CLS
             #   1 = prompt -> patches
             "prompt_attention_selection_route": (n_layers, 2),
             # [layer, destination group]
             #
-            # Head-aggregated prompt->backbone OV/transport routes:
+            # Head-aggregated prompt -> backbone transport:
             #   0 = prompt -> CLS
             #   1 = prompt -> patches
             "prompt_attention_transport_route": (n_layers, 2),
@@ -447,10 +452,16 @@ class ViTB16VPT(nn.Module):
         spatial_bins = torch.bucketize(distances, thresholds) + 1
         spatial_bins.fill_diagonal_(0)
 
-        # Nine mutually exclusive source/destination routes ending at backbone
-        # tokens. Routes 0:7 are backbone-to-backbone; routes 7:9 are
-        # prompt-to-backbone. Prompt-destination rows are intentionally outside
-        # this functional-route decomposition.
+        # Nine mutually exclusive routes ending at backbone tokens.
+        #
+        # Routes 0:7:
+        #   backbone -> backbone
+        #
+        # Routes 7:9:
+        #   prompt -> backbone
+        #
+        # Prompt-destination rows are intentionally not part of the backbone
+        # functional-route decomposition.
         route_masks = reference.new_zeros(
             9,
             n_tokens,
@@ -494,17 +505,21 @@ class ViTB16VPT(nn.Module):
                         (head_idx + 1) * head_dim,
                     )
 
-                    # Columns of W_O corresponding to this head: [D, K].
+                    # W_O columns associated with this head: [D, K].
                     head_weight = output_weight[:, head_slice]
 
-                    # For one head-context vector c:
-                    # ||W_O,h c||² = cᵀ(W_O,hᵀ W_O,h)c.
+                    # For head context c:
+                    #
+                    #   ||W_O,h c||²
+                    #       = cᵀ (W_O,hᵀ W_O,h) c.
                     layer_metrics.append(head_weight.T @ head_weight)
 
                 head_metrics.append(torch.stack(layer_metrics))
 
-                # Output-space squared norm associated with each hidden MLP
-                # neuron: ||W_2[:, j]||².
+                # For hidden MLP neuron j:
+                #
+                #   ||a_j W_2[:, j]||²
+                #       = a_j² ||W_2[:, j]||².
                 mlp_neuron_norms.append(block.ffn.fc2.weight.square().sum(dim=0))
 
         self._functional_head_metrics = torch.stack(head_metrics)
@@ -521,7 +536,8 @@ class ViTB16VPT(nn.Module):
 
                 def record(name, index, value):
                     """
-                    value has shape [batch, *component_shape_at_index].
+                    value: [batch, *component_shape_at_index]
+
                     Participation is accumulated over the current batch.
                     """
                     self.functional_participation[name][index].copy_(
@@ -566,7 +582,7 @@ class ViTB16VPT(nn.Module):
 
                 def apply_token_groups(value, group_gate):
                     """
-                    Apply one scalar gate to the complete CLS/patch update.
+                    Apply one scalar gate to each CLS/patch update.
 
                     value:      [B, T, C]
                     group_gate: [2]
@@ -584,7 +600,7 @@ class ViTB16VPT(nn.Module):
 
                 def projected_head_energy(context):
                     """
-                    Squared output-space energy of each head after its W_O slice.
+                    Output-space energy of each individual head.
 
                     context: [B, H, T, K]
                     return:  [B, H]
@@ -616,8 +632,8 @@ class ViTB16VPT(nn.Module):
                     gates["sublayer_input_channel"][layer_idx, 0],
                 )
 
-                # Prompt coupling is defined on the complete prompt state
-                # entering the frozen Q/K/V projections.
+                # Prompt coupling acts on the complete prompt state entering
+                # the frozen Q/K/V projections.
                 if n_prompts:
                     value = torch.cat(
                         (
@@ -636,38 +652,27 @@ class ViTB16VPT(nn.Module):
                 attention_scores = query @ key.transpose(-1, -2) / math.sqrt(head_dim)
 
                 # ==========================================================
-                # Attention selection routes (QK side)
+                # Attention selection
                 # ==========================================================
-
-                selection_route_energy = torch.einsum(
-                    "bhij,rij->bhr",
-                    attention_scores.detach().square(),
-                    self._functional_route_masks,
-                )
-
-                record(
-                    "attention_head_selection_route",
-                    layer_idx,
-                    selection_route_energy[:, :, :7],
-                )
-
-                record(
-                    "prompt_attention_head_selection_route",
-                    layer_idx,
-                    selection_route_energy[:, :, 7:],
-                )
-
-                record(
-                    "attention_selection_route",
-                    layer_idx,
-                    selection_route_energy[:, :, :7].sum(dim=1),
-                )
-
-                record(
-                    "prompt_attention_selection_route",
-                    layer_idx,
-                    selection_route_energy[:, :, 7:].sum(dim=1),
-                )
+                #
+                # Let Z_ij be the original attention logit and M_r,ij the mask
+                # for route r. The gated attention distribution is
+                #
+                #   A_ij(g)
+                #     = softmax_j(
+                #           Z_ij
+                #           + sum_r M_r,ij log(g_r)
+                #       ).
+                #
+                # Equivalently, before normalization:
+                #
+                #   exp(Z_ij) -> g_r exp(Z_ij)
+                #
+                # for edges belonging to route r.
+                #
+                # This scales route odds rather than raw logits and is therefore
+                # invariant to arbitrary row-wise shifts Z_i -> Z_i + c.
+                # ==========================================================
 
                 selection_route_gates = torch.cat(
                     (
@@ -677,29 +682,90 @@ class ViTB16VPT(nn.Module):
                     dim=-1,
                 )
 
+                # Functional signatures are evaluated at g = 1. clamp_min also
+                # makes finite gate attenuation toward zero numerically safe.
+                selection_log_gates = torch.log(
+                    selection_route_gates.clamp_min(
+                        torch.finfo(selection_route_gates.dtype).tiny
+                    )
+                )
+
                 attention_scores = (
                     attention_scores
-                    * (
-                        1
-                        + torch.einsum(
-                            "hr,rij->hij",
-                            selection_route_gates - 1,
-                            self._functional_route_masks,
-                        )
+                    + torch.einsum(
+                        "hr,rij->hij",
+                        selection_log_gates,
+                        self._functional_route_masks,
                     )[None]
                 )
 
-                attention_probs = attention.softmax(attention_scores)
-                weights = attention_probs if attention.vis else None
-                attention_probs = attention.attn_dropout(attention_probs)
+                attention_weights = attention.softmax(attention_scores)
+
+                # Selection participation is the probability mass allocated to
+                # each route by the attention distribution:
+                #
+                #   P_r(x) = sum_(i,j in r) A_ij.
+                #
+                # This directly measures how much of the head's attention
+                # allocation participates in the route whose relative odds are
+                # perturbed by the corresponding selection gate.
+                selection_route_mass = torch.einsum(
+                    "bhij,rij->bhr",
+                    attention_weights.detach(),
+                    self._functional_route_masks,
+                )
+
+                record(
+                    "attention_head_selection_route",
+                    layer_idx,
+                    selection_route_mass[:, :, :7],
+                )
+
+                record(
+                    "prompt_attention_head_selection_route",
+                    layer_idx,
+                    selection_route_mass[:, :, 7:],
+                )
+
+                record(
+                    "attention_selection_route",
+                    layer_idx,
+                    selection_route_mass[:, :, :7].sum(dim=1),
+                )
+
+                record(
+                    "prompt_attention_selection_route",
+                    layer_idx,
+                    selection_route_mass[:, :, 7:].sum(dim=1),
+                )
+
+                weights = attention_weights if attention.vis else None
+
+                attention_probs = attention.attn_dropout(attention_weights)
 
                 # ==========================================================
-                # Attention transport-route participation (OV side)
+                # Attention transport-route participation
+                # ==========================================================
+                #
+                # For route r:
+                #
+                #   c_h,r,i
+                #     = sum_j M_r,ij A_h,ij V_h,j.
+                #
+                # Fine participation measures
+                #
+                #   ||W_O,h c_h,r||².
+                #
+                # Coarse head-aggregated participation instead measures
+                #
+                #   ||sum_h W_O,h c_h,r||²,
+                #
+                # which correctly retains cross-head terms for the tied route
+                # gate.
                 # ==========================================================
 
                 with torch.no_grad():
-                    # Route-specific context before W_O:
-                    # [B, H, route, destination token, K].
+                    # [B, H, R, destination token, K]
                     route_context = torch.einsum(
                         "bhij,rij,bhjk->bhrik",
                         attention_probs.detach(),
@@ -707,7 +773,7 @@ class ViTB16VPT(nn.Module):
                         attention_value.detach(),
                     )
 
-                    # Route energy after the corresponding W_O head slice.
+                    # Fine per-head route energy.
                     transport_route_energy = torch.einsum(
                         "bhrik,hkl,bhril->bhr",
                         route_context,
@@ -727,20 +793,50 @@ class ViTB16VPT(nn.Module):
                         transport_route_energy[:, :, 7:],
                     )
 
+                    # Aggregate all heads in output space before computing
+                    # energy. This is the correct participation for a coarse
+                    # route gate tied across heads.
+                    route_context_concat = route_context.permute(0, 2, 3, 1, 4).reshape(
+                        route_context.shape[0],
+                        route_context.shape[2],
+                        n_tokens,
+                        n_heads * head_dim,
+                    )
+
+                    route_output = F.linear(
+                        route_context_concat,
+                        attention.out.weight,
+                        bias=None,
+                    )
+
+                    coarse_transport_energy = route_output.square().sum(dim=(2, 3))
+
                     record(
                         "attention_transport_route",
                         layer_idx,
-                        transport_route_energy[:, :, :7].sum(dim=1),
+                        coarse_transport_energy[:, :7],
                     )
 
                     record(
                         "prompt_attention_transport_route",
                         layer_idx,
-                        transport_route_energy[:, :, 7:].sum(dim=1),
+                        coarse_transport_energy[:, 7:],
                     )
 
                 # ==========================================================
-                # Attention transport routes (OV side)
+                # Attention transport intervention
+                # ==========================================================
+                #
+                # Unlike selection, transport does not renormalize attention.
+                # It directly scales the contribution carried through each
+                # edge:
+                #
+                #   A_ij V_j
+                #       -> g_r A_ij V_j.
+                #
+                # Thus selection asks where probability is allocated, whereas
+                # transport asks how consequential the content carried through
+                # that route is.
                 # ==========================================================
 
                 transport_route_gates = torch.cat(
@@ -760,8 +856,8 @@ class ViTB16VPT(nn.Module):
                 context = (attention_probs * transport_scale[None]) @ attention_value
 
                 # Complete head context delivered to backbone destinations.
-                # Because the context already sums over all sources, this
-                # participation includes prompt-source contributions.
+                # Since the context already sums over all sources, this
+                # includes prompt-source transport.
                 backbone_context = torch.cat(
                     (
                         context[:, :, :1],
@@ -831,8 +927,9 @@ class ViTB16VPT(nn.Module):
                     feed_forward.act_fn(feed_forward.fc1(value))
                 )
 
-                # Each hidden-neuron activation contributes through one column
-                # of W_2; this measures its output-space energy.
+                # Output-space participation of hidden neuron j:
+                #
+                #   a_j² ||W_2[:, j]||².
                 neuron_energy = (
                     grouped_channel_energy(value)
                     * self._functional_mlp_neuron_norms[layer_idx][None, None]
@@ -886,8 +983,8 @@ class ViTB16VPT(nn.Module):
                 block,
             )
 
-        # Apply the final channel gate after the original encoder LayerNorm,
-        # exactly where the task classifier consumes the CLS representation.
+        # Final CLS channel gate after the original encoder LayerNorm, exactly
+        # where the task classifier consumes the representation.
         original_norm_forward = self.backbone.norm.forward
 
         def norm_forward(norm, hidden):
@@ -900,10 +997,7 @@ class ViTB16VPT(nn.Module):
             return torch.cat(
                 (
                     encoded[:, :1]
-                    * self.functional_gates["final_cls_readout_channel"][
-                        None,
-                        None,
-                    ],
+                    * self.functional_gates["final_cls_readout_channel"][None, None],
                     encoded[:, 1:],
                 ),
                 dim=1,
@@ -944,23 +1038,30 @@ class ViTB16VPT(nn.Module):
         """
         Estimate:
 
-        P: shared functional participation
+        P:
+            Component-specific functional participation.
+
+            For selection routes, P is the attention probability mass assigned
+            to the route.
+
+            For channel, neuron, transport, head-output, and residual-update
+            components, P is the corresponding activation/output energy.
 
         Model distribution y ~ p(y | x):
-        F_m: diagonal model Fisher
-        S_m: F_m / P
-        C_m: prompt-component score correlation
-        G_layer_m: RMS C_m across prompts at each prompt layer
-        G_global_m: RMS C_m across all prompt layers and prompts
+            F_m: diagonal model Fisher
+            S_m: F_m / P
+            C_m: prompt-component score correlation
+            G_layer_m: RMS C_m across prompts at each prompt layer
+            G_global_m: RMS C_m across all prompt layers and prompts
 
         Empirical distribution y = y*:
-        U_e: mean functional score
-        F_e: empirical squared-score second moment
-        S_e: F_e / P
-        B_e: U_e^2 / F_e
-        C_e: centered prompt-component score correlation
-        G_layer_e: RMS C_e across prompts at each prompt layer
-        G_global_e: RMS C_e across all prompt layers and prompts
+            U_e: mean functional score
+            F_e: empirical squared-score second moment
+            S_e: F_e / P
+            B_e: U_e^2 / F_e
+            C_e: centered prompt-component score correlation
+            G_layer_e: RMS C_e across prompts at each prompt layer
+            G_global_e: RMS C_e across all prompt layers and prompts
         """
         if mc_samples < 1:
             raise ValueError("mc_samples must be positive")
@@ -990,19 +1091,40 @@ class ViTB16VPT(nn.Module):
         if use_prompts:
             coupling_size = n_layers * n_prompts
 
-            cross_sum_m = gates[0].new_zeros(total_size, coupling_size)
+            cross_sum_m = gates[0].new_zeros(
+                total_size,
+                coupling_size,
+            )
             coupling_square_sum_m = gates[0].new_zeros(coupling_size)
 
-            cross_sum_e = gates[0].new_zeros(total_size, coupling_size)
+            cross_sum_e = gates[0].new_zeros(
+                total_size,
+                coupling_size,
+            )
             coupling_score_sum_e = gates[0].new_zeros(coupling_size)
             coupling_square_sum_e = gates[0].new_zeros(coupling_size)
 
         params = (*gates, self.coupling_gates) if use_prompts else gates
 
         def build_scores(raw_scores):
-            scores = dict(zip(gate_names, raw_scores[: len(gates)]))
+            scores = dict(
+                zip(
+                    gate_names,
+                    raw_scores[: len(gates)],
+                )
+            )
 
             # Exact tied-gate coarse scores.
+            #
+            # If several fine gates g_j are tied to one coarse gate a,
+            #
+            #   g_j = a,
+            #
+            # then at a = 1:
+            #
+            #   d log p / da
+            #       = sum_j d log p / dg_j.
+
             scores["sublayer_update"] = scores["sublayer_token_update"].sum(dim=-1)
 
             scores["attention_selection_route"] = scores[
@@ -1013,6 +1135,8 @@ class ViTB16VPT(nn.Module):
                 "attention_head_transport_route"
             ].sum(dim=2)
 
+            # Whole-head output includes every source route ending at backbone
+            # destinations, including prompt -> backbone transport.
             scores["attention_head_output"] = scores[
                 "attention_head_transport_route"
             ].sum(dim=-1) + scores["prompt_attention_head_transport_route"].sum(dim=-1)
@@ -1041,7 +1165,14 @@ class ViTB16VPT(nn.Module):
         sample_count_m = 0
         sample_count_e = 0
 
-        iterator = tqdm(loader, desc="Functional signatures") if verbose else loader
+        iterator = (
+            tqdm(
+                loader,
+                desc="Functional signatures",
+            )
+            if verbose
+            else loader
+        )
 
         for batch in iterator:
             x = batch[0].to(
@@ -1069,7 +1200,8 @@ class ViTB16VPT(nn.Module):
             batch_size = x.shape[0]
             input_count += batch_size
 
-            # Model Fisher scores: y ~ p(y | x).
+            # Model Fisher:
+            # y ~ p(y | x).
             labels_m = torch.multinomial(
                 log_probs.detach().exp(),
                 mc_samples,
@@ -1078,21 +1210,32 @@ class ViTB16VPT(nn.Module):
 
             selected_m = log_probs.gather(1, labels_m).flatten()
 
-            # Empirical scores: y = ground-truth label.
-            selected_e = log_probs.gather(1, y.reshape(-1, 1)).flatten()
+            # Empirical Fisher:
+            # y = observed ground-truth label.
+            selected_e = log_probs.gather(
+                1,
+                y.reshape(-1, 1),
+            ).flatten()
 
             n_m = selected_m.numel()
             n_e = selected_e.numel()
-            selected = torch.cat((selected_m, selected_e))
+
+            selected = torch.cat(
+                (
+                    selected_m,
+                    selected_e,
+                )
+            )
 
             basis = bases.get(selected.numel())
 
             if basis is None:
-                basis = bases[selected.numel()] = torch.eye(
+                basis = torch.eye(
                     selected.numel(),
                     device=device,
                     dtype=selected.dtype,
                 )
+                bases[selected.numel()] = basis
 
             raw_scores = torch.autograd.grad(
                 selected,
@@ -1101,7 +1244,10 @@ class ViTB16VPT(nn.Module):
                 is_grads_batched=True,
             )
 
-            functional_scores, coupling_scores = build_scores(raw_scores)
+            (
+                functional_scores,
+                coupling_scores,
+            ) = build_scores(raw_scores)
 
             functional_m = functional_scores[:n_m]
             functional_e = functional_scores[n_m:]
@@ -1115,10 +1261,16 @@ class ViTB16VPT(nn.Module):
                 coupling_m = coupling_scores[:n_m]
                 coupling_e = coupling_scores[n_m:]
 
-                cross_sum_m.addmm_(functional_m.T, coupling_m)
+                cross_sum_m.addmm_(
+                    functional_m.T,
+                    coupling_m,
+                )
                 coupling_square_sum_m.add_(coupling_m.square().sum(dim=0))
 
-                cross_sum_e.addmm_(functional_e.T, coupling_e)
+                cross_sum_e.addmm_(
+                    functional_e.T,
+                    coupling_e,
+                )
                 coupling_score_sum_e.add_(coupling_e.sum(dim=0))
                 coupling_square_sum_e.add_(coupling_e.square().sum(dim=0))
 
@@ -1130,9 +1282,13 @@ class ViTB16VPT(nn.Module):
             raise ValueError("loader is empty")
 
         participation = participation_sum.div_(input_count)
+
         fisher_m = fisher_sum_m.div_(sample_count_m)
+
         mean_e = score_sum_e.div_(sample_count_e)
+
         fisher_e = fisher_sum_e.div_(sample_count_e)
+
         variance_e = (fisher_e - mean_e.square()).clamp_min_(0)
 
         def unpack(value, tail=()):
@@ -1154,6 +1310,7 @@ class ViTB16VPT(nn.Module):
             for name in names:
                 p = P_signature[name]
                 f = F_signature[name]
+
                 threshold = eps * p.amax().clamp_min(1.0)
 
                 signature[name] = torch.where(
@@ -1165,6 +1322,7 @@ class ViTB16VPT(nn.Module):
             return signature
 
         P_signature = unpack(participation)
+
         F_m_signature = unpack(fisher_m)
         S_m_signature = make_S(F_m_signature)
 
@@ -1178,6 +1336,7 @@ class ViTB16VPT(nn.Module):
             posinf=0.0,
             neginf=0.0,
         ).clamp_(0, 1)
+
         B_e_signature = unpack(bias_e)
 
         if use_prompts:
@@ -1193,17 +1352,21 @@ class ViTB16VPT(nn.Module):
             ).clamp_(-1, 1)
 
             coupling_mean_e = coupling_score_sum_e.div_(sample_count_e)
+
             coupling_second_e = coupling_square_sum_e.div_(sample_count_e)
+
             coupling_variance_e = (
                 coupling_second_e - coupling_mean_e.square()
             ).clamp_min_(0)
 
             C_e = cross_sum_e.div_(sample_count_e)
+
             C_e.addmm_(
                 mean_e[:, None],
                 coupling_mean_e[None],
                 alpha=-1.0,
             )
+
             C_e.div_(variance_e.sqrt()[:, None])
             C_e.div_(coupling_variance_e.sqrt()[None])
             C_e.nan_to_num_(
@@ -1212,50 +1375,95 @@ class ViTB16VPT(nn.Module):
                 neginf=0.0,
             ).clamp_(-1, 1)
 
-            C_m_view = C_m.reshape(total_size, n_layers, n_prompts)
-            C_e_view = C_e.reshape(total_size, n_layers, n_prompts)
-
-            G_layer_m = torch.linalg.vector_norm(C_m_view, dim=-1).div_(
-                math.sqrt(n_prompts)
+            C_m_view = C_m.reshape(
+                total_size,
+                n_layers,
+                n_prompts,
             )
-            G_layer_e = torch.linalg.vector_norm(C_e_view, dim=-1).div_(
-                math.sqrt(n_prompts)
-            )
-
-            G_global_m = torch.linalg.vector_norm(G_layer_m, dim=-1).div_(
-                math.sqrt(n_layers)
-            )
-            G_global_e = torch.linalg.vector_norm(G_layer_e, dim=-1).div_(
-                math.sqrt(n_layers)
+            C_e_view = C_e.reshape(
+                total_size,
+                n_layers,
+                n_prompts,
             )
 
-            C_m_signature = unpack(C_m, (n_layers, n_prompts))
-            C_e_signature = unpack(C_e, (n_layers, n_prompts))
-            G_layer_m_signature = unpack(G_layer_m, (n_layers,))
-            G_layer_e_signature = unpack(G_layer_e, (n_layers,))
+            G_layer_m = torch.linalg.vector_norm(
+                C_m_view,
+                dim=-1,
+            ).div_(math.sqrt(n_prompts))
+
+            G_layer_e = torch.linalg.vector_norm(
+                C_e_view,
+                dim=-1,
+            ).div_(math.sqrt(n_prompts))
+
+            G_global_m = torch.linalg.vector_norm(
+                G_layer_m,
+                dim=-1,
+            ).div_(math.sqrt(n_layers))
+
+            G_global_e = torch.linalg.vector_norm(
+                G_layer_e,
+                dim=-1,
+            ).div_(math.sqrt(n_layers))
+
+            C_m_signature = unpack(
+                C_m,
+                (n_layers, n_prompts),
+            )
+            C_e_signature = unpack(
+                C_e,
+                (n_layers, n_prompts),
+            )
+
+            G_layer_m_signature = unpack(
+                G_layer_m,
+                (n_layers,),
+            )
+            G_layer_e_signature = unpack(
+                G_layer_e,
+                (n_layers,),
+            )
+
             G_global_m_signature = unpack(G_global_m)
             G_global_e_signature = unpack(G_global_e)
 
         else:
             C_m_signature = unpack(
-                fisher_m.new_zeros(total_size, n_layers, 0),
+                fisher_m.new_zeros(
+                    total_size,
+                    n_layers,
+                    0,
+                ),
                 (n_layers, 0),
             )
+
             C_e_signature = unpack(
-                fisher_e.new_zeros(total_size, n_layers, 0),
+                fisher_e.new_zeros(
+                    total_size,
+                    n_layers,
+                    0,
+                ),
                 (n_layers, 0),
             )
 
             G_layer_m_signature = unpack(
-                fisher_m.new_zeros(total_size, n_layers),
+                fisher_m.new_zeros(
+                    total_size,
+                    n_layers,
+                ),
                 (n_layers,),
             )
+
             G_layer_e_signature = unpack(
-                fisher_e.new_zeros(total_size, n_layers),
+                fisher_e.new_zeros(
+                    total_size,
+                    n_layers,
+                ),
                 (n_layers,),
             )
 
             G_global_m_signature = unpack(fisher_m.new_zeros(total_size))
+
             G_global_e_signature = unpack(fisher_e.new_zeros(total_size))
 
         self._set_gate_grads(False)
