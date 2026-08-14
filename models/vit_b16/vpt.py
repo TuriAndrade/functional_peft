@@ -243,11 +243,11 @@ class ViTB16VPT(nn.Module):
 
     def _create_functional_artifacts(self):
         """
-        Create the functional gates, participation accumulators, fixed route
-        masks/metrics, and instrumented ViT forward pass.
+        Create functional gates, participation accumulators, fixed route masks,
+        output-space metrics, and an instrumented ViT forward pass.
 
         Every gate is initialized to one, so the patched forward is identical
-        to the original forward at the Fisher evaluation point.
+        to the original forward at the functional evaluation point.
         """
         if hasattr(self, "functional_gates"):
             return
@@ -271,22 +271,26 @@ class ViTB16VPT(nn.Module):
 
         self.functional_gates = nn.ParameterDict(
             {
-                # [layer, site, token group, residual channel]
+                # [layer, sublayer, token group, residual channel]
                 #
-                # site:
-                #   0 = attention read
-                #   1 = attention write
-                #   2 = MLP read
-                #   3 = MLP write
+                # sublayer:
+                #   0 = attention
+                #   1 = MLP
                 #
                 # token group:
                 #   0 = CLS
                 #   1 = patches
-                "residual_stream_channel": gate((n_layers, 4, 2, embed_dim)),
-                # [residual channel]
-                # Final normalized CLS immediately before the classifier.
-                "final_cls_readout": gate((embed_dim,)),
+                #
+                # Scales the normalized pretrained residual-stream channels
+                # consumed by each sublayer. Prompt-token channels are excluded
+                # and pass unchanged.
+                "sublayer_input_channel": gate((n_layers, 2, 2, embed_dim)),
                 # [layer, head, route]
+                #
+                # QK/selection-side routing. Each gate scales the pre-softmax
+                # attention logits belonging to one backbone-to-backbone route,
+                # measuring the functional importance of where a head selects
+                # information from.
                 #
                 # route:
                 #   0 = CLS   <- CLS
@@ -296,43 +300,72 @@ class ViTB16VPT(nn.Module):
                 #   4 = PATCH <- PATCH local
                 #   5 = PATCH <- PATCH medium
                 #   6 = PATCH <- PATCH global
-                "attention_qk_route": gate((n_layers, n_heads, 7)),
-                "attention_ov_route": gate((n_layers, n_heads, 7)),
-                # [layer, head, token group, raw head channel]
+                "attention_head_selection_route": gate((n_layers, n_heads, 7)),
+                # [layer, head, route]
                 #
-                # QK token group:
-                #   0 = CLS query
-                #   1 = patch query
+                # OV/transport-side routing. Each gate scales the contribution
+                # carried through one backbone-to-backbone route after the
+                # attention distribution is formed, measuring the functional
+                # importance of the content transported through that route.
                 #
-                # OV token group:
-                #   0 = output written to CLS
-                #   1 = output written to patches
-                "attention_qk_channel": gate((n_layers, n_heads, 2, head_dim)),
-                "attention_ov_channel": gate((n_layers, n_heads, 2, head_dim)),
+                # Routes use the same seven source/destination categories above.
+                "attention_head_transport_route": gate((n_layers, n_heads, 7)),
                 # [layer, processed token group, hidden MLP neuron]
                 #
                 # token group:
                 #   0 = CLS
                 #   1 = patches
-                "mlp_neuron": gate((n_layers, 2, mlp_dim)),
-                # [layer, head, destination group]
                 #
-                # Source is any prompt token.
-                # destination:
+                # Scales each post-activation hidden MLP neuron before W_2,
+                # measuring the functional importance of each frozen nonlinear
+                # MLP computation for CLS and patch tokens separately.
+                "mlp_neuron": gate((n_layers, 2, mlp_dim)),
+                # [layer, sublayer, token group]
+                #
+                # sublayer:
+                #   0 = attention
+                #   1 = MLP
+                #
+                # token group:
                 #   0 = CLS
                 #   1 = patches
-                "prompt_to_backbone_qk_route": gate((n_layers, n_heads, 2)),
-                "prompt_to_backbone_ov_route": gate((n_layers, n_heads, 2)),
+                #
+                # Scales the complete post-dropout residual update produced by
+                # each sublayer for CLS or patch tokens. Prompt-token updates
+                # pass unchanged.
+                "sublayer_token_update": gate((n_layers, 2, 2)),
+                # [residual channel]
+                #
+                # Scales each channel of the final normalized CLS representation
+                # immediately before the task classifier.
+                "final_cls_readout_channel": gate((embed_dim,)),
+                # [layer, head, destination group]
+                #
+                # VPT-specific QK/selection routes whose source is any prompt
+                # token and whose destination is:
+                #   0 = CLS
+                #   1 = patches
+                "prompt_attention_head_selection_route": gate((n_layers, n_heads, 2)),
+                # [layer, head, destination group]
+                #
+                # VPT-specific OV/transport routes whose source is any prompt
+                # token and whose destination is:
+                #   0 = CLS
+                #   1 = patches
+                "prompt_attention_head_transport_route": gate((n_layers, n_heads, 2)),
             }
         )
 
         # [layer, prompt token]
         #
-        # Scales each complete prompt state before its Q/K/V projections.
-        # These scores define prompt-component coupling used by C and G.
+        # Scales each complete prompt state immediately before its Q/K/V
+        # projections. These intervention scores define the prompt-side
+        # variables used by C and G.
         self.coupling_gates = gate((n_layers, n_prompts))
 
-        # Coarse components are derived exactly from fine per-sample scores.
+        # Coarse components are exact tied-gate derivatives constructed from
+        # the fine per-sample functional scores. Their participation values are
+        # recorded directly at the corresponding computation.
         self._functional_shapes = {
             **{
                 name: tuple(value.shape)
@@ -340,23 +373,37 @@ class ViTB16VPT(nn.Module):
             },
             # [layer, sublayer]
             #
-            # sublayer:
-            #   0 = attention
-            #   1 = MLP
+            # Complete attention/MLP residual update, aggregated over CLS and
+            # patch destinations.
             "sublayer_update": (n_layers, 2),
-            # [layer, sublayer, token group]
+            # [layer, route]
             #
-            # sublayer:
-            #   0 = attention
-            #   1 = MLP
+            # Head-aggregated QK/selection importance for each of the seven
+            # backbone-to-backbone attention routes.
+            "attention_selection_route": (n_layers, 7),
+            # [layer, route]
             #
-            # token group:
-            #   0 = CLS
-            #   1 = patches
-            "sublayer_token_update": (n_layers, 2, 2),
+            # Head-aggregated OV/transport importance for each of the seven
+            # backbone-to-backbone attention routes.
+            "attention_transport_route": (n_layers, 7),
             # [layer, head]
-            # Complete head output delivered to CLS/patch destinations.
-            "attention_head_update": (n_layers, n_heads),
+            #
+            # Complete output of each attention head delivered to backbone
+            # destinations. Its score includes both backbone-source and
+            # prompt-source transport contributions.
+            "attention_head_output": (n_layers, n_heads),
+            # [layer, destination group]
+            #
+            # Head-aggregated prompt->backbone QK/selection routes:
+            #   0 = prompt -> CLS
+            #   1 = prompt -> patches
+            "prompt_attention_selection_route": (n_layers, 2),
+            # [layer, destination group]
+            #
+            # Head-aggregated prompt->backbone OV/transport routes:
+            #   0 = prompt -> CLS
+            #   1 = prompt -> patches
+            "prompt_attention_transport_route": (n_layers, 2),
         }
 
         self._functional_names = tuple(self._functional_shapes)
@@ -392,24 +439,18 @@ class ViTB16VPT(nn.Module):
             distances.new_tensor([1 / 3, 2 / 3]),
         )
 
-        # Patch-to-patch bins:
+        # Patch-to-patch spatial bins:
         #   0 = self
         #   1 = local
         #   2 = medium
         #   3 = global
-        spatial_bins = (
-            torch.bucketize(
-                distances,
-                thresholds,
-            )
-            + 1
-        )
-
+        spatial_bins = torch.bucketize(distances, thresholds) + 1
         spatial_bins.fill_diagonal_(0)
 
-        # Nine mutually exclusive routes ending at backbone tokens.
-        # Routes 0:7 are backbone-to-backbone.
-        # Routes 7:9 are prompt-to-backbone.
+        # Nine mutually exclusive source/destination routes ending at backbone
+        # tokens. Routes 0:7 are backbone-to-backbone; routes 7:9 are
+        # prompt-to-backbone. Prompt-destination rows are intentionally outside
+        # this functional-route decomposition.
         route_masks = reference.new_zeros(
             9,
             n_tokens,
@@ -439,7 +480,6 @@ class ViTB16VPT(nn.Module):
         # ------------------------------------------------------------------
 
         head_metrics = []
-        head_channel_norms = []
         mlp_neuron_norms = []
 
         with torch.no_grad():
@@ -447,7 +487,6 @@ class ViTB16VPT(nn.Module):
                 output_weight = block.attn.out.weight
 
                 layer_metrics = []
-                layer_channel_norms = []
 
                 for head_idx in range(n_heads):
                     head_slice = slice(
@@ -458,21 +497,17 @@ class ViTB16VPT(nn.Module):
                     # Columns of W_O corresponding to this head: [D, K].
                     head_weight = output_weight[:, head_slice]
 
-                    # For head context c:
-                    # ||W_O,h c||² = cᵀ(W_O,hᵀW_O,h)c.
+                    # For one head-context vector c:
+                    # ||W_O,h c||² = cᵀ(W_O,hᵀ W_O,h)c.
                     layer_metrics.append(head_weight.T @ head_weight)
 
-                    # Output norm of each raw head channel.
-                    layer_channel_norms.append(head_weight.square().sum(dim=0))
-
                 head_metrics.append(torch.stack(layer_metrics))
-                head_channel_norms.append(torch.stack(layer_channel_norms))
 
-                # Output norm of each hidden MLP neuron.
+                # Output-space squared norm associated with each hidden MLP
+                # neuron: ||W_2[:, j]||².
                 mlp_neuron_norms.append(block.ffn.fc2.weight.square().sum(dim=0))
 
         self._functional_head_metrics = torch.stack(head_metrics)
-        self._functional_head_channel_norms = torch.stack(head_channel_norms)
         self._functional_mlp_neuron_norms = torch.stack(mlp_neuron_norms)
 
         # ------------------------------------------------------------------
@@ -493,7 +528,7 @@ class ViTB16VPT(nn.Module):
                         value.detach().sum(dim=0)
                     )
 
-                def grouped_energy(value):
+                def grouped_channel_energy(value):
                     """
                     [B, T, C] -> [B, 2, C]
 
@@ -511,9 +546,9 @@ class ViTB16VPT(nn.Module):
                         dim=1,
                     )
 
-                def apply_token_groups(value, group_gate):
+                def apply_channel_groups(value, group_gate):
                     """
-                    Apply separate channel/neuron gates to CLS and patches.
+                    Apply channel/neuron gates separately to CLS and patches.
 
                     value:      [B, T, C]
                     group_gate: [2, C]
@@ -529,32 +564,27 @@ class ViTB16VPT(nn.Module):
                         dim=1,
                     )
 
-                def expand_head_groups(group_gate):
+                def apply_token_groups(value, group_gate):
                     """
-                    [H, 2, K] -> [H, T, K]
+                    Apply one scalar gate to the complete CLS/patch update.
 
-                    Prompt tokens receive scale one.
+                    value:      [B, T, C]
+                    group_gate: [2]
+
+                    Prompt-token updates pass unchanged.
                     """
                     return torch.cat(
                         (
-                            group_gate[:, :1],
-                            group_gate.new_ones(
-                                n_heads,
-                                n_prompts,
-                                head_dim,
-                            ),
-                            group_gate[:, 1:2].expand(
-                                -1,
-                                n_patches,
-                                -1,
-                            ),
+                            value[:, :1] * group_gate[0],
+                            value[:, prompt_slice],
+                            value[:, patch_slice] * group_gate[1],
                         ),
                         dim=1,
                     )
 
                 def projected_head_energy(context):
                     """
-                    Squared output energy of each head after its W_O slice.
+                    Squared output-space energy of each head after its W_O slice.
 
                     context: [B, H, T, K]
                     return:  [B, H]
@@ -569,26 +599,25 @@ class ViTB16VPT(nn.Module):
                     )
 
                 # ==========================================================
-                # Attention read
+                # Attention input channels
                 # ==========================================================
 
                 residual = hidden
                 value = block.attention_norm(hidden)
 
                 record(
-                    "residual_stream_channel",
+                    "sublayer_input_channel",
                     (layer_idx, 0),
-                    grouped_energy(value),
+                    grouped_channel_energy(value),
                 )
 
-                value = apply_token_groups(
+                value = apply_channel_groups(
                     value,
-                    gates["residual_stream_channel"][
-                        layer_idx,
-                        0,
-                    ],
+                    gates["sublayer_input_channel"][layer_idx, 0],
                 )
 
+                # Prompt coupling is defined on the complete prompt state
+                # entering the frozen Q/K/V projections.
                 if n_prompts:
                     value = torch.cat(
                         (
@@ -601,78 +630,49 @@ class ViTB16VPT(nn.Module):
                     )
 
                 query = attention.transpose_for_scores(attention.query(value))
-
                 key = attention.transpose_for_scores(attention.key(value))
-
                 attention_value = attention.transpose_for_scores(attention.value(value))
-
-                # ==========================================================
-                # QK channels
-                # ==========================================================
-
-                query_energy = query.detach().square()
-
-                qk_channel_energy = torch.stack(
-                    (
-                        query_energy[:, :, 0],
-                        query_energy[
-                            :,
-                            :,
-                            patch_slice,
-                        ].sum(dim=2),
-                    ),
-                    dim=2,
-                )
-
-                # For QK channel k:
-                #
-                # sum_j (q_ik k_jk / sqrt(K))²
-                # = q_ik² sum_j k_jk² / K.
-                qk_channel_energy = (
-                    qk_channel_energy
-                    * key.detach().square().sum(dim=2)[:, :, None]
-                    / head_dim
-                )
-
-                record(
-                    "attention_qk_channel",
-                    layer_idx,
-                    qk_channel_energy,
-                )
-
-                query = (
-                    query
-                    * expand_head_groups(gates["attention_qk_channel"][layer_idx])[None]
-                )
 
                 attention_scores = query @ key.transpose(-1, -2) / math.sqrt(head_dim)
 
                 # ==========================================================
-                # QK routes
+                # Attention selection routes (QK side)
                 # ==========================================================
 
-                qk_route_energy = torch.einsum(
+                selection_route_energy = torch.einsum(
                     "bhij,rij->bhr",
                     attention_scores.detach().square(),
                     self._functional_route_masks,
                 )
 
                 record(
-                    "attention_qk_route",
+                    "attention_head_selection_route",
                     layer_idx,
-                    qk_route_energy[:, :, :7],
+                    selection_route_energy[:, :, :7],
                 )
 
                 record(
-                    "prompt_to_backbone_qk_route",
+                    "prompt_attention_head_selection_route",
                     layer_idx,
-                    qk_route_energy[:, :, 7:],
+                    selection_route_energy[:, :, 7:],
                 )
 
-                qk_route_gates = torch.cat(
+                record(
+                    "attention_selection_route",
+                    layer_idx,
+                    selection_route_energy[:, :, :7].sum(dim=1),
+                )
+
+                record(
+                    "prompt_attention_selection_route",
+                    layer_idx,
+                    selection_route_energy[:, :, 7:].sum(dim=1),
+                )
+
+                selection_route_gates = torch.cat(
                     (
-                        gates["attention_qk_route"][layer_idx],
-                        gates["prompt_to_backbone_qk_route"][layer_idx],
+                        gates["attention_head_selection_route"][layer_idx],
+                        gates["prompt_attention_head_selection_route"][layer_idx],
                     ),
                     dim=-1,
                 )
@@ -683,24 +683,23 @@ class ViTB16VPT(nn.Module):
                         1
                         + torch.einsum(
                             "hr,rij->hij",
-                            qk_route_gates - 1,
+                            selection_route_gates - 1,
                             self._functional_route_masks,
                         )
                     )[None]
                 )
 
                 attention_probs = attention.softmax(attention_scores)
-
                 weights = attention_probs if attention.vis else None
-
                 attention_probs = attention.attn_dropout(attention_probs)
 
                 # ==========================================================
-                # OV-route participation
+                # Attention transport-route participation (OV side)
                 # ==========================================================
 
                 with torch.no_grad():
-                    # [B, H, route, destination token, K]
+                    # Route-specific context before W_O:
+                    # [B, H, route, destination token, K].
                     route_context = torch.einsum(
                         "bhij,rij,bhjk->bhrik",
                         attention_probs.detach(),
@@ -708,7 +707,8 @@ class ViTB16VPT(nn.Module):
                         attention_value.detach(),
                     )
 
-                    ov_route_energy = torch.einsum(
+                    # Route energy after the corresponding W_O head slice.
+                    transport_route_energy = torch.einsum(
                         "bhrik,hkl,bhril->bhr",
                         route_context,
                         self._functional_head_metrics[layer_idx],
@@ -716,38 +716,52 @@ class ViTB16VPT(nn.Module):
                     )
 
                     record(
-                        "attention_ov_route",
+                        "attention_head_transport_route",
                         layer_idx,
-                        ov_route_energy[:, :, :7],
+                        transport_route_energy[:, :, :7],
                     )
 
                     record(
-                        "prompt_to_backbone_ov_route",
+                        "prompt_attention_head_transport_route",
                         layer_idx,
-                        ov_route_energy[:, :, 7:],
+                        transport_route_energy[:, :, 7:],
+                    )
+
+                    record(
+                        "attention_transport_route",
+                        layer_idx,
+                        transport_route_energy[:, :, :7].sum(dim=1),
+                    )
+
+                    record(
+                        "prompt_attention_transport_route",
+                        layer_idx,
+                        transport_route_energy[:, :, 7:].sum(dim=1),
                     )
 
                 # ==========================================================
-                # OV routes
+                # Attention transport routes (OV side)
                 # ==========================================================
 
-                ov_route_gates = torch.cat(
+                transport_route_gates = torch.cat(
                     (
-                        gates["attention_ov_route"][layer_idx],
-                        gates["prompt_to_backbone_ov_route"][layer_idx],
+                        gates["attention_head_transport_route"][layer_idx],
+                        gates["prompt_attention_head_transport_route"][layer_idx],
                     ),
                     dim=-1,
                 )
 
                 transport_scale = 1 + torch.einsum(
                     "hr,rij->hij",
-                    ov_route_gates - 1,
+                    transport_route_gates - 1,
                     self._functional_route_masks,
                 )
 
                 context = (attention_probs * transport_scale[None]) @ attention_value
 
-                # All source routes ending at CLS/patch destinations.
+                # Complete head context delivered to backbone destinations.
+                # Because the context already sums over all sources, this
+                # participation includes prompt-source contributions.
                 backbone_context = torch.cat(
                     (
                         context[:, :, :1],
@@ -757,45 +771,9 @@ class ViTB16VPT(nn.Module):
                 )
 
                 record(
-                    "attention_head_update",
+                    "attention_head_output",
                     layer_idx,
                     projected_head_energy(backbone_context),
-                )
-
-                # ==========================================================
-                # OV channels
-                # ==========================================================
-
-                context_energy = context.detach().square()
-
-                ov_channel_energy = torch.stack(
-                    (
-                        context_energy[:, :, 0],
-                        context_energy[
-                            :,
-                            :,
-                            patch_slice,
-                        ].sum(dim=2),
-                    ),
-                    dim=2,
-                )
-
-                # One context channel contributes:
-                # context_k * W_O[:, head_channel_k].
-                ov_channel_energy = (
-                    ov_channel_energy
-                    * self._functional_head_channel_norms[layer_idx][None, :, None]
-                )
-
-                record(
-                    "attention_ov_channel",
-                    layer_idx,
-                    ov_channel_energy,
-                )
-
-                context = (
-                    context
-                    * expand_head_groups(gates["attention_ov_channel"][layer_idx])[None]
                 )
 
                 context = context.transpose(1, 2).reshape(
@@ -807,15 +785,15 @@ class ViTB16VPT(nn.Module):
                 attention_output = attention.proj_dropout(attention.out(context))
 
                 # ==========================================================
-                # Attention write
+                # Attention residual update
                 # ==========================================================
 
-                attention_energy = grouped_energy(attention_output)
+                attention_energy = grouped_channel_energy(attention_output)
 
                 record(
-                    "residual_stream_channel",
-                    (layer_idx, 1),
-                    attention_energy,
+                    "sublayer_token_update",
+                    (layer_idx, 0),
+                    attention_energy.sum(dim=-1),
                 )
 
                 record(
@@ -824,22 +802,13 @@ class ViTB16VPT(nn.Module):
                     attention_energy.sum(dim=(1, 2)),
                 )
 
-                record(
-                    "sublayer_token_update",
-                    (layer_idx, 0, slice(None)),
-                    attention_energy.sum(dim=-1),
-                )
-
                 hidden = residual + apply_token_groups(
                     attention_output,
-                    gates["residual_stream_channel"][
-                        layer_idx,
-                        1,
-                    ],
+                    gates["sublayer_token_update"][layer_idx, 0],
                 )
 
                 # ==========================================================
-                # MLP read and neurons
+                # MLP input channels and hidden neurons
                 # ==========================================================
 
                 residual = hidden
@@ -848,27 +817,24 @@ class ViTB16VPT(nn.Module):
                 value = block.ffn_norm(hidden)
 
                 record(
-                    "residual_stream_channel",
-                    (layer_idx, 2),
-                    grouped_energy(value),
+                    "sublayer_input_channel",
+                    (layer_idx, 1),
+                    grouped_channel_energy(value),
                 )
 
-                value = apply_token_groups(
+                value = apply_channel_groups(
                     value,
-                    gates["residual_stream_channel"][
-                        layer_idx,
-                        2,
-                    ],
+                    gates["sublayer_input_channel"][layer_idx, 1],
                 )
 
                 value = feed_forward.dropout(
                     feed_forward.act_fn(feed_forward.fc1(value))
                 )
 
-                # Neuron output energy:
-                # activation_j² * ||W_2[:, j]||².
+                # Each hidden-neuron activation contributes through one column
+                # of W_2; this measures its output-space energy.
                 neuron_energy = (
-                    grouped_energy(value)
+                    grouped_channel_energy(value)
                     * self._functional_mlp_neuron_norms[layer_idx][None, None]
                 )
 
@@ -878,7 +844,7 @@ class ViTB16VPT(nn.Module):
                     neuron_energy,
                 )
 
-                value = apply_token_groups(
+                value = apply_channel_groups(
                     value,
                     gates["mlp_neuron"][layer_idx],
                 )
@@ -886,15 +852,15 @@ class ViTB16VPT(nn.Module):
                 mlp_output = feed_forward.dropout(feed_forward.fc2(value))
 
                 # ==========================================================
-                # MLP write
+                # MLP residual update
                 # ==========================================================
 
-                mlp_energy = grouped_energy(mlp_output)
+                mlp_energy = grouped_channel_energy(mlp_output)
 
                 record(
-                    "residual_stream_channel",
-                    (layer_idx, 3),
-                    mlp_energy,
+                    "sublayer_token_update",
+                    (layer_idx, 1),
+                    mlp_energy.sum(dim=-1),
                 )
 
                 record(
@@ -903,20 +869,11 @@ class ViTB16VPT(nn.Module):
                     mlp_energy.sum(dim=(1, 2)),
                 )
 
-                record(
-                    "sublayer_token_update",
-                    (layer_idx, 1, slice(None)),
-                    mlp_energy.sum(dim=-1),
-                )
-
                 return (
                     residual
                     + apply_token_groups(
                         mlp_output,
-                        gates["residual_stream_channel"][
-                            layer_idx,
-                            3,
-                        ],
+                        gates["sublayer_token_update"][layer_idx, 1],
                     ),
                     weights,
                 )
@@ -929,20 +886,24 @@ class ViTB16VPT(nn.Module):
                 block,
             )
 
-        # Apply the final CLS gate after the original encoder LayerNorm.
+        # Apply the final channel gate after the original encoder LayerNorm,
+        # exactly where the task classifier consumes the CLS representation.
         original_norm_forward = self.backbone.norm.forward
 
         def norm_forward(norm, hidden):
             encoded = original_norm_forward(hidden)
 
-            self.functional_participation["final_cls_readout"].copy_(
+            self.functional_participation["final_cls_readout_channel"].copy_(
                 encoded[:, 0].detach().square().sum(dim=0)
             )
 
             return torch.cat(
                 (
                     encoded[:, :1]
-                    * self.functional_gates["final_cls_readout"][None, None],
+                    * self.functional_gates["final_cls_readout_channel"][
+                        None,
+                        None,
+                    ],
                     encoded[:, 1:],
                 ),
                 dim=1,
@@ -1041,21 +1002,28 @@ class ViTB16VPT(nn.Module):
         def build_scores(raw_scores):
             scores = dict(zip(gate_names, raw_scores[: len(gates)]))
 
-            stream_scores = scores["residual_stream_channel"]
-
-            scores["sublayer_token_update"] = torch.stack(
-                (
-                    stream_scores[:, :, 1].sum(dim=-1),
-                    stream_scores[:, :, 3].sum(dim=-1),
-                ),
-                dim=2,
-            )
-
+            # Exact tied-gate coarse scores.
             scores["sublayer_update"] = scores["sublayer_token_update"].sum(dim=-1)
 
-            scores["attention_head_update"] = scores["attention_ov_route"].sum(
-                dim=-1
-            ) + scores["prompt_to_backbone_ov_route"].sum(dim=-1)
+            scores["attention_selection_route"] = scores[
+                "attention_head_selection_route"
+            ].sum(dim=2)
+
+            scores["attention_transport_route"] = scores[
+                "attention_head_transport_route"
+            ].sum(dim=2)
+
+            scores["attention_head_output"] = scores[
+                "attention_head_transport_route"
+            ].sum(dim=-1) + scores["prompt_attention_head_transport_route"].sum(dim=-1)
+
+            scores["prompt_attention_selection_route"] = scores[
+                "prompt_attention_head_selection_route"
+            ].sum(dim=2)
+
+            scores["prompt_attention_transport_route"] = scores[
+                "prompt_attention_head_transport_route"
+            ].sum(dim=2)
 
             functional_scores = torch.cat(
                 [scores[name].flatten(start_dim=1) for name in names],
