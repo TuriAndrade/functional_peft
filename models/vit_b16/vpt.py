@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from functools import reduce
-from operator import mul
 from types import MethodType
 from typing import Optional
 from tqdm.auto import tqdm
@@ -19,10 +17,10 @@ class ViTB16VPT(nn.Module):
         self,
         img_size: int,
         n_classes: int,
+        freeze_backbone: bool = True,
         prompt_length: int = 0,
         prompt_mode: str = "shallow",
         prompt_dropout: Optional[float] = None,
-        freeze_backbone: bool = True,
     ):
         super().__init__()
 
@@ -37,13 +35,13 @@ class ViTB16VPT(nn.Module):
 
         self.img_size = img_size
         self.n_classes = n_classes
+        self.is_backbone_frozen = freeze_backbone
         self.prompt_length = prompt_length
         self.prompt_mode = prompt_mode
         default_dropout = 0.0 if prompt_mode == "shallow" else 0.1
         self.prompt_dropout = (
             default_dropout if prompt_dropout is None else float(prompt_dropout)
         )
-        self.is_backbone_frozen = freeze_backbone
 
         # Backbone
         self.backbone = ViTB16Backbone(img_size=img_size)
@@ -63,7 +61,7 @@ class ViTB16VPT(nn.Module):
             )
         )
         self.prompt_dropout_layer = nn.Dropout(self.prompt_dropout)
-        self.init_prompt()
+        self.init_peft()
 
     def freeze_backbone(self):
         self.backbone.freeze()
@@ -90,22 +88,25 @@ class ViTB16VPT(nn.Module):
         if init_from is not None:
             if (
                 init_from.weight.shape != self.head.weight.shape
+                or init_from.bias is None
                 or init_from.bias.shape != self.head.bias.shape
             ):
                 raise ValueError(
-                    f"Head shape mismatch: expected {tuple(self.head.weight.shape)}, "
-                    f"got {tuple(init_from.weight.shape)}."
+                    f"Head shape mismatch: expected "
+                    f"weight={tuple(self.head.weight.shape)}, "
+                    f"bias={tuple(self.head.bias.shape)}."
                 )
 
             with torch.no_grad():
                 self.head.weight.copy_(init_from.weight)
                 self.head.bias.copy_(init_from.bias)
+
             return
 
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-    def init_prompt(self, init_from: Optional[nn.Parameter] = None):
+    def init_peft(self, init_from: Optional[torch.Tensor] = None):
         if self.prompt_length == 0:
             return
 
@@ -118,12 +119,14 @@ class ViTB16VPT(nn.Module):
 
             with torch.no_grad():
                 self.prompt.copy_(init_from)
+
             return
 
-        patch_size = (self.backbone.patch_size, self.backbone.patch_size)
+        patch_size = self.backbone.patch_size
         prompt_dim = self.backbone.embed_dim
-        val = math.sqrt(6.0 / float(3 * reduce(mul, patch_size, 1) + prompt_dim))
-        nn.init.uniform_(self.prompt.data, -val, val)
+        val = math.sqrt(6.0 / (3 * patch_size**2 + prompt_dim))
+
+        nn.init.uniform_(self.prompt, -val, val)
 
     def get_prompt_tokens(self, batch_size: int, layer_idx: int = 0) -> torch.Tensor:
         prompt = self.prompt[layer_idx if self.prompt_mode == "deep" else 0]

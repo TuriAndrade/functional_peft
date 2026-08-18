@@ -15,10 +15,10 @@ class ViTB16LoRA(nn.Module):
         self,
         img_size: int,
         n_classes: int,
+        freeze_backbone: bool = True,
         rank: int = 8,
         lora_alpha: Optional[float] = None,
         lora_targets=("query", "value"),
-        freeze_backbone: bool = True,
     ):
         super().__init__()
 
@@ -38,11 +38,11 @@ class ViTB16LoRA(nn.Module):
 
         self.img_size = img_size
         self.n_classes = n_classes
+        self.is_backbone_frozen = freeze_backbone
         self.rank = rank
         self.lora_targets = lora_targets
         self.lora_alpha = float(rank if lora_alpha is None else lora_alpha)
         self.lora_scaling = self.lora_alpha / rank if rank > 0 else 0.0
-        self.is_backbone_frozen = freeze_backbone
 
         if rank > 0 and self.lora_alpha <= 0:
             raise ValueError("lora_alpha must be positive when rank > 0")
@@ -83,7 +83,7 @@ class ViTB16LoRA(nn.Module):
                 )
             )
 
-            self.init_lora()
+            self.init_peft()
             self._patch_lora_projections()
 
         else:
@@ -115,11 +115,13 @@ class ViTB16LoRA(nn.Module):
         if init_from is not None:
             if (
                 init_from.weight.shape != self.head.weight.shape
+                or init_from.bias is None
                 or init_from.bias.shape != self.head.bias.shape
             ):
                 raise ValueError(
-                    f"Head shape mismatch: expected {tuple(self.head.weight.shape)}, "
-                    f"got {tuple(init_from.weight.shape)}."
+                    f"Head shape mismatch: expected "
+                    f"weight={tuple(self.head.weight.shape)}, "
+                    f"bias={tuple(self.head.bias.shape)}."
                 )
 
             with torch.no_grad():
@@ -131,15 +133,31 @@ class ViTB16LoRA(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-    def init_lora(self):
+    def init_peft(
+        self,
+        init_from: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ):
         if self.rank == 0:
             return
 
+        if init_from is not None:
+            lora_A, lora_B = init_from
+
+            if lora_A.shape != self.lora_A.shape or lora_B.shape != self.lora_B.shape:
+                raise ValueError(
+                    f"LoRA shape mismatch: expected "
+                    f"A={tuple(self.lora_A.shape)}, B={tuple(self.lora_B.shape)}, "
+                    f"got A={tuple(lora_A.shape)}, B={tuple(lora_B.shape)}."
+                )
+
+            with torch.no_grad():
+                self.lora_A.copy_(lora_A)
+                self.lora_B.copy_(lora_B)
+
+            return
+
         for value in self.lora_A.flatten(0, 1):
-            nn.init.kaiming_uniform_(
-                value,
-                a=math.sqrt(5),
-            )
+            nn.init.kaiming_uniform_(value, a=math.sqrt(5))
 
         nn.init.zeros_(self.lora_B)
 

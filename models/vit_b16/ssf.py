@@ -28,6 +28,7 @@ class ViTB16SSF(nn.Module):
         self,
         img_size: int,
         n_classes: int,
+        freeze_backbone: bool = True,
         ssf_targets=(
             "patch",
             "attention_norm",
@@ -40,7 +41,6 @@ class ViTB16SSF(nn.Module):
             "fc2",
             "final_norm",
         ),
-        freeze_backbone: bool = True,
     ):
         super().__init__()
 
@@ -57,8 +57,8 @@ class ViTB16SSF(nn.Module):
 
         self.img_size = img_size
         self.n_classes = n_classes
-        self.ssf_targets = ssf_targets
         self.is_backbone_frozen = freeze_backbone
+        self.ssf_targets = ssf_targets
 
         # Backbone
         self.backbone = ViTB16Backbone(img_size=img_size)
@@ -97,7 +97,7 @@ class ViTB16SSF(nn.Module):
                 self.ssf_scale[name] = nn.Parameter(reference.new_empty(shapes[name]))
                 self.ssf_shift[name] = nn.Parameter(reference.new_empty(shapes[name]))
 
-            self.init_ssf()
+            self.init_peft()
             self._patch_ssf_targets()
 
     def freeze_backbone(self):
@@ -125,11 +125,13 @@ class ViTB16SSF(nn.Module):
         if init_from is not None:
             if (
                 init_from.weight.shape != self.head.weight.shape
+                or init_from.bias is None
                 or init_from.bias.shape != self.head.bias.shape
             ):
                 raise ValueError(
-                    f"Head shape mismatch: expected {tuple(self.head.weight.shape)}, "
-                    f"got {tuple(init_from.weight.shape)}."
+                    f"Head shape mismatch: expected "
+                    f"weight={tuple(self.head.weight.shape)}, "
+                    f"bias={tuple(self.head.bias.shape)}."
                 )
 
             with torch.no_grad():
@@ -141,7 +143,42 @@ class ViTB16SSF(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-    def init_ssf(self):
+    def init_peft(
+        self,
+        init_from: Optional[tuple[nn.ParameterDict, nn.ParameterDict]] = None,
+    ):
+        if not self.ssf_targets:
+            return
+
+        if init_from is not None:
+            scales, shifts = init_from
+
+            if set(scales) != set(self.ssf_scale) or set(shifts) != set(self.ssf_shift):
+                raise ValueError(
+                    f"SSF target mismatch: expected {tuple(self.ssf_targets)}, "
+                    f"got scales={tuple(scales)}, shifts={tuple(shifts)}."
+                )
+
+            for name in self.ssf_targets:
+                if (
+                    scales[name].shape != self.ssf_scale[name].shape
+                    or shifts[name].shape != self.ssf_shift[name].shape
+                ):
+                    raise ValueError(
+                        f"SSF shape mismatch for target {name!r}: expected "
+                        f"scale={tuple(self.ssf_scale[name].shape)}, "
+                        f"shift={tuple(self.ssf_shift[name].shape)}, got "
+                        f"scale={tuple(scales[name].shape)}, "
+                        f"shift={tuple(shifts[name].shape)}."
+                    )
+
+            with torch.no_grad():
+                for name in self.ssf_targets:
+                    self.ssf_scale[name].copy_(scales[name])
+                    self.ssf_shift[name].copy_(shifts[name])
+
+            return
+
         with torch.no_grad():
             for scale in self.ssf_scale.values():
                 nn.init.normal_(scale, mean=1.0, std=0.02)

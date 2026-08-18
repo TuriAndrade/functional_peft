@@ -53,10 +53,10 @@ class ViTB16AdaptFormer(nn.Module):
         self,
         img_size: int,
         n_classes: int,
+        freeze_backbone: bool = True,
         bottleneck_dim: int = 64,
         adapter_scale: float = 0.1,
         adapter_dropout: float = 0.1,
-        freeze_backbone: bool = True,
     ):
         super().__init__()
 
@@ -71,10 +71,10 @@ class ViTB16AdaptFormer(nn.Module):
 
         self.img_size = img_size
         self.n_classes = n_classes
+        self.is_backbone_frozen = freeze_backbone
         self.bottleneck_dim = bottleneck_dim
         self.adapter_scale = float(adapter_scale)
         self.adapter_dropout = float(adapter_dropout)
-        self.is_backbone_frozen = freeze_backbone
 
         # Backbone
         self.backbone = ViTB16Backbone(img_size=img_size)
@@ -102,7 +102,7 @@ class ViTB16AdaptFormer(nn.Module):
                     for _ in self.backbone.blocks
                 ]
             )
-
+            self.init_peft()
             self._patch_adaptformer_ffns()
 
         else:
@@ -129,19 +129,17 @@ class ViTB16AdaptFormer(nn.Module):
     def eval(self):
         return self.train(False)
 
-    def init_head(
-        self,
-        init_from: Optional[nn.Linear] = None,
-    ):
+    def init_head(self, init_from: Optional[nn.Linear] = None):
         if init_from is not None:
             if (
                 init_from.weight.shape != self.head.weight.shape
+                or init_from.bias is None
                 or init_from.bias.shape != self.head.bias.shape
             ):
                 raise ValueError(
-                    f"Head shape mismatch: "
-                    f"expected {tuple(self.head.weight.shape)}, "
-                    f"got {tuple(init_from.weight.shape)}."
+                    f"Head shape mismatch: expected "
+                    f"weight={tuple(self.head.weight.shape)}, "
+                    f"bias={tuple(self.head.bias.shape)}."
                 )
 
             with torch.no_grad():
@@ -152,6 +150,27 @@ class ViTB16AdaptFormer(nn.Module):
 
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
+
+    def init_peft(
+        self,
+        init_from: Optional[nn.ModuleList] = None,
+    ):
+        if self.bottleneck_dim == 0:
+            return
+
+        if init_from is not None:
+            try:
+                self.adapters.load_state_dict(
+                    init_from.state_dict(),
+                    strict=True,
+                )
+            except RuntimeError as exc:
+                raise ValueError("AdaptFormer adapter shape mismatch.") from exc
+
+            return
+
+        for adapter in self.adapters:
+            adapter.reset_parameters()
 
     def _patch_adaptformer_ffns(self):
         """
