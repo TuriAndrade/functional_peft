@@ -211,18 +211,16 @@ def test_freeze_backbone_sets_eval_mode_and_disables_gradients():
 
 
 def test_invalid_prompt_mode_raises():
-    model = ViTB16VPT(
-        img_size=IMG_SIZE,
-        n_classes=N_CLASSES,
-        prompt_length=4,
-        prompt_mode="invalid",
-    )
-    model.eval()
-
-    x = torch.randn(2, 3, IMG_SIZE, IMG_SIZE)
-
-    with pytest.raises(ValueError, match="Invalid prompt_mode"):
-        model.forward_features(x)
+    with pytest.raises(
+        ValueError,
+        match="prompt_mode must be 'shallow' or 'deep'",
+    ):
+        ViTB16VPT(
+            img_size=IMG_SIZE,
+            n_classes=N_CLASSES,
+            prompt_length=4,
+            prompt_mode="invalid",
+        )
 
 
 @pytest.mark.parametrize("prompt_mode", ["shallow", "deep"])
@@ -304,3 +302,39 @@ def test_save_and_load_trainable_parameters(tmp_path, prompt_mode):
     assert torch.allclose(target_model.prompt, source_model.prompt)
     assert torch.allclose(target_model.head.weight, source_model.head.weight)
     assert torch.allclose(target_model.head.bias, source_model.head.bias)
+
+
+@pytest.mark.parametrize("prompt_mode", ["shallow", "deep"])
+def test_functional_gates_preserve_forward(prompt_mode):
+    model = ViTB16VPT(
+        img_size=IMG_SIZE,
+        n_classes=N_CLASSES,
+        prompt_length=4,
+        prompt_mode=prompt_mode,
+    )
+    model.eval()
+
+    x = torch.randn(2, 3, IMG_SIZE, IMG_SIZE)
+
+    with torch.no_grad():
+        expected = model.forward_features(x)
+
+    model._create_functional_artifacts()
+    model._reset_functional_artifacts()
+
+    with torch.no_grad():
+        actual = model.forward_features(x)
+
+    assert torch.allclose(actual["cls"], expected["cls"], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(
+        actual["prompt_tokens"],
+        expected["prompt_tokens"],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        actual["patch_tokens"],
+        expected["patch_tokens"],
+        rtol=1e-5,
+        atol=1e-6,
+    )

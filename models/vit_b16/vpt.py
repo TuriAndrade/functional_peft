@@ -21,14 +21,28 @@ class ViTB16VPT(nn.Module):
         n_classes: int,
         prompt_length: int = 0,
         prompt_mode: str = "shallow",
+        prompt_dropout: Optional[float] = None,
         freeze_backbone: bool = True,
     ):
         super().__init__()
+
+        if prompt_length < 0:
+            raise ValueError("prompt_length must be non-negative")
+
+        if prompt_mode not in {"shallow", "deep"}:
+            raise ValueError("prompt_mode must be 'shallow' or 'deep'")
+
+        if prompt_dropout is not None and not (0.0 <= prompt_dropout < 1.0):
+            raise ValueError("prompt_dropout must be in [0, 1)")
 
         self.img_size = img_size
         self.n_classes = n_classes
         self.prompt_length = prompt_length
         self.prompt_mode = prompt_mode
+        default_dropout = 0.0 if prompt_mode == "shallow" else 0.1
+        self.prompt_dropout = (
+            default_dropout if prompt_dropout is None else float(prompt_dropout)
+        )
         self.is_backbone_frozen = freeze_backbone
 
         # Backbone
@@ -48,7 +62,7 @@ class ViTB16VPT(nn.Module):
                 self.backbone.embed_dim,
             )
         )
-        self.prompt_dropout_layer = nn.Dropout(0.0 if prompt_mode == "shallow" else 0.1)
+        self.prompt_dropout_layer = nn.Dropout(self.prompt_dropout)
         self.init_prompt()
 
     def freeze_backbone(self):
@@ -228,7 +242,11 @@ class ViTB16VPT(nn.Module):
         trainable_state_dict = {
             key: value.detach().cpu()
             for key, value in self.state_dict().items()
-            if key == "prompt" or key.startswith("head.")
+            if (
+                key == "prompt"
+                or key.startswith("head.")
+                or (not self.is_backbone_frozen and key.startswith("backbone."))
+            )
         }
 
         torch.save(trainable_state_dict, path)
