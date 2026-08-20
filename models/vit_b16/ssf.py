@@ -473,6 +473,12 @@ class ViTB16SSF(PEFTModel):
                     hidden,
                 )
 
+                value = apply_ssf(
+                    "attention_norm",
+                    value,
+                    layer_idx,
+                )
+
                 self._record_functional_participation(
                     "sublayer_input_channel",
                     (layer_idx, 0),
@@ -489,12 +495,6 @@ class ViTB16SSF(PEFTModel):
                         layer_idx,
                         0,
                     ],
-                )
-
-                value = apply_ssf(
-                    "attention_norm",
-                    value,
-                    layer_idx,
                 )
 
                 query = attention.transpose_for_scores(
@@ -610,6 +610,12 @@ class ViTB16SSF(PEFTModel):
                     hidden,
                 )
 
+                value = apply_ssf(
+                    "ffn_norm",
+                    value,
+                    layer_idx,
+                )
+
                 self._record_functional_participation(
                     "sublayer_input_channel",
                     (layer_idx, 1),
@@ -626,12 +632,6 @@ class ViTB16SSF(PEFTModel):
                         layer_idx,
                         1,
                     ],
-                )
-
-                value = apply_ssf(
-                    "ffn_norm",
-                    value,
-                    layer_idx,
                 )
 
                 # ======================================================
@@ -718,12 +718,12 @@ class ViTB16SSF(PEFTModel):
                 hidden,
             )
 
-            encoded = self._apply_final_cls_readout_gate(encoded)
-
-            return apply_ssf(
+            encoded = apply_ssf(
                 "final_norm",
                 encoded,
             )
+
+            return self._apply_final_cls_readout_gate(encoded)
 
         final_norm.forward = MethodType(
             norm_forward,
