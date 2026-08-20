@@ -288,7 +288,6 @@ class SupervisedTrainer:
         loader,
         save_name: str,
         topk: Sequence[int] = (1,),
-        enable_grad=False,
         device: str = "cuda",
         bootstrap: bool = False,
         bootstrap_num_samples: int = 1000,
@@ -310,25 +309,24 @@ class SupervisedTrainer:
             leave=False,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
         )
-        with torch.set_grad_enabled(enable_grad):
-            for x, y in pbar:
-                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-                logits = self.model(x)  # (B, C)
-                max_k = max(ks)
-                max_k = min(max_k, logits.size(1))  # clamp k to num classes
-                _, pred = logits.topk(max_k, dim=1)  # (B, max_k)
-                pred = pred.t()  # (max_k, B)
-                correct_mat = pred.eq(y.view(1, -1))  # (max_k, B)
+        for x, y in pbar:
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            logits = self.model(x)  # (B, C)
+            max_k = max(ks)
+            max_k = min(max_k, logits.size(1))  # clamp k to num classes
+            _, pred = logits.topk(max_k, dim=1)  # (B, max_k)
+            pred = pred.t()  # (max_k, B)
+            correct_mat = pred.eq(y.view(1, -1))  # (max_k, B)
 
-                bs = y.size(0)
-                n += bs
-                for k in ks:
-                    k_eff = min(k, logits.size(1))
-                    hits = correct_mat[:k_eff].any(dim=0).float()  # (B,)
-                    correct[k] += hits.sum().item()
+            bs = y.size(0)
+            n += bs
+            for k in ks:
+                k_eff = min(k, logits.size(1))
+                hits = correct_mat[:k_eff].any(dim=0).float()  # (B,)
+                correct[k] += hits.sum().item()
 
-                    if bootstrap:
-                        bootstrap_hits[k].append(hits.detach().cpu())
+                if bootstrap:
+                    bootstrap_hits[k].append(hits.detach().cpu())
 
         acc = {f"top{k}": (correct[k] / max(n, 1)) * 100.0 for k in ks}
         parts = [f"top{k}={acc[f'top{k}']:.2f}%" for k in ks]

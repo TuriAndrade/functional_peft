@@ -6,7 +6,7 @@ import os
 import math
 
 from datasets import datasets
-from models import vpt
+from models import models
 from optimizers import AdamW
 from trainers import SupervisedTrainer
 from utils import save_config, set_seed, seed_worker, parse_args_json
@@ -14,11 +14,9 @@ from utils import save_config, set_seed, seed_worker, parse_args_json
 
 def _build_parser():
     # ----- Parser -----
-    parser = argparse.ArgumentParser(
-        description="Visual Prompt Tuning trainer and evaluator."
-    )
+    parser = argparse.ArgumentParser(description="PEFT trainer and evaluator.")
 
-    # ----- Data -----
+    # ----- Dataset -----
     parser.add_argument(
         "--dataset-name",
         type=str,
@@ -35,19 +33,19 @@ def _build_parser():
         help="Which backbone to use.",
     )
 
-    # ----- VPT -----
+    # ----- PEFT method -----
     parser.add_argument(
-        "--prompt-length",
-        type=int,
-        default=0,
-        help="Prompt length.",
+        "--peft-name",
+        type=str,
+        default="vpt",
+        choices=["vpt", "lora", "adaptformer", "ssf"],
+        help="Which PEFT method to use.",
     )
     parser.add_argument(
-        "--prompt-mode",
-        type=str,
-        default="shallow",
-        choices=["shallow", "deep"],
-        help="Type of prompt to use.",
+        "--peft-config",
+        type=json.loads,
+        default={},
+        help="Config for the PEFT method.",
     )
     parser.add_argument(
         "--freeze-backbone",
@@ -140,14 +138,6 @@ def _build_parser():
         help="Interval for saving intermediate checlpoints. 0 disables it.",
     )
     parser.add_argument(
-        "--save-ckpt-all-seeds",
-        action="store_true",
-        help=(
-            "If --save-ckpt is enabled, save checkpoints for all seeds. "
-            "By default, checkpoints are saved only for the first seed."
-        ),
-    )
-    parser.add_argument(
         "--run-seeds",
         type=json.loads,
         default=[0],
@@ -180,8 +170,6 @@ def _build_parser():
         action="store_true",
         help="Enable early stopping.",
     )
-
-    # ----- Device -----
     parser.add_argument(
         "--device",
         type=str,
@@ -216,11 +204,13 @@ def _parse_args():
     return parse_args_json(parser)
 
 
-def _train_seed(args, run_seed: int, save_ckpt: bool):
+def _train_seed(args, run_seed: int):
     # ----- Save dir and name -----
     save_dir = args.save_dir
     save_name = (
-        f"{args.save_name}_{run_seed}" if args.save_name is not None else str(run_seed)
+        f"{args.save_name}_seed-{run_seed}"
+        if args.save_name is not None
+        else f"seed-{run_seed}"
     )
 
     if not args.override:
@@ -276,13 +266,12 @@ def _train_seed(args, run_seed: int, save_ckpt: bool):
         test_ds = None
         test_loader = None
 
-    # ----- VPT -----
-    model = vpt[args.backbone_name](
+    # ----- PEFT model -----
+    model = models[args.backbone_name][args.peft_name](
         img_size=img_size,
         n_classes=n_classes,
-        prompt_length=args.prompt_length,
-        prompt_mode=args.prompt_mode,
         freeze_backbone=args.freeze_backbone,
+        **args.peft_config,
     )
 
     if args.load_model_path:
@@ -324,7 +313,7 @@ def _train_seed(args, run_seed: int, save_ckpt: bool):
                 "train_ds": vars(train_ds),
                 "val_ds": vars(val_ds) if not args.eval_on_test else None,
                 "test_ds": vars(test_ds) if args.eval_on_test else None,
-                "vpt": vars(model),
+                "model": vars(model),
                 "optimizer": vars(optimizer),
                 "trainer": vars(trainer),
                 "param_count": model.get_param_count(),
@@ -346,7 +335,7 @@ def _train_seed(args, run_seed: int, save_ckpt: bool):
         early_stopping=args.early_stopping,
         patience=args.patience,
         device=args.device,
-        save_ckpt=save_ckpt,
+        save_ckpt=args.save_ckpt,
         save_ckpt_interval=args.save_ckpt_interval,
     )
 
@@ -354,7 +343,6 @@ def _train_seed(args, run_seed: int, save_ckpt: bool):
     trainer.evaluate_acc(
         loader=test_loader if args.eval_on_test else val_loader,
         topk=(1,),
-        enable_grad=False,
         save_name=f"{'test' if args.eval_on_test else 'val'}_acc_eval.json",
         bootstrap=args.bootstrap,
         bootstrap_num_samples=args.bootstrap_num_samples,
@@ -378,11 +366,9 @@ def _train_seed(args, run_seed: int, save_ckpt: bool):
 def main():
     args = _parse_args()
 
-    for i, run_seed in enumerate(args.run_seeds):
+    for run_seed in args.run_seeds:
         print(f"\n===== Training seed {run_seed} =====")
         _train_seed(
             args,
             run_seed,
-            save_ckpt=(i == 0 and args.save_ckpt)
-            or (args.save_ckpt_all_seeds and args.save_ckpt),
         )
