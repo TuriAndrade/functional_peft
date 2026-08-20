@@ -20,11 +20,14 @@ class PEFTModel(nn.Module, ABC):
         n_classes: int,
         freeze_backbone: bool = True,
     ):
+        if n_classes < 2:
+            raise ValueError("n_classes must be >= 2")
+
         super().__init__()
 
         self.backbone = backbone
-        self.n_classes = n_classes
-        self.is_backbone_frozen = freeze_backbone
+        self.n_classes = int(n_classes)
+        self.is_backbone_frozen = bool(freeze_backbone)
 
         if freeze_backbone:
             self.freeze_backbone()
