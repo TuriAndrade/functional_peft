@@ -1,6 +1,5 @@
 import math
 from types import MethodType
-from timm.layers import DropPath
 
 import torch
 import torch.nn as nn
@@ -18,13 +17,10 @@ class ViTB16LoRA(PEFTModel):
         img_size: int,
         n_classes: int,
         freeze_backbone: bool = True,
-        drop_path_rate: float = 0.1,
         rank: int = 8,
         lora_alpha: float | None = None,
         lora_targets=("query", "value"),
     ):
-        if not 0.0 <= drop_path_rate < 1.0:
-            raise ValueError("drop_path_rate must be in [0, 1)")
         if rank < 0:
             raise ValueError("rank must be non-negative")
 
@@ -48,16 +44,6 @@ class ViTB16LoRA(PEFTModel):
             backbone=ViTB16Backbone(img_size=img_size),
             n_classes=n_classes,
             freeze_backbone=freeze_backbone,
-        )
-
-        self.drop_path_rate = float(drop_path_rate)
-        drop_path_rates = torch.linspace(
-            0.0,
-            self.drop_path_rate,
-            self.backbone.num_layers,
-        ).tolist()
-        self.drop_paths = nn.ModuleList(
-            DropPath(rate) if rate > 0.0 else nn.Identity() for rate in drop_path_rates
         )
 
         self.img_size = img_size
@@ -93,37 +79,6 @@ class ViTB16LoRA(PEFTModel):
 
         if rank > 0:
             self._patch_lora_projections()
-
-        self._patch_drop_path()
-
-    def _patch_drop_path(self) -> None:
-        def make_forward(layer_idx):
-            def forward(block, hidden):
-                residual = hidden
-
-                hidden = block.attention_norm(hidden)
-                hidden, weights = block.attn(hidden)
-                hidden = residual + self.drop_paths[layer_idx](hidden)
-
-                residual = hidden
-
-                hidden = block.ffn_norm(hidden)
-                hidden = block.ffn(hidden)
-                hidden = residual + self.drop_paths[layer_idx](hidden)
-
-                return hidden, weights
-
-            return forward
-
-        for layer_idx, block in enumerate(self.backbone.blocks):
-            block.forward = MethodType(
-                make_forward(layer_idx),
-                block,
-            )
-
-    # ======================================================================
-    # LoRA
-    # ======================================================================
 
     def init_peft(
         self,
@@ -363,7 +318,6 @@ class ViTB16LoRA(PEFTModel):
                 )
 
                 attention_output = attention.proj_dropout(attention.out(context))
-                attention_output = self.drop_paths[layer_idx](attention_output)
 
                 self._record_sublayer_participation(
                     layer_idx,
@@ -432,7 +386,6 @@ class ViTB16LoRA(PEFTModel):
                 )
 
                 mlp_output = feed_forward.dropout(feed_forward.fc2(value))
-                mlp_output = self.drop_paths[layer_idx](mlp_output)
 
                 self._record_sublayer_participation(
                     layer_idx,

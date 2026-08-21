@@ -2,9 +2,9 @@
 slurm/
 logs/
 
-# Experiment results
-experiments/*/*/
-
+# Experiment
+experiments/**
+!experiments/**/*.py
 
 # Checkpoints
 third_party/vit_pytorch/ckpts/ViT-B_16.npz
