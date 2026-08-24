@@ -266,12 +266,12 @@ FINETUNING_METHOD_GROUPS = {
 
 
 # ======================================================================
-# BUILD RUNS
+# BUILD TUNING RUNS
 # ======================================================================
 def build_tuning_runs(
-    dataset_name_or_group: str,
-    backbone_name_or_group: str,
-    ft_name_or_group: str,
+    dataset_name_or_group: str = "all",
+    backbone_name_or_group: str = "all",
+    ft_name_or_group: str = "all",
     output_name: str = "top_1_acc_tuning",
     max_runs_per_file: int = 0,
 ):
@@ -327,6 +327,161 @@ def build_tuning_runs(
                     commands.append(
                         f"python peft_train_exe.py --args-json {shlex.quote(args_json)}"
                     )
+
+    if max_runs_per_file == 0:
+        chunks = [commands]
+    else:
+        chunks = [
+            commands[i : i + max_runs_per_file]
+            for i in range(0, len(commands), max_runs_per_file)
+        ]
+
+    for i, chunk in enumerate(chunks):
+        filename = (
+            f"{output_name}.txt" if max_runs_per_file == 0 else f"{output_name}_{i}.txt"
+        )
+
+        path = os.path.join(output_dir, filename)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(chunk) + "\n")
+
+
+# ======================================================================
+# EVAL ARGS
+# ======================================================================
+EVAL_SEEDS = [0, 1, 2]
+
+EVAL_ARGS = {
+    "batch_size": 64,
+    "gpu_batch_size": 8,
+    "early_stopping": False,
+    "start_lr": 1e-6,
+    "final_lr": 1e-5,
+    "warmup_epochs": 10,
+    "save_ckpt": True,
+    "run_seeds": EVAL_SEEDS,
+    "eval_on_test": True,
+    "bootstrap": False,
+}
+
+
+# ======================================================================
+# BUILD EVAL RUNS
+# ======================================================================
+def _best_tuning_config(tuning_dir: str):
+    best_acc = None
+    best_config = None
+
+    for run_name in sorted(os.listdir(tuning_dir)):
+        run_dir = os.path.join(tuning_dir, run_name)
+
+        if not os.path.isdir(run_dir):
+            continue
+
+        eval_path = os.path.join(run_dir, "val_acc_eval.json")
+        config_path = os.path.join(run_dir, "config.json")
+        summary_path = os.path.join(run_dir, "train_summary.json")
+
+        if not all(
+            os.path.isfile(path) for path in (eval_path, config_path, summary_path)
+        ):
+            continue
+
+        with open(eval_path, "r", encoding="utf-8") as f:
+            acc = json.load(f)["accuracy"]["top1"]
+
+        if best_acc is None or acc > best_acc:
+            with open(config_path, "r", encoding="utf-8") as f:
+                best_config = json.load(f)
+
+            with open(summary_path, "r", encoding="utf-8") as f:
+                best_epoch = json.load(f)["best_epoch"]
+
+            best_config["epochs"] = best_epoch
+            best_acc = acc
+
+    if best_config is None:
+        raise FileNotFoundError(f"No completed tuning runs found in: {tuning_dir}")
+
+    return best_config
+
+
+def build_eval_runs(
+    dataset_name_or_group: str = "all",
+    backbone_name_or_group: str = "all",
+    ft_name_or_group: str = "all",
+    output_name: str = "top_1_acc_eval",
+    max_runs_per_file: int = 0,
+):
+    if max_runs_per_file < 0:
+        raise ValueError("max_runs_per_file must be non-negative")
+
+    if dataset_name_or_group in DATASET_GROUPS:
+        dataset_names = DATASET_GROUPS[dataset_name_or_group]
+    elif dataset_name_or_group in DATASETS:
+        dataset_names = [dataset_name_or_group]
+    else:
+        raise ValueError(f"Unknown dataset or group: {dataset_name_or_group}")
+
+    if backbone_name_or_group in BACKBONE_GROUPS:
+        backbone_names = BACKBONE_GROUPS[backbone_name_or_group]
+    elif backbone_name_or_group in BACKBONES:
+        backbone_names = [backbone_name_or_group]
+    else:
+        raise ValueError(f"Unknown backbone or group: {backbone_name_or_group}")
+
+    if ft_name_or_group in FINETUNING_METHOD_GROUPS:
+        methods = FINETUNING_METHOD_GROUPS[ft_name_or_group]
+    elif ft_name_or_group in FINETUNING_METHODS:
+        methods = {ft_name_or_group: FINETUNING_METHODS[ft_name_or_group]}
+    else:
+        raise ValueError(f"Unknown fine-tuning method or group: {ft_name_or_group}")
+
+    experiments_dir = os.environ.get("EXPERIMENTS_DIR", "./experiments")
+    output_dir = os.path.dirname(os.path.abspath(__file__))
+
+    commands = []
+
+    for backbone_name in backbone_names:
+        for dataset_name in dataset_names:
+            for ft_name in methods:
+                tuning_dir = os.path.join(
+                    experiments_dir,
+                    "top_1_acc_tuning",
+                    backbone_name,
+                    dataset_name,
+                    ft_name,
+                )
+
+                best = _best_tuning_config(tuning_dir)
+
+                save_dir = os.path.join(
+                    experiments_dir,
+                    "top_1_acc_eval",
+                    backbone_name,
+                    dataset_name,
+                    ft_name,
+                )
+
+                args = {
+                    "dataset_name": dataset_name,
+                    "backbone_name": backbone_name,
+                    **EVAL_ARGS,
+                    "peft_name": best["peft_name"],
+                    "freeze_backbone": best["freeze_backbone"],
+                    "peft_config": best["peft_config"],
+                    "ref_lr": best["ref_lr"],
+                    "ref_wd": best["ref_wd"],
+                    "final_wd": best["final_wd"],
+                    "save_dir": save_dir,
+                    "save_name": best["save_name"],
+                }
+
+                args_json = json.dumps(args)
+                commands.append(
+                    f"python peft_train_exe.py --args-json {shlex.quote(args_json)}"
+                )
 
     if max_runs_per_file == 0:
         chunks = [commands]
