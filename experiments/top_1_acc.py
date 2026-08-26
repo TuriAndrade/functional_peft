@@ -471,6 +471,7 @@ def build_eval_runs(
                     "peft_name": best["peft_name"],
                     "freeze_backbone": best["freeze_backbone"],
                     "peft_config": best["peft_config"],
+                    "epochs": best["epochs"],
                     "ref_lr": best["ref_lr"],
                     "ref_wd": best["ref_wd"],
                     "final_wd": best["final_wd"],
