@@ -82,8 +82,13 @@ TUNING_ARGS = {
 # ======================================================================
 # TUNING SEARCH GRIDS
 # ======================================================================
-LR_SEARCH = [1e-3, 1e-2]
-WD_SEARCH = [1e-4, 1e-3]
+# Search grids follow the CVPR 2025 unified vision-PEFT study; Full FT uses a
+# lower LR range because the PEFT LR grid was too large for full-backbone tuning,
+# with the reduced range guided by prior ViT/VTAB full fine-tuning settings.
+FULL_FT_LR_SEARCH = [1e-4, 5e-4, 1e-3]
+FULL_FT_WD_SEARCH = [0.0, 1e-3, 1e-2]
+PEFT_LR_SEARCH = [1e-3, 1e-2]
+PEFT_WD_SEARCH = [1e-4, 1e-3]
 VPT_SHALLOW_PROMPT_SEARCH = [5, 10, 50, 100, 200]
 VPT_DEEP_PROMPT_SEARCH = [5, 10, 50, 100]
 LORA_RANK_SEARCH = [1, 8, 16, 32]
@@ -107,7 +112,7 @@ def linear_probe_args(lr, wd):
 
 
 def linear_probe_search():
-    return [linear_probe_args(lr, wd) for lr in LR_SEARCH for wd in WD_SEARCH]
+    return [linear_probe_args(lr, wd) for lr in PEFT_LR_SEARCH for wd in PEFT_WD_SEARCH]
 
 
 def full_ft_args(lr, wd):
@@ -126,7 +131,9 @@ def full_ft_args(lr, wd):
 
 
 def full_ft_search():
-    return [full_ft_args(lr, wd) for lr in LR_SEARCH for wd in WD_SEARCH]
+    return [
+        full_ft_args(lr, wd) for lr in FULL_FT_LR_SEARCH for wd in FULL_FT_WD_SEARCH
+    ]
 
 
 def vpt_args(lr, wd, prompt_length, prompt_mode):
@@ -149,8 +156,8 @@ def vpt_args(lr, wd, prompt_length, prompt_mode):
 def vpt_shallow_search():
     return [
         vpt_args(lr, wd, pl, "shallow")
-        for lr in LR_SEARCH
-        for wd in WD_SEARCH
+        for lr in PEFT_LR_SEARCH
+        for wd in PEFT_WD_SEARCH
         for pl in VPT_SHALLOW_PROMPT_SEARCH
     ]
 
@@ -158,8 +165,8 @@ def vpt_shallow_search():
 def vpt_deep_search():
     return [
         vpt_args(lr, wd, pl, "deep")
-        for lr in LR_SEARCH
-        for wd in WD_SEARCH
+        for lr in PEFT_LR_SEARCH
+        for wd in PEFT_WD_SEARCH
         for pl in VPT_DEEP_PROMPT_SEARCH
     ]
 
@@ -184,8 +191,8 @@ def lora_args(lr, wd, rank):
 def lora_search():
     return [
         lora_args(lr, wd, rank)
-        for lr in LR_SEARCH
-        for wd in WD_SEARCH
+        for lr in PEFT_LR_SEARCH
+        for wd in PEFT_WD_SEARCH
         for rank in LORA_RANK_SEARCH
     ]
 
@@ -210,8 +217,8 @@ def adaptformer_args(lr, wd, bottleneck_dim, scale):
 def adaptformer_search():
     return [
         adaptformer_args(lr, wd, dim, s)
-        for lr in LR_SEARCH
-        for wd in WD_SEARCH
+        for lr in PEFT_LR_SEARCH
+        for wd in PEFT_WD_SEARCH
         for dim in ADAPTFORMER_BOTTLENECK_DIM_SEARCH
         for s in ADAPTFORMER_SCALE_SEARCH
     ]
@@ -244,7 +251,7 @@ def ssf_args(lr, wd):
 
 
 def ssf_search():
-    return [ssf_args(lr, wd) for lr in LR_SEARCH for wd in WD_SEARCH]
+    return [ssf_args(lr, wd) for lr in PEFT_LR_SEARCH for wd in PEFT_WD_SEARCH]
 
 
 PEFT_METHODS = {
