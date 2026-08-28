@@ -1,6 +1,9 @@
 import json
 import os
 import shlex
+import csv
+import math
+import statistics
 
 # ======================================================================
 # DATASETS
@@ -508,3 +511,115 @@ def build_eval_runs(
 
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(chunk) + "\n")
+
+
+# ======================================================================
+# AGGREGATE EVAL RESULTS
+# ======================================================================
+def aggregate_eval_results(
+    dataset_name_or_group: str = "all",
+    backbone_name_or_group: str = "all",
+    ft_name_or_group: str = "all",
+    output_name: str = "top_1_acc_eval_results",
+):
+    if dataset_name_or_group in DATASET_GROUPS:
+        dataset_names = DATASET_GROUPS[dataset_name_or_group]
+    elif dataset_name_or_group in DATASETS:
+        dataset_names = [dataset_name_or_group]
+    else:
+        raise ValueError(f"Unknown dataset or group: {dataset_name_or_group}")
+
+    if backbone_name_or_group in BACKBONE_GROUPS:
+        backbone_names = BACKBONE_GROUPS[backbone_name_or_group]
+    elif backbone_name_or_group in BACKBONES:
+        backbone_names = [backbone_name_or_group]
+    else:
+        raise ValueError(f"Unknown backbone or group: {backbone_name_or_group}")
+
+    if ft_name_or_group in FINETUNING_METHOD_GROUPS:
+        method_names = list(FINETUNING_METHOD_GROUPS[ft_name_or_group])
+    elif ft_name_or_group in FINETUNING_METHODS:
+        method_names = [ft_name_or_group]
+    else:
+        raise ValueError(f"Unknown fine-tuning method or group: {ft_name_or_group}")
+
+    experiments_dir = os.environ.get("EXPERIMENTS_DIR", "./experiments")
+    output_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Two-sided 95% Student-t critical value for n=3 (df=2).
+    t_crit = 4.302652729911275
+
+    for backbone_name in backbone_names:
+        results = {method: {} for method in method_names}
+
+        for dataset_name in dataset_names:
+            for method_name in method_names:
+                eval_dir = os.path.join(
+                    experiments_dir,
+                    "top_1_acc_eval",
+                    backbone_name,
+                    dataset_name,
+                    method_name,
+                )
+
+                accuracies = {}
+
+                if os.path.isdir(eval_dir):
+                    for run_name in sorted(os.listdir(eval_dir)):
+                        run_dir = os.path.join(eval_dir, run_name)
+
+                        if not os.path.isdir(run_dir):
+                            continue
+
+                        seed = next(
+                            (
+                                seed
+                                for seed in EVAL_SEEDS
+                                if run_name.endswith(f"_seed-{seed}")
+                            ),
+                            None,
+                        )
+
+                        if seed is None:
+                            continue
+
+                        eval_path = os.path.join(run_dir, "test_acc_eval.json")
+
+                        if not os.path.isfile(eval_path):
+                            continue
+
+                        with open(eval_path, "r", encoding="utf-8") as f:
+                            accuracies[seed] = json.load(f)["accuracy"]["top1"]
+
+                if set(accuracies) != set(EVAL_SEEDS):
+                    missing = sorted(set(EVAL_SEEDS) - set(accuracies))
+                    raise FileNotFoundError(
+                        f"Missing eval seeds {missing} for "
+                        f"{backbone_name}/{dataset_name}/{method_name}"
+                    )
+
+                values = [accuracies[seed] for seed in EVAL_SEEDS]
+                mean = statistics.mean(values)
+                ci95 = t_crit * statistics.stdev(values) / math.sqrt(len(values))
+
+                results[method_name][dataset_name] = f"{mean:.2f} ± {ci95:.2f}"
+
+        output_path = os.path.join(
+            output_dir,
+            f"{output_name}.csv",
+        )
+
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["method", *dataset_names])
+
+            for method_name in method_names:
+                writer.writerow(
+                    [
+                        method_name,
+                        *[
+                            results[method_name][dataset_name]
+                            for dataset_name in dataset_names
+                        ],
+                    ]
+                )
