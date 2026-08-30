@@ -30,6 +30,12 @@ def _build_parser():
     parser.add_argument("--mc-samples", type=int, default=20)
     parser.add_argument("--eps", type=float, default=1e-12)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--run-seeds",
+        type=json.loads,
+        default=[0],
+        help="List of estimation seeds to run. Example: --run-seeds '[0, 1, 2]'",
+    )
 
     parser.add_argument("--save-dir", type=str, default=None)
     parser.add_argument("--save-name", type=str, default=None)
@@ -38,22 +44,23 @@ def _build_parser():
     return parser
 
 
-def main():
-    args = parse_args_json(_build_parser())
-
+def _estimate_seed(args, run_seed: int):
     # Build output path first and skip if already completed.
     save_dir = Path(args.save_dir)
 
     if args.save_name is not None:
         save_dir /= args.save_name
 
-    save_path = save_dir / "functional_signatures.npz"
+    save_path = save_dir / f"functional_signatures_seed-{run_seed}.npz"
 
     if save_path.exists():
-        print(f"Experiment already done: {save_path}")
+        print(f"Experiment already done: {save_path}. Skipping.")
         return
 
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set the seed for this functional-signature estimation run.
+    set_seed(run_seed)
 
     # Load the configuration of the trained model.
     model_path = Path(args.model_path)
@@ -72,10 +79,6 @@ def main():
 
     peft_name = args.peft_name or config_peft_name
     peft_config = config["peft_config"]
-
-    # Reproduce the training seed for deterministic data loading / estimation.
-    seed = config.get("run_seed", 0)
-    set_seed(seed)
 
     # Train+val task data used to estimate the model Fisher.
     ds = datasets[args.dataset_name](split="train+val")
@@ -106,7 +109,7 @@ def main():
     )
 
     # Flatten nested signature dictionaries into NPZ keys such as
-    # F__attention_head and C__mlp_neuron.
+    # F_m__attention_head_output and C_global_m__mlp_neuron.
     arrays = {
         f"{signature_name}__{component_name}": values.detach().cpu().numpy()
         for signature_name, signature in signatures.items()
@@ -119,11 +122,22 @@ def main():
         backbone_name=np.array(args.backbone_name),
         peft_name=np.array(peft_name),
         peft_config=np.array(json.dumps(peft_config)),
-        run_seed=np.array(seed),
+        run_seed=np.array(run_seed),
         mc_samples=np.array(args.mc_samples),
         eps=np.array(args.eps),
         **arrays,
     )
+
+
+def main():
+    args = parse_args_json(_build_parser())
+
+    for run_seed in args.run_seeds:
+        print(f"\n===== Functional-signature seed {run_seed} =====")
+        _estimate_seed(
+            args,
+            run_seed,
+        )
 
 
 if __name__ == "__main__":

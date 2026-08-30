@@ -211,6 +211,7 @@ def build_functional_signature_runs(
                         # the corresponding training seed.
                         "save_dir": str(model_path),
                         "verbose": VERBOSE,
+                        "run_seeds": list(EVAL_SEEDS),
                     }
 
                     args_json = json.dumps(args)
