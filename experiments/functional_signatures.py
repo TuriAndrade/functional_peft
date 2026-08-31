@@ -6,6 +6,7 @@ from pathlib import Path
 # ======================================================================
 # DATASETS
 # ======================================================================
+
 VTAB_NATURAL = [
     "vtab_caltech101",
     "vtab_cifar100",
@@ -35,6 +36,7 @@ VTAB_STRUCTURED = [
 ]
 
 VTAB = VTAB_NATURAL + VTAB_SPECIALIZED + VTAB_STRUCTURED
+
 DATASETS = VTAB + ["imagenet_val"]
 
 DATASET_GROUPS = {
@@ -50,7 +52,9 @@ DATASET_GROUPS = {
 # ======================================================================
 # BACKBONES
 # ======================================================================
+
 BACKBONES = ["vit_b16"]
+
 BACKBONE_GROUPS = {
     "all": BACKBONES,
 }
@@ -59,6 +63,7 @@ BACKBONE_GROUPS = {
 # ======================================================================
 # FINE-TUNING METHODS
 # ======================================================================
+
 PEFT_METHODS = (
     "vpt_shallow",
     "vpt_deep",
@@ -82,7 +87,12 @@ FINETUNING_METHOD_GROUPS = {
 # ======================================================================
 # FUNCTIONAL-SIGNATURE ESTIMATION ARGS
 # ======================================================================
+
+# Independently trained checkpoints.
 EVAL_SEEDS = (0, 1, 2)
+
+# Independent MC estimation runs within each checkpoint.
+MC_SEEDS = (0, 1, 2)
 
 MC_SAMPLES = 20
 BATCH_SIZE = 1
@@ -92,6 +102,7 @@ VERBOSE = True
 
 EVAL_EXPERIMENT_NAME = "top_1_acc_eval"
 ESTIMATE_EXE = "estimate_functional_signatures_exe.py"
+
 CHECKPOINT_NAME = "model.pt"
 CONFIG_NAME = "config.json"
 
@@ -99,48 +110,94 @@ CONFIG_NAME = "config.json"
 # ======================================================================
 # HELPERS
 # ======================================================================
-def _resolve_names(name_or_group, names, groups, kind):
+
+
+def _resolve_names(
+    name_or_group,
+    names,
+    groups,
+    kind,
+):
     if name_or_group in groups:
         return list(groups[name_or_group])
 
     if name_or_group in names:
         return [name_or_group]
 
-    raise ValueError(f"Unknown {kind} or group: {name_or_group}")
+    raise ValueError(f"Unknown {kind} or group: " f"{name_or_group}")
 
 
-def _find_eval_runs(eval_dir: Path):
+def _find_eval_runs(
+    eval_dir: Path,
+):
+    """
+    Validate that eval_dir contains exactly one completed checkpoint
+    for each required training seed.
+
+    The returned directories are only used for validation and for
+    reading a representative config. The estimation script receives
+    eval_dir itself as model_path.
+    """
     if not eval_dir.is_dir():
-        raise FileNotFoundError(f"Eval directory not found: {eval_dir}")
+        raise FileNotFoundError(f"Eval directory not found: " f"{eval_dir}")
+
+    run_dirs = sorted(path for path in eval_dir.iterdir() if path.is_dir())
+
+    if not run_dirs:
+        raise FileNotFoundError(
+            f"No eval checkpoint directories " f"found in: {eval_dir}"
+        )
 
     runs_by_seed = {}
 
-    for run_dir in sorted(path for path in eval_dir.iterdir() if path.is_dir()):
+    for run_dir in run_dirs:
         config_path = run_dir / CONFIG_NAME
+
         checkpoint_path = run_dir / CHECKPOINT_NAME
 
-        if not config_path.is_file() or not checkpoint_path.is_file():
-            continue
+        # The estimation script treats every subdirectory as a
+        # checkpoint, so every subdirectory must be complete.
+        if not config_path.is_file():
+            raise FileNotFoundError(
+                f"Missing {CONFIG_NAME} in " f"checkpoint directory: " f"{run_dir}"
+            )
 
-        with config_path.open("r", encoding="utf-8") as f:
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Missing {CHECKPOINT_NAME} in " f"checkpoint directory: " f"{run_dir}"
+            )
+
+        with config_path.open(
+            "r",
+            encoding="utf-8",
+        ) as f:
             config = json.load(f)
 
         seed = config.get("run_seed")
+
         if seed not in EVAL_SEEDS:
-            continue
+            raise RuntimeError(
+                f"Found unexpected eval seed "
+                f"{seed} in {run_dir}. "
+                f"Expected only {EVAL_SEEDS}."
+            )
 
         if seed in runs_by_seed:
             raise RuntimeError(
-                f"Found multiple completed eval runs for seed {seed} in {eval_dir}: "
-                f"{runs_by_seed[seed].name}, {run_dir.name}"
+                "Found multiple completed "
+                f"eval runs for seed {seed} "
+                f"in {eval_dir}: "
+                f"{runs_by_seed[seed].name}, "
+                f"{run_dir.name}"
             )
 
         runs_by_seed[seed] = run_dir
 
     missing = [seed for seed in EVAL_SEEDS if seed not in runs_by_seed]
+
     if missing:
         raise FileNotFoundError(
-            f"Missing eval checkpoints for seeds {missing} in: {eval_dir}"
+            "Missing eval checkpoints " f"for seeds {missing} in: " f"{eval_dir}"
         )
 
     return [runs_by_seed[seed] for seed in EVAL_SEEDS]
@@ -149,6 +206,8 @@ def _find_eval_runs(eval_dir: Path):
 # ======================================================================
 # BUILD FUNCTIONAL-SIGNATURE RUNS
 # ======================================================================
+
+
 def build_functional_signature_runs(
     dataset_name_or_group: str = "all",
     backbone_name_or_group: str = "all",
@@ -157,7 +216,7 @@ def build_functional_signature_runs(
     max_runs_per_file: int = 0,
 ):
     if max_runs_per_file < 0:
-        raise ValueError("max_runs_per_file must be non-negative")
+        raise ValueError("max_runs_per_file must " "be non-negative")
 
     dataset_names = _resolve_names(
         dataset_name_or_group,
@@ -165,12 +224,14 @@ def build_functional_signature_runs(
         DATASET_GROUPS,
         "dataset",
     )
+
     backbone_names = _resolve_names(
         backbone_name_or_group,
         BACKBONES,
         BACKBONE_GROUPS,
         "backbone",
     )
+
     method_names = _resolve_names(
         ft_name_or_group,
         FINETUNING_METHODS,
@@ -178,7 +239,13 @@ def build_functional_signature_runs(
         "fine-tuning method",
     )
 
-    experiments_dir = Path(os.environ.get("EXPERIMENTS_DIR", "./experiments"))
+    experiments_dir = Path(
+        os.environ.get(
+            "EXPERIMENTS_DIR",
+            "./experiments",
+        )
+    )
+
     output_dir = Path(__file__).resolve().parent
 
     commands = []
@@ -194,45 +261,67 @@ def build_functional_signature_runs(
                     / ft_name
                 )
 
-                for model_path in _find_eval_runs(eval_dir):
-                    with (model_path / CONFIG_NAME).open("r", encoding="utf-8") as f:
-                        config = json.load(f)
+                # Validate the three independently trained checkpoints.
+                eval_runs = _find_eval_runs(eval_dir)
 
-                    args = {
-                        "dataset_name": dataset_name,
-                        "backbone_name": backbone_name,
-                        "peft_name": config["peft_name"],
-                        "model_path": str(model_path),
-                        "batch_size": BATCH_SIZE,
-                        "mc_samples": MC_SAMPLES,
-                        "eps": EPS,
-                        "device": DEVICE,
-                        # Store the signatures next to the checkpoint/config for
-                        # the corresponding training seed.
-                        "save_dir": str(model_path),
-                        "verbose": VERBOSE,
-                        "run_seeds": list(EVAL_SEEDS),
-                    }
+                # All checkpoint configs should describe the same
+                # adaptation method/configuration. The estimation
+                # script validates this again across checkpoints.
+                with (eval_runs[0] / CONFIG_NAME).open(
+                    "r",
+                    encoding="utf-8",
+                ) as f:
+                    config = json.load(f)
 
-                    args_json = json.dumps(args)
-                    commands.append(
-                        f"python {ESTIMATE_EXE} --args-json {shlex.quote(args_json)}"
-                    )
+                args = {
+                    "dataset_name": (dataset_name),
+                    "backbone_name": (backbone_name),
+                    "peft_name": (config["peft_name"]),
+                    # Parent directory containing all independently
+                    # trained checkpoint subdirectories.
+                    "model_path": str(eval_dir),
+                    "ckpt_name": (CHECKPOINT_NAME),
+                    "batch_size": (BATCH_SIZE),
+                    "mc_samples": (MC_SAMPLES),
+                    "eps": (EPS),
+                    "device": (DEVICE),
+                    # MC estimation seeds within each checkpoint.
+                    "run_seeds": list(MC_SEEDS),
+                    "verbose": (VERBOSE),
+                }
+
+                args_json = json.dumps(args)
+
+                commands.append(
+                    f"python {ESTIMATE_EXE} "
+                    f"--args-json "
+                    f"{shlex.quote(args_json)}"
+                )
 
     if max_runs_per_file == 0:
         chunks = [commands]
+
     else:
         chunks = [
             commands[i : i + max_runs_per_file]
-            for i in range(0, len(commands), max_runs_per_file)
+            for i in range(
+                0,
+                len(commands),
+                max_runs_per_file,
+            )
         ]
 
     for i, chunk in enumerate(chunks):
         filename = (
-            f"{output_name}.txt" if max_runs_per_file == 0 else f"{output_name}_{i}.txt"
+            f"{output_name}.txt"
+            if max_runs_per_file == 0
+            else (f"{output_name}_" f"{i}.txt")
         )
 
         path = output_dir / filename
 
-        with path.open("w", encoding="utf-8") as f:
+        with path.open(
+            "w",
+            encoding="utf-8",
+        ) as f:
             f.write("\n".join(chunk) + "\n")

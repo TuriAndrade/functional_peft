@@ -847,17 +847,82 @@ class PEFTModel(nn.Module, ABC):
 
         return signature
 
+    def _merge_functional_statistics(
+        self,
+        statistics,
+    ):
+        """
+        Pool additive sufficient statistics from repeated MC estimates
+        of the SAME trained checkpoint.
+        """
+        if isinstance(statistics, Mapping):
+            statistics = (statistics,)
+        else:
+            statistics = tuple(statistics)
+
+        if not statistics:
+            raise ValueError("statistics must not be empty")
+
+        tensor_keys = (
+            "participation_sum",
+            "fisher_sum_m",
+            "score_sum_e",
+            "fisher_sum_e",
+            "cross_sum_m",
+            "coupling_square_sum_m",
+            "cross_sum_e",
+            "coupling_score_sum_e",
+            "coupling_square_sum_e",
+        )
+
+        count_keys = (
+            "input_count",
+            "sample_count_m",
+            "sample_count_e",
+        )
+
+        first = statistics[0]
+
+        merged = {key: int(first[key]) for key in count_keys}
+
+        merged.update(
+            {
+                key: (torch.as_tensor(first[key]).detach().cpu().clone())
+                for key in tensor_keys
+            }
+        )
+
+        for stats in statistics[1:]:
+            for key in count_keys:
+                merged[key] += int(stats[key])
+
+            for key in tensor_keys:
+                value = torch.as_tensor(stats[key]).detach().cpu()
+
+                if value.shape != merged[key].shape:
+                    raise ValueError(f"incompatible shape for '{key}'")
+
+                merged[key].add_(value.to(dtype=merged[key].dtype))
+
+        if min(merged[key] for key in count_keys) <= 0:
+            raise ValueError("statistics contain an invalid sample count")
+
+        return merged
+
     # ======================================================================
-    # Functional-signature estimator
+    # Functional-statistics estimator
     # ======================================================================
 
-    def estimate_functional_signatures(
+    def estimate_functional_statistics(
         self,
         loader,
         mc_samples: int = 20,
-        eps: float = 1e-12,
         verbose: bool = False,
     ):
+        """
+        Estimate additive sufficient statistics for the functional
+        and coupling signatures.
+        """
         if mc_samples < 1:
             raise ValueError("mc_samples must be positive")
 
@@ -866,35 +931,30 @@ class PEFTModel(nn.Module, ABC):
         self._set_gate_grads(True)
         self.eval()
 
-        gate_names, gates = zip(*self.functional_gates.items())
+        try:
+            gate_names, gates = zip(*self.functional_gates.items())
 
-        (
-            sizes,
-            total_size,
-        ) = self._functional_layout()
+            _, total_size = self._functional_layout()
 
-        n_layers = self.backbone.num_layers
+            n_layers = self.backbone.num_layers
 
-        coupling_unit_shape = self._coupling_unit_shape()
+            coupling_unit_size = self.coupling_gates.numel()
 
-        coupling_unit_size = self.coupling_gates.numel()
+            use_couplings = coupling_unit_size > 0
 
-        use_couplings = coupling_unit_size > 0
+            coupling_size = coupling_unit_size + n_layers + 1 if use_couplings else 0
 
-        coupling_size = coupling_unit_size + n_layers + 1 if use_couplings else 0
+            reference = gates[0]
+            device = reference.device
 
-        reference = gates[0]
-        device = reference.device
+            participation_sum = reference.new_zeros(total_size)
 
-        participation_sum = reference.new_zeros(total_size)
+            fisher_sum_m = reference.new_zeros(total_size)
 
-        fisher_sum_m = reference.new_zeros(total_size)
+            score_sum_e = reference.new_zeros(total_size)
 
-        score_sum_e = reference.new_zeros(total_size)
+            fisher_sum_e = reference.new_zeros(total_size)
 
-        fisher_sum_e = reference.new_zeros(total_size)
-
-        if use_couplings:
             cross_sum_m = reference.new_zeros(
                 total_size,
                 coupling_size,
@@ -911,157 +971,223 @@ class PEFTModel(nn.Module, ABC):
 
             coupling_square_sum_e = reference.new_zeros(coupling_size)
 
-        params = (*gates, self.coupling_gates) if use_couplings else gates
-
-        bases = {}
-
-        input_count = 0
-        sample_count_m = 0
-        sample_count_e = 0
-
-        iterator = (
-            tqdm(
-                loader,
-                desc="Functional signatures",
-            )
-            if verbose
-            else loader
-        )
-
-        for batch in iterator:
-            x = batch[0].to(
-                device,
-                non_blocking=True,
-            )
-
-            y = batch[1].to(
-                device=device,
-                dtype=torch.long,
-                non_blocking=True,
-            )
-
-            with torch.no_grad():
-                for name in self._functional_shapes:
-                    self._participation(name).zero_()
-
-            log_probs = self(x).log_softmax(dim=-1)
-
-            participation_sum.add_(
-                torch.cat(
-                    [
-                        self._participation(name).reshape(-1)
-                        for name in self._functional_shapes
-                    ]
-                )
-            )
-
-            input_count += x.shape[0]
-
-            # Model Fisher: y ~ p(y | x).
-            labels_m = torch.multinomial(
-                log_probs.detach().exp(),
-                mc_samples,
-                replacement=True,
-            )
-
-            selected_m = log_probs.gather(
-                1,
-                labels_m,
-            ).flatten()
-
-            # Observed-label score: y = y*.
-            selected_e = log_probs.gather(
-                1,
-                y.reshape(
-                    -1,
-                    1,
-                ),
-            ).flatten()
-
-            n_m = selected_m.numel()
-            n_e = selected_e.numel()
-
-            selected = torch.cat(
+            params = (
                 (
-                    selected_m,
-                    selected_e,
+                    *gates,
+                    self.coupling_gates,
                 )
+                if use_couplings
+                else gates
             )
 
-            basis = bases.get(selected.numel())
+            bases = {}
 
-            if basis is None:
-                basis = torch.eye(
-                    selected.numel(),
+            input_count = 0
+            sample_count_m = 0
+            sample_count_e = 0
+
+            iterator = (
+                tqdm(
+                    loader,
+                    desc="Functional statistics",
+                )
+                if verbose
+                else loader
+            )
+
+            for batch in iterator:
+                x = batch[0].to(
+                    device,
+                    non_blocking=True,
+                )
+
+                y = batch[1].to(
                     device=device,
-                    dtype=selected.dtype,
+                    dtype=torch.long,
+                    non_blocking=True,
                 )
 
-                bases[selected.numel()] = basis
+                with torch.no_grad():
+                    for name in self._functional_shapes:
+                        self._participation(name).zero_()
 
-            raw_scores = torch.autograd.grad(
-                selected,
-                params,
-                grad_outputs=basis,
-                is_grads_batched=True,
-            )
+                log_probs = self(x).log_softmax(dim=-1)
 
-            functional_scores = self._build_functional_scores(
-                raw_scores,
-                gate_names,
-                gates,
-            )
-
-            coupling_scores = (
-                self._build_coupling_scores(raw_scores[-1]) if use_couplings else None
-            )
-
-            functional_m = functional_scores[:n_m]
-
-            functional_e = functional_scores[n_m:]
-
-            fisher_sum_m.add_(functional_m.square().sum(dim=0))
-
-            score_sum_e.add_(functional_e.sum(dim=0))
-
-            fisher_sum_e.add_(functional_e.square().sum(dim=0))
-
-            if use_couplings:
-                coupling_m = coupling_scores[:n_m]
-
-                coupling_e = coupling_scores[n_m:]
-
-                cross_sum_m.addmm_(
-                    functional_m.T,
-                    coupling_m,
+                participation_sum.add_(
+                    torch.cat(
+                        [
+                            self._participation(name).reshape(-1)
+                            for name in self._functional_shapes
+                        ]
+                    )
                 )
 
-                coupling_square_sum_m.add_(coupling_m.square().sum(dim=0))
+                input_count += x.shape[0]
 
-                cross_sum_e.addmm_(
-                    functional_e.T,
-                    coupling_e,
+                # Model Fisher:
+                # y~ ~ p(y | x)
+                labels_m = torch.multinomial(
+                    log_probs.detach().exp(),
+                    mc_samples,
+                    replacement=True,
                 )
 
-                coupling_score_sum_e.add_(coupling_e.sum(dim=0))
+                selected_m = log_probs.gather(
+                    1,
+                    labels_m,
+                ).flatten()
 
-                coupling_square_sum_e.add_(coupling_e.square().sum(dim=0))
+                # Observed-label score:
+                # y = y*
+                selected_e = log_probs.gather(
+                    1,
+                    y.reshape(
+                        -1,
+                        1,
+                    ),
+                ).flatten()
 
-            sample_count_m += n_m
-            sample_count_e += n_e
+                n_m = selected_m.numel()
+                n_e = selected_e.numel()
 
-        if input_count == 0:
+                selected = torch.cat(
+                    (
+                        selected_m,
+                        selected_e,
+                    )
+                )
+
+                basis = bases.get(selected.numel())
+
+                if basis is None:
+                    basis = torch.eye(
+                        selected.numel(),
+                        device=device,
+                        dtype=selected.dtype,
+                    )
+
+                    bases[selected.numel()] = basis
+
+                raw_scores = torch.autograd.grad(
+                    selected,
+                    params,
+                    grad_outputs=basis,
+                    is_grads_batched=True,
+                )
+
+                functional_scores = self._build_functional_scores(
+                    raw_scores,
+                    gate_names,
+                    gates,
+                )
+
+                coupling_scores = (
+                    self._build_coupling_scores(raw_scores[-1])
+                    if use_couplings
+                    else None
+                )
+
+                functional_m = functional_scores[:n_m]
+
+                functional_e = functional_scores[n_m:]
+
+                fisher_sum_m.add_(functional_m.square().sum(dim=0))
+
+                score_sum_e.add_(functional_e.sum(dim=0))
+
+                fisher_sum_e.add_(functional_e.square().sum(dim=0))
+
+                if use_couplings:
+                    coupling_m = coupling_scores[:n_m]
+
+                    coupling_e = coupling_scores[n_m:]
+
+                    cross_sum_m.addmm_(
+                        functional_m.T,
+                        coupling_m,
+                    )
+
+                    coupling_square_sum_m.add_(coupling_m.square().sum(dim=0))
+
+                    cross_sum_e.addmm_(
+                        functional_e.T,
+                        coupling_e,
+                    )
+
+                    coupling_score_sum_e.add_(coupling_e.sum(dim=0))
+
+                    coupling_square_sum_e.add_(coupling_e.square().sum(dim=0))
+
+                sample_count_m += n_m
+                sample_count_e += n_e
+
+            if input_count == 0:
+                raise ValueError("loader is empty")
+
+            return {
+                "input_count": (input_count),
+                "sample_count_m": (sample_count_m),
+                "sample_count_e": (sample_count_e),
+                "participation_sum": (participation_sum.detach().cpu()),
+                "fisher_sum_m": (fisher_sum_m.detach().cpu()),
+                "score_sum_e": (score_sum_e.detach().cpu()),
+                "fisher_sum_e": (fisher_sum_e.detach().cpu()),
+                "cross_sum_m": (cross_sum_m.detach().cpu()),
+                "coupling_square_sum_m": (coupling_square_sum_m.detach().cpu()),
+                "cross_sum_e": (cross_sum_e.detach().cpu()),
+                "coupling_score_sum_e": (coupling_score_sum_e.detach().cpu()),
+                "coupling_square_sum_e": (coupling_square_sum_e.detach().cpu()),
+            }
+
+        finally:
             self._set_gate_grads(False)
 
-            raise ValueError("loader is empty")
+    # ======================================================================
+    # Statistics -> functional signatures
+    # ======================================================================
 
-        participation = participation_sum / input_count
+    def functional_signatures_from_statistics(
+        self,
+        statistics,
+        eps: float = 1e-12,
+    ):
+        """
+        Pool MC statistics from the SAME trained checkpoint and
+        reconstruct one checkpoint-level functional signature.
+        """
+        if eps <= 0:
+            raise ValueError("eps must be positive")
 
-        fisher_m = fisher_sum_m / sample_count_m
+        self._create_functional_artifacts()
 
-        mean_e = score_sum_e / sample_count_e
+        (
+            sizes,
+            total_size,
+        ) = self._functional_layout()
 
-        fisher_e = fisher_sum_e / sample_count_e
+        n_layers = self.backbone.num_layers
+
+        coupling_unit_shape = self._coupling_unit_shape()
+
+        coupling_unit_size = self.coupling_gates.numel()
+
+        use_couplings = coupling_unit_size > 0
+
+        stats = self._merge_functional_statistics(statistics)
+
+        input_count = stats["input_count"]
+
+        sample_count_m = stats["sample_count_m"]
+
+        sample_count_e = stats["sample_count_e"]
+
+        participation = stats["participation_sum"] / input_count
+
+        fisher_m = stats["fisher_sum_m"] / sample_count_m
+
+        mean_e = stats["score_sum_e"] / sample_count_e
+
+        fisher_e = stats["fisher_sum_e"] / sample_count_e
 
         variance_e = (fisher_e - mean_e.square()).clamp_min(0)
 
@@ -1075,27 +1201,27 @@ class PEFTModel(nn.Module, ABC):
                 tail,
             )
 
-        P_signature = unpack(participation)
+        P = unpack(participation)
 
-        F_m_signature = unpack(fisher_m)
+        F_m = unpack(fisher_m)
 
-        S_m_signature = self._make_sensitivity_signature(
-            F_m_signature,
-            P_signature,
+        S_m = self._make_sensitivity_signature(
+            F_m,
+            P,
             eps,
         )
 
-        U_e_signature = unpack(mean_e)
+        U_e = unpack(mean_e)
 
-        F_e_signature = unpack(fisher_e)
+        F_e = unpack(fisher_e)
 
-        S_e_signature = self._make_sensitivity_signature(
-            F_e_signature,
-            P_signature,
+        S_e = self._make_sensitivity_signature(
+            F_e,
+            P,
             eps,
         )
 
-        bias_e = (
+        B_e = unpack(
             (mean_e.square() / fisher_e)
             .nan_to_num(
                 nan=0.0,
@@ -1108,41 +1234,39 @@ class PEFTModel(nn.Module, ABC):
             )
         )
 
-        B_e_signature = unpack(bias_e)
+        reference = stats["participation_sum"]
 
         if use_couplings:
-            coupling_second_m = coupling_square_sum_m / sample_count_m
+            coupling_second_m = stats["coupling_square_sum_m"] / sample_count_m
 
             C_m = (
-                (
-                    (cross_sum_m / sample_count_m)
-                    / fisher_m.sqrt()[
-                        :,
-                        None,
-                    ]
-                    / coupling_second_m.sqrt()[None]
-                )
-                .nan_to_num(
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
-                .clamp(
-                    -1,
-                    1,
-                )
+                (stats["cross_sum_m"] / sample_count_m)
+                / fisher_m.sqrt()[
+                    :,
+                    None,
+                ]
+                / coupling_second_m.sqrt()[None]
             )
 
-            coupling_mean_e = coupling_score_sum_e / sample_count_e
+            C_m = C_m.nan_to_num(
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp(
+                -1,
+                1,
+            )
 
-            coupling_second_e = coupling_square_sum_e / sample_count_e
+            coupling_mean_e = stats["coupling_score_sum_e"] / sample_count_e
+
+            coupling_second_e = stats["coupling_square_sum_e"] / sample_count_e
 
             coupling_variance_e = (
                 coupling_second_e - coupling_mean_e.square()
             ).clamp_min(0)
 
             C_e = (
-                cross_sum_e / sample_count_e
+                stats["cross_sum_e"] / sample_count_e
                 - mean_e[
                     :,
                     None,
@@ -1151,23 +1275,21 @@ class PEFTModel(nn.Module, ABC):
             )
 
             C_e = (
-                (
-                    C_e
-                    / variance_e.sqrt()[
-                        :,
-                        None,
-                    ]
-                    / coupling_variance_e.sqrt()[None]
-                )
-                .nan_to_num(
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
-                .clamp(
-                    -1,
-                    1,
-                )
+                C_e
+                / variance_e.sqrt()[
+                    :,
+                    None,
+                ]
+                / coupling_variance_e.sqrt()[None]
+            )
+
+            C_e = C_e.nan_to_num(
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp(
+                -1,
+                1,
             )
 
             unit = slice(
@@ -1180,7 +1302,7 @@ class PEFTModel(nn.Module, ABC):
                 coupling_unit_size + n_layers,
             )
 
-            C_unit_m_signature = unpack(
+            C_unit_m = unpack(
                 C_m[
                     :,
                     unit,
@@ -1188,7 +1310,7 @@ class PEFTModel(nn.Module, ABC):
                 coupling_unit_shape,
             )
 
-            C_layer_m_signature = unpack(
+            C_layer_m = unpack(
                 C_m[
                     :,
                     layer,
@@ -1196,14 +1318,14 @@ class PEFTModel(nn.Module, ABC):
                 (n_layers,),
             )
 
-            C_global_m_signature = unpack(
+            C_global_m = unpack(
                 C_m[
                     :,
                     -1,
                 ]
             )
 
-            C_unit_e_signature = unpack(
+            C_unit_e = unpack(
                 C_e[
                     :,
                     unit,
@@ -1211,7 +1333,7 @@ class PEFTModel(nn.Module, ABC):
                 coupling_unit_shape,
             )
 
-            C_layer_e_signature = unpack(
+            C_layer_e = unpack(
                 C_e[
                     :,
                     layer,
@@ -1219,7 +1341,7 @@ class PEFTModel(nn.Module, ABC):
                 (n_layers,),
             )
 
-            C_global_e_signature = unpack(
+            C_global_e = unpack(
                 C_e[
                     :,
                     -1,
@@ -1227,7 +1349,7 @@ class PEFTModel(nn.Module, ABC):
             )
 
         else:
-            C_unit_m_signature = unpack(
+            C_unit_m = unpack(
                 reference.new_zeros(
                     total_size,
                     *coupling_unit_shape,
@@ -1235,7 +1357,7 @@ class PEFTModel(nn.Module, ABC):
                 coupling_unit_shape,
             )
 
-            C_layer_m_signature = unpack(
+            C_layer_m = unpack(
                 reference.new_zeros(
                     total_size,
                     n_layers,
@@ -1243,9 +1365,9 @@ class PEFTModel(nn.Module, ABC):
                 (n_layers,),
             )
 
-            C_global_m_signature = unpack(reference.new_zeros(total_size))
+            C_global_m = unpack(reference.new_zeros(total_size))
 
-            C_unit_e_signature = unpack(
+            C_unit_e = unpack(
                 reference.new_zeros(
                     total_size,
                     *coupling_unit_shape,
@@ -1253,7 +1375,7 @@ class PEFTModel(nn.Module, ABC):
                 coupling_unit_shape,
             )
 
-            C_layer_e_signature = unpack(
+            C_layer_e = unpack(
                 reference.new_zeros(
                     total_size,
                     n_layers,
@@ -1261,22 +1383,276 @@ class PEFTModel(nn.Module, ABC):
                 (n_layers,),
             )
 
-            C_global_e_signature = unpack(reference.new_zeros(total_size))
-
-        self._set_gate_grads(False)
+            C_global_e = unpack(reference.new_zeros(total_size))
 
         return {
-            "P": P_signature,
-            "F_m": F_m_signature,
-            "S_m": S_m_signature,
-            "C_unit_m": C_unit_m_signature,
-            "C_layer_m": C_layer_m_signature,
-            "C_global_m": C_global_m_signature,
-            "U_e": U_e_signature,
-            "F_e": F_e_signature,
-            "S_e": S_e_signature,
-            "B_e": B_e_signature,
-            "C_unit_e": C_unit_e_signature,
-            "C_layer_e": C_layer_e_signature,
-            "C_global_e": C_global_e_signature,
+            "P": P,
+            "F_m": F_m,
+            "S_m": S_m,
+            "C_unit_m": C_unit_m,
+            "C_layer_m": C_layer_m,
+            "C_global_m": C_global_m,
+            "U_e": U_e,
+            "F_e": F_e,
+            "S_e": S_e,
+            "B_e": B_e,
+            "C_unit_e": C_unit_e,
+            "C_layer_e": C_layer_e,
+            "C_global_e": C_global_e,
         }
+
+    # ======================================================================
+    # Reliability
+    # ======================================================================
+
+    @staticmethod
+    def _icc_absolute_agreement(
+        values,
+    ):
+        """
+        Compute ICC(A,1) and ICC(A,k).
+
+        Rows are functional coordinates.
+        Columns are repeated estimates.
+        """
+        values = torch.as_tensor(values).detach().double()
+
+        if values.ndim != 2:
+            raise ValueError(
+                "values must have shape " "[n_coordinates, k_measurements]"
+            )
+
+        n, k = values.shape
+
+        if n < 2 or k < 2:
+            return (
+                float("nan"),
+                float("nan"),
+            )
+
+        if not torch.isfinite(values).all():
+            raise ValueError("ICC input contains non-finite values")
+
+        grand_mean = values.mean()
+
+        row_means = values.mean(dim=1)
+
+        column_means = values.mean(dim=0)
+
+        ss_rows = k * (row_means - grand_mean).square().sum()
+
+        ss_columns = n * (column_means - grand_mean).square().sum()
+
+        residual = (
+            values
+            - row_means[
+                :,
+                None,
+            ]
+            - column_means[
+                None,
+                :,
+            ]
+            + grand_mean
+        )
+
+        ss_error = residual.square().sum()
+
+        ms_rows = ss_rows / (n - 1)
+
+        ms_columns = ss_columns / (k - 1)
+
+        ms_error = ss_error / ((n - 1) * (k - 1))
+
+        numerator = ms_rows - ms_error
+
+        denominator_a1 = (
+            ms_rows + (k - 1) * ms_error + (k / n) * (ms_columns - ms_error)
+        )
+
+        denominator_ak = ms_rows + (ms_columns - ms_error) / n
+
+        def ratio(
+            denominator,
+        ):
+            if (
+                not torch.isfinite(denominator)
+                or denominator.abs() <= torch.finfo(values.dtype).eps
+            ):
+                return float("nan")
+
+            return float((numerator / denominator).item())
+
+        return (
+            ratio(denominator_a1),
+            ratio(denominator_ak),
+        )
+
+    def _functional_signatures_icc(
+        self,
+        signatures,
+    ):
+        """
+        Compute ICC independently for each signature and component family.
+        """
+        signatures = tuple(signatures)
+
+        if len(signatures) < 2:
+            raise ValueError("at least two signatures are required")
+
+        names = tuple(signatures[0])
+
+        if any(tuple(signature) != names for signature in signatures[1:]):
+            raise ValueError("signatures have incompatible keys")
+
+        icc_a1 = {}
+        icc_ak = {}
+
+        for name in names:
+            components = tuple(signatures[0][name])
+
+            if any(
+                tuple(signature[name]) != components for signature in signatures[1:]
+            ):
+                raise ValueError(
+                    f"signature '{name}' has " "incompatible component keys"
+                )
+
+            icc_a1[name] = {}
+            icc_ak[name] = {}
+
+            for component in components:
+                values = [
+                    (torch.as_tensor(signature[name][component]).detach().cpu())
+                    for signature in signatures
+                ]
+
+                shape = values[0].shape
+
+                if any(value.shape != shape for value in values[1:]):
+                    raise ValueError(f"'{name}/{component}' " "has incompatible shapes")
+
+                matrix = torch.stack(
+                    [value.reshape(-1) for value in values],
+                    dim=1,
+                )
+
+                a1, ak = self._icc_absolute_agreement(matrix)
+
+                icc_a1[name][component] = a1
+
+                icc_ak[name][component] = ak
+
+        return {
+            "icc_a1": icc_a1,
+            "icc_ak": icc_ak,
+            "k": len(signatures),
+        }
+
+    def functional_statistics_reliability(
+        self,
+        statistics,
+        eps: float = 1e-12,
+    ):
+        """
+        Compute within-checkpoint MC reliability.
+
+        Each MC statistics object is independently converted to a
+        functional signature, and ICC(A,1) is computed across them.
+
+        Only ICC(A,1) is returned because the actual checkpoint signature
+        is obtained by pooling sufficient statistics, not by averaging
+        separately finalized MC signatures.
+        """
+        if isinstance(
+            statistics,
+            Mapping,
+        ):
+            statistics = (statistics,)
+        else:
+            statistics = tuple(statistics)
+
+        if len(statistics) < 2:
+            raise ValueError("at least two MC estimates are required")
+
+        signatures = [
+            self.functional_signatures_from_statistics(
+                stats,
+                eps=eps,
+            )
+            for stats in statistics
+        ]
+
+        return self._functional_signatures_icc(signatures)["icc_a1"]
+
+    def functional_signature_reliability(
+        self,
+        signatures,
+    ):
+        """
+        Compute reliability across independently trained checkpoints.
+
+        Returns ICC(A,1) and ICC(A,k). With three checkpoints,
+        ICC(A,k) is ICC(A,3), the reliability of the three-checkpoint mean.
+        """
+        return self._functional_signatures_icc(signatures)
+
+    # ======================================================================
+    # Checkpoint aggregation
+    # ======================================================================
+
+    def merge_functional_signatures(
+        self,
+        signatures,
+    ):
+        """
+        Arithmetic-average functional signatures from independently
+        trained checkpoints to obtain the final dataset x method profile.
+        """
+        if isinstance(
+            signatures,
+            Mapping,
+        ):
+            signatures = (signatures,)
+        else:
+            signatures = tuple(signatures)
+
+        if not signatures:
+            raise ValueError("signatures must not be empty")
+
+        names = tuple(signatures[0])
+
+        if any(tuple(signature) != names for signature in signatures[1:]):
+            raise ValueError("signatures have incompatible keys")
+
+        merged = {}
+
+        for name in names:
+            components = tuple(signatures[0][name])
+
+            if any(
+                tuple(signature[name]) != components for signature in signatures[1:]
+            ):
+                raise ValueError(
+                    f"signature '{name}' has " "incompatible component keys"
+                )
+
+            merged[name] = {}
+
+            for component in components:
+                values = [
+                    (torch.as_tensor(signature[name][component]).detach().cpu())
+                    for signature in signatures
+                ]
+
+                shape = values[0].shape
+
+                if any(value.shape != shape for value in values[1:]):
+                    raise ValueError(f"'{name}/{component}' " "has incompatible shapes")
+
+                merged[name][component] = torch.stack(
+                    values,
+                    dim=0,
+                ).mean(dim=0)
+
+        return merged
