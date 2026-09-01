@@ -1,6 +1,7 @@
 import json
 import os
 import shlex
+import csv
 from pathlib import Path
 
 # ======================================================================
@@ -325,3 +326,168 @@ def build_functional_signature_runs(
             encoding="utf-8",
         ) as f:
             f.write("\n".join(chunk) + "\n")
+
+
+def view_functional_signatures_reliability(
+    dataset_name_or_group: str = "all",
+    backbone_name_or_group: str = "all",
+    ft_name_or_group: str = "all",
+):
+    dataset_names = _resolve_names(
+        dataset_name_or_group,
+        DATASETS,
+        DATASET_GROUPS,
+        "dataset",
+    )
+
+    backbone_names = _resolve_names(
+        backbone_name_or_group,
+        BACKBONES,
+        BACKBONE_GROUPS,
+        "backbone",
+    )
+
+    method_names = _resolve_names(
+        ft_name_or_group,
+        FINETUNING_METHODS,
+        FINETUNING_METHOD_GROUPS,
+        "fine-tuning method",
+    )
+
+    experiments_dir = Path(
+        os.environ.get(
+            "EXPERIMENTS_DIR",
+            "./experiments",
+        )
+    )
+
+    output_dir = Path(__file__).resolve().parent / "functional_signatures_reliability"
+
+    # Signatures shared by all methods.
+    common_signature_names = (
+        "P",
+        "F_m",
+        "S_m",
+        "U_e",
+        "F_e",
+        "S_e",
+        "B_e",
+    )
+
+    # Coupling signatures only have meaning for PEFT methods.
+    # C_unit is intentionally excluded from this summary.
+    coupling_signature_names = (
+        "C_layer_m",
+        "C_global_m",
+        "C_layer_e",
+        "C_global_e",
+    )
+
+    for backbone_name in backbone_names:
+        backbone_output_dir = output_dir / backbone_name
+
+        backbone_output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        for method_name in method_names:
+            if method_name in PEFT_METHODS:
+                signature_names = (
+                    *common_signature_names,
+                    *coupling_signature_names,
+                )
+            else:
+                signature_names = common_signature_names
+
+            results = {signature_name: {} for signature_name in signature_names}
+
+            for dataset_name in dataset_names:
+                reliability_path = (
+                    experiments_dir
+                    / EVAL_EXPERIMENT_NAME
+                    / backbone_name
+                    / dataset_name
+                    / method_name
+                    / "functional_signatures_reliability.json"
+                )
+
+                if not reliability_path.is_file():
+                    raise FileNotFoundError(
+                        "Functional-signature reliability "
+                        f"not found: {reliability_path}"
+                    )
+
+                with reliability_path.open(
+                    "r",
+                    encoding="utf-8",
+                ) as f:
+                    reliability = json.load(f)
+
+                if reliability.get("k") != 3:
+                    raise ValueError(
+                        f"Expected k=3 checkpoints for "
+                        f"{backbone_name}/{dataset_name}/{method_name}, "
+                        f"found k={reliability.get('k')}."
+                    )
+
+                if "icc_ak" not in reliability:
+                    raise KeyError(f"'icc_ak' missing from " f"{reliability_path}")
+
+                icc_a3 = reliability["icc_ak"]
+
+                for signature_name in signature_names:
+                    if signature_name not in icc_a3:
+                        raise KeyError(
+                            f"Signature '{signature_name}' "
+                            f"missing from {reliability_path}"
+                        )
+
+                    # Undefined ICCs are stored as JSON null.
+                    # Ignore them when computing the signature-level mean.
+                    component_values = [
+                        value
+                        for value in icc_a3[signature_name].values()
+                        if value is not None
+                    ]
+
+                    if component_values:
+                        results[signature_name][dataset_name] = sum(
+                            component_values
+                        ) / len(component_values)
+                    else:
+                        # The entire signature has undefined ICC.
+                        results[signature_name][dataset_name] = None
+
+            output_path = backbone_output_dir / f"{method_name}.csv"
+
+            with output_path.open(
+                "w",
+                newline="",
+                encoding="utf-8",
+            ) as f:
+                writer = csv.writer(f)
+
+                writer.writerow(
+                    [
+                        "signature",
+                        *dataset_names,
+                    ]
+                )
+
+                for signature_name in signature_names:
+                    writer.writerow(
+                        [
+                            signature_name,
+                            *[
+                                (
+                                    f"{results[signature_name][dataset_name]:.4f}"
+                                    if results[signature_name][dataset_name] is not None
+                                    else "NA"
+                                )
+                                for dataset_name in dataset_names
+                            ],
+                        ]
+                    )
+
+            print("Saved functional-signature reliability " f"to {output_path}")
