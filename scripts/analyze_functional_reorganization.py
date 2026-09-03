@@ -37,17 +37,11 @@ def main():
         verbose=not args.quiet,
     )
 
-    # SQ1 — global task / method / interaction
-    analyzer.analyze_task_method_decomposition()
-
-    # SQ2 — task-group vs individual-task hierarchy
-    analyzer.analyze_task_hierarchy()
-
-    # SQ3 — per-task / per-group consistency across methods
-    analyzer.analyze_task_consistency()
-
-    # SQ4 — per-method specificity
-    analyzer.analyze_method_specificity()
+    analyzer.analyze_pair_attribution()  # SQ1
+    analyzer.analyze_dataset_organization()  # SQ2
+    analyzer.analyze_method_organization()  # SQ3
+    analyzer.analyze_global_organization()  # SQ4
+    analyzer.analyze_prediction_alignment()  # SQ5
 
 
 if __name__ == "__main__":

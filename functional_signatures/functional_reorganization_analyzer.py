@@ -1,37 +1,21 @@
 import csv
+import gc
+import itertools
+import json
 import os
 from pathlib import Path
 
 import numpy as np
+import torch
+from scipy.stats import rankdata, spearmanr
+from tqdm.auto import tqdm
+
+from datasets import datasets
+from models import models
+from utils import seed_worker
 
 
 class FunctionalReorganizationAnalyzer:
-    """
-    Analyze task- and adaptation-dependent functional organization.
-
-    RQ1 is formulated as a hierarchy of exact Euclidean sums-of-squares
-    decompositions.
-
-    The same analyses are performed for two representations:
-
-        raw:
-            z_tj = log(F_tj + eps)
-
-        delta:
-            d_tj = log(F_tj + eps) - log(F_t,LP + eps)
-
-    Both representations use the same adaptive methods and the same
-    task x method decomposition.
-
-    Public methods correspond one-to-one with the four RQ1 subquestions.
-    Each public analysis is independently runnable and may reuse privately
-    cached intermediate representations.
-    """
-
-    # ======================================================================
-    # DATASETS
-    # ======================================================================
-
     NATURAL = (
         "vtab_caltech101",
         "vtab_cifar100",
@@ -42,19 +26,11 @@ class FunctionalReorganizationAnalyzer:
         "vtab_svhn",
     )
 
-    REMOTE_SENSING = (
+    SPECIALIZED = (
         "vtab_eurosat",
         "vtab_resisc45",
-    )
-
-    MEDICAL = (
         "vtab_patch_camelyon",
         "vtab_retinopathy",
-    )
-
-    SPECIALIZED = (
-        *REMOTE_SENSING,
-        *MEDICAL,
     )
 
     STRUCTURED = (
@@ -74,40 +50,15 @@ class FunctionalReorganizationAnalyzer:
         *STRUCTURED,
     )
 
-    # ======================================================================
-    # TASK HIERARCHY
-    # ======================================================================
-
     OFFICIAL_TASK_GROUPS = {
         "natural": NATURAL,
         "specialized": SPECIALIZED,
         "structured": STRUCTURED,
     }
 
-    SPECIALIZED_SUBGROUPS = {
-        "remote_sensing": REMOTE_SENSING,
-        "medical": MEDICAL,
-    }
-
-    # Used by SQ3 for independent conditional analyses.
-    # remote_sensing and medical are nested inside specialized, but this
-    # is not a problem because each task set is analyzed independently.
-    TASK_SETS = {
-        "natural": NATURAL,
-        "specialized": SPECIALIZED,
-        "structured": STRUCTURED,
-        "remote_sensing": REMOTE_SENSING,
-        "medical": MEDICAL,
-    }
-
-    # ======================================================================
-    # METHODS
-    # ======================================================================
-
     REFERENCE_METHOD = "linear_probe"
 
-    ADAPTATION_METHODS = (
-        "full_ft",
+    PEFT_METHODS = (
         "vpt_shallow",
         "vpt_deep",
         "lora",
@@ -115,39 +66,36 @@ class FunctionalReorganizationAnalyzer:
         "adaptformer",
     )
 
+    ADAPTATION_METHODS = (
+        "full_ft",
+        *PEFT_METHODS,
+    )
+
     METHODS = (
         REFERENCE_METHOD,
         *ADAPTATION_METHODS,
     )
 
-    # ======================================================================
-    # REPRESENTATIONS
-    # ======================================================================
+    METHOD_SCOPES = {
+        "peft_only": PEFT_METHODS,
+        "peft_plus_ft": ADAPTATION_METHODS,
+    }
 
     REPRESENTATIONS = (
         "raw",
         "delta",
     )
 
-    # ======================================================================
-    # SIGNATURES
-    # ======================================================================
-
-    PRIMARY_SIGNATURES = (
+    SOURCE_SIGNATURES = (
         "F_m",
-        "F_e",
+        "P",
     )
 
-    PARTICIPATION_SIGNATURE = "P"
-
-    AVAILABLE_SIGNATURES = (
-        *PRIMARY_SIGNATURES,
-        PARTICIPATION_SIGNATURE,
+    RQ1_SIGNATURES = (
+        "F_m",
+        "P",
+        "S_m",
     )
-
-    # ======================================================================
-    # COMMON BACKBONE COMPONENTS
-    # ======================================================================
 
     COMPONENTS = (
         "sublayer_input_channel",
@@ -164,26 +112,22 @@ class FunctionalReorganizationAnalyzer:
         "attention_head_output",
     )
 
-    # ======================================================================
-    # EXPERIMENT LAYOUT
-    # ======================================================================
+    CORE_COMPONENTS = (
+        "residual_token_carry",
+        "sublayer_token_update",
+        "attention_selection_route",
+        "attention_transport_route",
+    )
 
     EVAL_EXPERIMENT_NAME = "top_1_acc_eval"
     SIGNATURE_FILENAME = "functional_signatures.npz"
 
-    # ======================================================================
-    # INITIALIZATION
-    # ======================================================================
-
     def __init__(
         self,
-        backbone_name: str = "vit_b16",
-        eps: float = 1e-12,
-        verbose: bool = True,
+        backbone_name="vit_b16",
+        eps=1e-12,
+        verbose=True,
     ):
-        if eps <= 0:
-            raise ValueError("eps must be positive")
-
         self.backbone_name = str(backbone_name)
 
         self.experiments_dir = Path(
@@ -200,31 +144,64 @@ class FunctionalReorganizationAnalyzer:
         self.eps = float(eps)
         self.verbose = bool(verbose)
 
-        # Populated lazily from the NPZ files.
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self._component_shapes = {}
 
-        # signature -> method -> component -> [T, *component_shape]
         self._profile_cache = {}
+        self._log_source_cache = {}
+        self._derived_log_cache = {}
 
-        # signature -> method -> component -> [T, *component_shape]
-        self._log_profile_cache = {}
+        self._values_cache = {}
+        self._effects_cache = {}
+        self._attribution_cache = {}
+        self._dataset_org_cache = {}
 
-        # signature -> adaptive_method -> component -> [T, *component_shape]
-        self._delta_profile_cache = {}
+        self._runs_cache = {}
+        self._full_behavior_cache = {}
+        self._behavior_cache = {}
 
-        # (representation, signature, component)
-        #     -> global task x method decomposition
-        self._decomposition_cache = {}
+        self._dataset_index = {name: i for i, name in enumerate(self.DATASETS)}
 
-    # ======================================================================
-    # COMMON HELPERS
-    # ======================================================================
+        self._official_group_indices = {
+            name: np.array(
+                [self._dataset_index[d] for d in group],
+                dtype=int,
+            )
+            for name, group in self.OFFICIAL_TASK_GROUPS.items()
+        }
 
-    def _log(self, message):
+    # ==================================================================
+    # GENERIC HELPERS
+    # ==================================================================
+
+    def _log(
+        self,
+        message,
+    ):
         if self.verbose:
-            print(message, flush=True)
+            print(
+                message,
+                flush=True,
+            )
 
-    def _signature_path(
+    def _progress(
+        self,
+        iterable,
+        desc,
+        total=None,
+        leave=False,
+    ):
+        return tqdm(
+            iterable,
+            desc=desc,
+            total=total,
+            disable=not self.verbose,
+            leave=leave,
+            dynamic_ncols=True,
+        )
+
+    def _method_dir(
         self,
         dataset_name,
         method_name,
@@ -235,442 +212,120 @@ class FunctionalReorganizationAnalyzer:
             / self.backbone_name
             / dataset_name
             / method_name
+        )
+
+    def _signature_path(
+        self,
+        dataset_name,
+        method_name,
+    ):
+        return (
+            self._method_dir(
+                dataset_name,
+                method_name,
+            )
             / self.SIGNATURE_FILENAME
         )
 
     def _analysis_save_dir(
         self,
         analysis_name,
-        representation,
+        *parts,
     ):
-        if representation not in self.REPRESENTATIONS:
-            raise ValueError(
-                f"Unknown representation '{representation}'. "
-                f"Expected one of {self.REPRESENTATIONS}."
-            )
+        path = self.save_dir / analysis_name
 
-        return self.save_dir / analysis_name / representation
+        for part in parts:
+            path /= part
 
-    @staticmethod
-    def _npz_scalar_string(value):
-        value = np.asarray(value)
+        path.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
-        if value.ndim == 0:
-            return str(value.item())
+        return path
 
-        return str(value)
-
-    def _load_profiles(
+    def _scope_methods(
         self,
-        signature_names,
+        scope,
     ):
-        """
-        Load final dataset x method signatures.
+        if scope not in self.METHOD_SCOPES:
+            raise ValueError(f"Unknown scope {scope!r}")
 
-        Returned structure:
-            signature
-                -> method
-                    -> component
-                        -> [T, *component_shape]
-        """
-        signature_names = tuple(signature_names)
-
-        unknown = set(signature_names) - set(self.AVAILABLE_SIGNATURES)
-
-        if unknown:
-            raise ValueError(f"Unknown signatures: {sorted(unknown)}")
-
-        loaded = {
-            signature_name: {
-                method_name: {component: [] for component in self.COMPONENTS}
-                for method_name in self.METHODS
-            }
-            for signature_name in signature_names
-        }
-
-        for method_name in self.METHODS:
-            self._log(f"Loading {method_name}...")
-
-            for dataset_name in self.DATASETS:
-                path = self._signature_path(
-                    dataset_name,
-                    method_name,
-                )
-
-                if not path.is_file():
-                    raise FileNotFoundError(f"Functional signatures not found: {path}")
-
-                with np.load(
-                    path,
-                    allow_pickle=False,
-                ) as data:
-                    if "dataset_name" in data:
-                        stored_dataset = self._npz_scalar_string(data["dataset_name"])
-
-                        if stored_dataset != dataset_name:
-                            raise ValueError(
-                                f"Dataset mismatch in {path}: "
-                                f"expected '{dataset_name}', "
-                                f"found '{stored_dataset}'."
-                            )
-
-                    if "backbone_name" in data:
-                        stored_backbone = self._npz_scalar_string(data["backbone_name"])
-
-                        if stored_backbone != self.backbone_name:
-                            raise ValueError(
-                                f"Backbone mismatch in {path}: "
-                                f"expected '{self.backbone_name}', "
-                                f"found '{stored_backbone}'."
-                            )
-
-                    for signature_name in signature_names:
-                        for component in self.COMPONENTS:
-                            key = f"{signature_name}" f"__{component}"
-
-                            if key not in data:
-                                raise KeyError(f"Missing '{key}' in {path}.")
-
-                            value = np.asarray(
-                                data[key],
-                                dtype=np.float64,
-                            )
-
-                            if not np.all(np.isfinite(value)):
-                                raise ValueError(
-                                    f"Non-finite values in " f"'{key}' from {path}."
-                                )
-
-                            if signature_name in (
-                                "F_m",
-                                "F_e",
-                                "P",
-                            ):
-                                if np.any(value < 0):
-                                    raise ValueError(
-                                        f"Negative values in "
-                                        f"nonnegative signature "
-                                        f"'{key}' from {path}."
-                                    )
-
-                            expected_shape = self._component_shapes.get(component)
-
-                            if expected_shape is None:
-                                self._component_shapes[component] = value.shape
-
-                            elif value.shape != expected_shape:
-                                raise ValueError(
-                                    f"Inconsistent shape for "
-                                    f"component '{component}': "
-                                    f"{value.shape} in {path}, "
-                                    f"expected {expected_shape}."
-                                )
-
-                            loaded[signature_name][method_name][component].append(value)
-
-        for signature_name in signature_names:
-            for method_name in self.METHODS:
-                for component in self.COMPONENTS:
-                    loaded[signature_name][method_name][component] = np.stack(
-                        loaded[signature_name][method_name][component],
-                        axis=0,
-                    )
-
-        return loaded
-
-    def _get_profiles(
-        self,
-        signature_names,
-    ):
-        """
-        Retrieve signatures, loading only missing signatures.
-        """
-        signature_names = tuple(signature_names)
-
-        missing = [
-            signature_name
-            for signature_name in signature_names
-            if signature_name not in self._profile_cache
-        ]
-
-        if missing:
-            loaded = self._load_profiles(missing)
-
-            self._profile_cache.update(loaded)
-
-        return {
-            signature_name: (self._profile_cache[signature_name])
-            for signature_name in signature_names
-        }
-
-    def _get_log_profiles(
-        self,
-        signature_name,
-    ):
-        """
-        Log-transform one nonnegative signature.
-
-        z_tj = log(F_tj + eps)
-        """
-        if signature_name not in self._log_profile_cache:
-            profiles = self._get_profiles((signature_name,))[signature_name]
-
-            self._log_profile_cache[signature_name] = {
-                method_name: {
-                    component: np.log(profiles[method_name][component] + self.eps)
-                    for component in self.COMPONENTS
-                }
-                for method_name in self.METHODS
-            }
-
-        return self._log_profile_cache[signature_name]
-
-    def _get_delta_profiles(
-        self,
-        signature_name,
-    ):
-        """
-        Construct LP-referenced log reorganization profiles.
-
-        d_tj
-            = log(F_tj + eps)
-            - log(F_t,LP + eps)
-        """
-        if signature_name not in self._delta_profile_cache:
-            log_profiles = self._get_log_profiles(signature_name)
-
-            reference = log_profiles[self.REFERENCE_METHOD]
-
-            self._delta_profile_cache[signature_name] = {
-                method_name: {
-                    component: (
-                        log_profiles[method_name][component] - reference[component]
-                    )
-                    for component in self.COMPONENTS
-                }
-                for method_name in self.ADAPTATION_METHODS
-            }
-
-        return self._delta_profile_cache[signature_name]
-
-    def _get_task_method_values(
-        self,
-        representation,
-        signature_name,
-        component,
-    ):
-        """
-        Return values with shape:
-
-            [T, J, *component_shape]
-
-        where J contains only the adaptive methods.
-
-        raw:
-            log(F_tj + eps)
-
-        delta:
-            log(F_tj + eps)
-            - log(F_t,LP + eps)
-        """
-        if representation not in self.REPRESENTATIONS:
-            raise ValueError(f"Unknown representation " f"'{representation}'.")
-
-        if signature_name not in self.PRIMARY_SIGNATURES:
-            raise ValueError(
-                f"RQ1 decomposition only supports "
-                f"primary signatures, found "
-                f"'{signature_name}'."
-            )
-
-        if component not in self.COMPONENTS:
-            raise ValueError(f"Unknown component '{component}'.")
-
-        if representation == "raw":
-            profiles = self._get_log_profiles(signature_name)
-
-        else:
-            profiles = self._get_delta_profiles(signature_name)
-
-        return np.stack(
-            [
-                profiles[method_name][component]
-                for method_name in self.ADAPTATION_METHODS
-            ],
-            axis=1,
-        )
-
-    @staticmethod
-    def _task_method_decomposition(
-        values,
-    ):
-        """
-        Exact balanced task x method decomposition.
-
-        values has shape:
-
-            [T, J, *component_shape]
-
-        x_tj = mu + alpha_t + beta_j + gamma_tj
-        """
-        values = np.asarray(
-            values,
-            dtype=np.float64,
-        )
-
-        if values.ndim < 3:
-            raise ValueError("values must have shape " "[T, J, *component_shape]")
-
-        if not np.all(np.isfinite(values)):
-            raise ValueError("values contain non-finite entries")
-
-        n_tasks = values.shape[0]
-        n_methods = values.shape[1]
-
-        if n_tasks < 2:
-            raise ValueError("At least two tasks are required")
-
-        if n_methods < 2:
-            raise ValueError("At least two methods are required")
-
-        mu = values.mean(axis=(0, 1))
-
-        alpha = values.mean(axis=1) - mu
-
-        beta = values.mean(axis=0) - mu
-
-        gamma = values - mu - alpha[:, None] - beta[None, :]
-
-        centered = values - mu
-
-        ss_task = n_methods * np.square(alpha).sum()
-
-        ss_method = n_tasks * np.square(beta).sum()
-
-        ss_interaction = np.square(gamma).sum()
-
-        ss_total = np.square(centered).sum()
-
-        FunctionalReorganizationAnalyzer._check_ss_identity(
-            ss_total,
-            (
-                ss_task,
-                ss_method,
-                ss_interaction,
-            ),
-            "global task-method decomposition",
-        )
-
-        r_task = FunctionalReorganizationAnalyzer._safe_ratio(
-            ss_task,
-            ss_total,
-        )
-
-        r_method = FunctionalReorganizationAnalyzer._safe_ratio(
-            ss_method,
-            ss_total,
-        )
-
-        r_interaction = FunctionalReorganizationAnalyzer._safe_ratio(
-            ss_interaction,
-            ss_total,
-        )
-
-        return {
-            "mu": mu,
-            "alpha": alpha,
-            "beta": beta,
-            "gamma": gamma,
-            "ss_task": float(ss_task),
-            "ss_method": float(ss_method),
-            "ss_interaction": float(ss_interaction),
-            "ss_total": float(ss_total),
-            "r_task": float(r_task),
-            "r_method": float(r_method),
-            "r_interaction": float(r_interaction),
-        }
-
-    def _get_decomposition(
-        self,
-        representation,
-        signature_name,
-        component,
-    ):
-        key = (
-            representation,
-            signature_name,
-            component,
-        )
-
-        if key not in self._decomposition_cache:
-            values = self._get_task_method_values(
-                representation,
-                signature_name,
-                component,
-            )
-
-            self._decomposition_cache[key] = self._task_method_decomposition(values)
-
-        return self._decomposition_cache[key]
+        return self.METHOD_SCOPES[scope]
 
     @staticmethod
     def _safe_ratio(
-        numerator,
-        denominator,
+        a,
+        b,
     ):
-        numerator = float(numerator)
+        b = float(b)
 
-        denominator = float(denominator)
-
-        if denominator <= np.finfo(np.float64).eps:
+        if abs(b) <= np.finfo(float).eps:
             return np.nan
 
-        return numerator / denominator
+        return float(a) / b
 
     @staticmethod
-    def _rms_from_ss(
+    def _safe_abs_shares(
+        values,
+    ):
+        values = np.asarray(
+            values,
+            dtype=float,
+        )
+
+        denominator = np.abs(values).sum()
+
+        if denominator <= np.finfo(float).eps:
+            return np.full_like(
+                values,
+                np.nan,
+            )
+
+        return np.abs(values) / denominator
+
+    @staticmethod
+    def _rms(
         ss,
         n_cells,
         n_coordinates,
     ):
-        """
-        RMS contribution per functional coordinate over
-        the cells entering the decomposition.
-        """
-        ss = float(ss)
-
-        denominator = int(n_cells) * int(n_coordinates)
-
-        if denominator <= 0:
-            raise ValueError("RMS denominator must be positive")
-
-        return float(np.sqrt(max(ss, 0.0) / denominator))
+        return float(
+            np.sqrt(
+                max(
+                    float(ss),
+                    0.0,
+                )
+                / (n_cells * n_coordinates)
+            )
+        )
 
     @staticmethod
-    def _check_ss_identity(
-        total,
-        parts,
+    def _vector_rms(
+        x,
+    ):
+        x = np.asarray(
+            x,
+            dtype=float,
+        ).reshape(-1)
+
+        return float(np.linalg.norm(x) / np.sqrt(x.size))
+
+    @staticmethod
+    def _assert_close(
+        a,
+        b,
         label,
     ):
-        total = float(total)
-
-        reconstructed = float(sum(float(part) for part in parts))
-
-        if not np.isclose(
-            total,
-            reconstructed,
-            rtol=1e-10,
-            atol=1e-12
-            * max(
-                1.0,
-                abs(total),
-            ),
+        if not np.allclose(
+            a,
+            b,
+            rtol=1e-9,
+            atol=1e-10,
         ):
-            raise RuntimeError(
-                f"{label} failed SS identity: "
-                f"total={total}, "
-                f"decomposed={reconstructed}."
-            )
+            error = float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
+
+            raise RuntimeError(f"{label} failed; " f"max error={error}")
 
     @staticmethod
     def _write_csv(
@@ -696,1057 +351,2016 @@ class FunctionalReorganizationAnalyzer:
             writer.writeheader()
 
             for record in records:
-                row = dict(record)
-
-                for key, value in row.items():
-                    if isinstance(
-                        value,
-                        (
-                            float,
-                            np.floating,
-                        ),
-                    ):
-                        row[key] = value if np.isfinite(value) else "NA"
+                row = {
+                    k: (
+                        "NA"
+                        if isinstance(
+                            v,
+                            (
+                                float,
+                                np.floating,
+                            ),
+                        )
+                        and not np.isfinite(v)
+                        else v
+                    )
+                    for k, v in record.items()
+                }
 
                 writer.writerow(row)
 
         return path
 
-    def _dataset_indices(
-        self,
-        dataset_names,
+    @staticmethod
+    def _spearman(
+        x,
+        y,
     ):
-        index = {name: i for i, name in enumerate(self.DATASETS)}
+        value = spearmanr(
+            x,
+            y,
+        ).statistic
 
-        return np.array(
-            [index[name] for name in dataset_names],
-            dtype=np.int64,
+        return float(value) if np.isfinite(value) else np.nan
+
+    @staticmethod
+    def _partial_spearman(
+        x,
+        y,
+        z,
+    ):
+        rx, ry, rz = map(
+            rankdata,
+            (
+                x,
+                y,
+                z,
+            ),
         )
 
-    # ======================================================================
-    # SQ1: GLOBAL DETERMINANTS
-    # ======================================================================
+        design = np.column_stack(
+            (
+                np.ones(len(rz)),
+                rz,
+            )
+        )
 
-    def analyze_task_method_decomposition(
+        residual_x = (
+            rx
+            - design
+            @ np.linalg.lstsq(
+                design,
+                rx,
+                rcond=None,
+            )[0]
+        )
+
+        residual_y = (
+            ry
+            - design
+            @ np.linalg.lstsq(
+                design,
+                ry,
+                rcond=None,
+            )[0]
+        )
+
+        if np.std(residual_x) == 0 or np.std(residual_y) == 0:
+            return np.nan
+
+        return float(
+            np.corrcoef(
+                residual_x,
+                residual_y,
+            )[0, 1]
+        )
+
+    def _rsa_permutation_p(
         self,
+        functional,
+        predictive,
+        accuracy=None,
     ):
-        """
-        SQ1
-        ---
-        Across all tasks and adaptive methods, how much functional
-        heterogeneity is attributable to task, method, and the
-        task x method interaction?
-
-        The exact same analysis is run for raw and delta profiles.
-        """
-        all_paths = {}
-
-        n_tasks = len(self.DATASETS)
-
-        n_methods = len(self.ADAPTATION_METHODS)
-
-        for representation in self.REPRESENTATIONS:
-            output_dir = self._analysis_save_dir(
-                "sq1_global_determinants",
-                representation,
+        if accuracy is None:
+            observed = self._spearman(
+                self._upper(functional),
+                self._upper(predictive),
             )
 
-            output_dir.mkdir(
-                parents=True,
-                exist_ok=True,
+        else:
+            observed = self._partial_spearman(
+                self._upper(functional),
+                self._upper(predictive),
+                self._upper(accuracy),
             )
 
-            records = []
-            effects = {}
+        if not np.isfinite(observed):
+            return np.nan
 
-            for signature_name in self.PRIMARY_SIGNATURES:
-                self._log(
-                    "\n"
-                    "================================\n"
-                    f"SQ1 [{representation}]: "
-                    f"{signature_name}\n"
-                    "================================"
+        count = 0
+        total = 0
+
+        for permutation in itertools.permutations(range(functional.shape[0])):
+            permuted = functional[
+                np.ix_(
+                    permutation,
+                    permutation,
+                )
+            ]
+
+            if accuracy is None:
+                value = self._spearman(
+                    self._upper(permuted),
+                    self._upper(predictive),
                 )
 
-                for component in self.COMPONENTS:
-                    self._log(f"  {component}")
+            else:
+                value = self._partial_spearman(
+                    self._upper(permuted),
+                    self._upper(predictive),
+                    self._upper(accuracy),
+                )
 
-                    result = self._get_decomposition(
-                        representation,
-                        signature_name,
-                        component,
-                    )
+            if np.isfinite(value):
+                total += 1
 
-                    n_coordinates = int(np.prod(result["mu"].shape))
+                count += abs(value) >= abs(observed) - 1e-15
 
-                    common_rms = float(
-                        np.linalg.norm(result["mu"].reshape(-1))
-                        / np.sqrt(n_coordinates)
-                    )
+        return count / total if total else np.nan
 
-                    heterogeneity_rms = self._rms_from_ss(
-                        result["ss_total"],
-                        n_tasks * n_methods,
-                        n_coordinates,
-                    )
+    @staticmethod
+    def _upper(
+        matrix,
+    ):
+        indices = np.triu_indices(
+            matrix.shape[0],
+            1,
+        )
 
-                    records.append(
-                        {
-                            "signature": signature_name,
-                            "component": component,
-                            "n_coordinates": n_coordinates,
-                            "ss_task": result["ss_task"],
-                            "ss_method": result["ss_method"],
-                            "ss_interaction": result["ss_interaction"],
-                            "ss_total": result["ss_total"],
-                            "r_task": result["r_task"],
-                            "r_method": result["r_method"],
-                            "r_interaction": result["r_interaction"],
-                            "rms_common_shift": (common_rms),
-                            "rms_heterogeneity": (heterogeneity_rms),
-                        }
-                    )
+        return matrix[indices]
 
-                    prefix = f"{signature_name}" f"__{component}"
+    @staticmethod
+    def _pairwise_rms_distance(
+        x,
+    ):
+        x = np.asarray(
+            x,
+            dtype=float,
+        )
 
-                    effects[f"{prefix}__mu"] = result["mu"]
+        differences = x[:, None, :] - x[None, :, :]
 
-                    effects[f"{prefix}__alpha"] = result["alpha"]
-
-                    effects[f"{prefix}__beta"] = result["beta"]
-
-                    effects[f"{prefix}__gamma"] = result["gamma"]
-
-            csv_path = self._write_csv(
-                output_dir / "decomposition.csv",
-                (
-                    "signature",
-                    "component",
-                    "n_coordinates",
-                    "ss_task",
-                    "ss_method",
-                    "ss_interaction",
-                    "ss_total",
-                    "r_task",
-                    "r_method",
-                    "r_interaction",
-                    "rms_common_shift",
-                    "rms_heterogeneity",
-                ),
-                records,
+        return np.sqrt(
+            np.mean(
+                differences**2,
+                axis=-1,
             )
+        )
 
-            effects_path = output_dir / "effects.npz"
+    def _jsd(
+        self,
+        p,
+        q,
+    ):
+        p = np.clip(
+            np.asarray(
+                p,
+                dtype=np.float64,
+            ),
+            self.eps,
+            1.0,
+        )
 
-            np.savez_compressed(
-                effects_path,
-                representation=np.array(representation),
-                backbone_name=np.array(self.backbone_name),
-                reference_method=np.array(self.REFERENCE_METHOD),
-                datasets=np.array(self.DATASETS),
-                methods=np.array(self.ADAPTATION_METHODS),
-                signatures=np.array(self.PRIMARY_SIGNATURES),
-                components=np.array(self.COMPONENTS),
-                eps=np.array(self.eps),
-                **effects,
-            )
+        q = np.clip(
+            np.asarray(
+                q,
+                dtype=np.float64,
+            ),
+            self.eps,
+            1.0,
+        )
 
-            self._log(
-                f"\nSaved SQ1 "
-                f"[{representation}] results:"
-                f"\n  {csv_path}"
-                f"\n  {effects_path}"
-            )
+        p /= p.sum(
+            axis=-1,
+            keepdims=True,
+        )
 
-            all_paths[representation] = {
-                "decomposition": csv_path,
-                "effects": effects_path,
-            }
+        q /= q.sum(
+            axis=-1,
+            keepdims=True,
+        )
 
-        return all_paths
+        middle = 0.5 * (p + q)
 
-    # ======================================================================
-    # SQ2: HIERARCHICAL ORGANIZATION OF TASK EFFECTS
-    # ======================================================================
+        jsd = 0.5 * np.sum(
+            p * np.log2(p / middle),
+            axis=-1,
+        )
 
-    def analyze_task_hierarchy(
+        jsd += 0.5 * np.sum(
+            q * np.log2(q / middle),
+            axis=-1,
+        )
+
+        return float(jsd.mean())
+
+    # ==================================================================
+    # SIGNATURE LOADING
+    # ==================================================================
+
+    def _load_source_profiles(
         self,
     ):
-        """
-        SQ2
-        ---
-        When the task main effect matters, how much is organized at the
-        official VTAB group level versus the individual-task level?
-
-        Also decomposes Specialized within-group task variation into
-        Remote Sensing vs Medical variation and residual within-subdomain
-        variation.
-
-        The same analysis is run for raw and delta profiles.
-        """
-        all_paths = {}
-
-        n_methods = len(self.ADAPTATION_METHODS)
-
-        n_tasks = len(self.DATASETS)
-
-        official_group_indices = {
-            name: self._dataset_indices(datasets)
-            for name, datasets in self.OFFICIAL_TASK_GROUPS.items()
+        loaded = {
+            signature: {
+                method: {component: [] for component in self.COMPONENTS}
+                for method in self.METHODS
+            }
+            for signature in self.SOURCE_SIGNATURES
         }
 
-        specialized_indices = self._dataset_indices(self.SPECIALIZED)
+        for method in self._progress(
+            self.METHODS,
+            desc="Loading signatures",
+            total=len(self.METHODS),
+        ):
+            self._log(f"Loading signatures: " f"{method}")
 
-        specialized_subgroup_indices = {
-            name: self._dataset_indices(datasets)
-            for name, datasets in self.SPECIALIZED_SUBGROUPS.items()
-        }
-
-        for representation in self.REPRESENTATIONS:
-            output_dir = self._analysis_save_dir(
-                "sq2_task_hierarchy",
-                representation,
-            )
-
-            output_dir.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-            hierarchy_records = []
-            specialized_records = []
-
-            for signature_name in self.PRIMARY_SIGNATURES:
-                self._log(
-                    "\n"
-                    "================================\n"
-                    f"SQ2 [{representation}]: "
-                    f"{signature_name}\n"
-                    "================================"
+            for dataset in self.DATASETS:
+                path = self._signature_path(
+                    dataset,
+                    method,
                 )
 
-                for component in self.COMPONENTS:
-                    self._log(f"  {component}")
-
-                    result = self._get_decomposition(
-                        representation,
-                        signature_name,
-                        component,
-                    )
-
-                    alpha = result["alpha"]
-
-                    n_coordinates = int(np.prod(alpha.shape[1:]))
-
-                    # --------------------------------------------------
-                    # Official VTAB hierarchy:
-                    #
-                    # SS_task
-                    #   = SS_task_group
-                    #   + SS_individual_task
-                    # --------------------------------------------------
-
-                    ss_group = 0.0
-                    ss_individual = 0.0
-
-                    for indices in official_group_indices.values():
-                        group_alpha = alpha[indices].mean(axis=0)
-
-                        ss_group += (
-                            n_methods
-                            * len(indices)
-                            * float(np.square(group_alpha).sum())
-                        )
-
-                        deviations = alpha[indices] - group_alpha
-
-                        ss_individual += n_methods * float(np.square(deviations).sum())
-
-                    self._check_ss_identity(
-                        result["ss_task"],
-                        (
-                            ss_group,
-                            ss_individual,
-                        ),
-                        (
-                            f"SQ2 task hierarchy "
-                            f"{representation}/"
-                            f"{signature_name}/"
-                            f"{component}"
-                        ),
-                    )
-
-                    hierarchy_records.append(
-                        {
-                            "signature": signature_name,
-                            "component": component,
-                            "n_coordinates": (n_coordinates),
-                            "ss_task": result["ss_task"],
-                            "ss_task_group": (ss_group),
-                            "ss_individual_task": (ss_individual),
-                            "r_task_group_within_task": (
-                                self._safe_ratio(
-                                    ss_group,
-                                    result["ss_task"],
-                                )
-                            ),
-                            "r_individual_task_within_task": (
-                                self._safe_ratio(
-                                    ss_individual,
-                                    result["ss_task"],
-                                )
-                            ),
-                            "rms_task": self._rms_from_ss(
-                                result["ss_task"],
-                                n_tasks * n_methods,
-                                n_coordinates,
-                            ),
-                            "rms_task_group": (
-                                self._rms_from_ss(
-                                    ss_group,
-                                    n_tasks * n_methods,
-                                    n_coordinates,
-                                )
-                            ),
-                            "rms_individual_task": (
-                                self._rms_from_ss(
-                                    ss_individual,
-                                    n_tasks * n_methods,
-                                    n_coordinates,
-                                )
-                            ),
-                        }
-                    )
-
-                    # --------------------------------------------------
-                    # Specialized hierarchy:
-                    #
-                    # SS_within_specialized
-                    #   = SS_remote_vs_medical
-                    #   + SS_within_subdomain
-                    # --------------------------------------------------
-
-                    alpha_specialized = alpha[specialized_indices]
-
-                    specialized_mean = alpha_specialized.mean(axis=0)
-
-                    ss_specialized = n_methods * float(
-                        np.square(alpha_specialized - specialized_mean).sum()
-                    )
-
-                    ss_subdomain = 0.0
-                    ss_within_subdomain = 0.0
-
-                    for indices in specialized_subgroup_indices.values():
-                        subgroup_alpha = alpha[indices]
-
-                        subgroup_mean = subgroup_alpha.mean(axis=0)
-
-                        ss_subdomain += (
-                            n_methods
-                            * len(indices)
-                            * float(np.square(subgroup_mean - specialized_mean).sum())
-                        )
-
-                        ss_within_subdomain += n_methods * float(
-                            np.square(subgroup_alpha - subgroup_mean).sum()
-                        )
-
-                    self._check_ss_identity(
-                        ss_specialized,
-                        (
-                            ss_subdomain,
-                            ss_within_subdomain,
-                        ),
-                        (
-                            f"SQ2 specialized "
-                            f"hierarchy "
-                            f"{representation}/"
-                            f"{signature_name}/"
-                            f"{component}"
-                        ),
-                    )
-
-                    n_specialized = len(self.SPECIALIZED)
-
-                    specialized_records.append(
-                        {
-                            "signature": signature_name,
-                            "component": component,
-                            "n_coordinates": (n_coordinates),
-                            "ss_within_specialized": (ss_specialized),
-                            "ss_remote_vs_medical": (ss_subdomain),
-                            "ss_within_subdomain": (ss_within_subdomain),
-                            "r_remote_vs_medical_within_specialized": (
-                                self._safe_ratio(
-                                    ss_subdomain,
-                                    ss_specialized,
-                                )
-                            ),
-                            "r_within_subdomain_within_specialized": (
-                                self._safe_ratio(
-                                    ss_within_subdomain,
-                                    ss_specialized,
-                                )
-                            ),
-                            "rms_within_specialized": (
-                                self._rms_from_ss(
-                                    ss_specialized,
-                                    n_specialized * n_methods,
-                                    n_coordinates,
-                                )
-                            ),
-                            "rms_remote_vs_medical": (
-                                self._rms_from_ss(
-                                    ss_subdomain,
-                                    n_specialized * n_methods,
-                                    n_coordinates,
-                                )
-                            ),
-                            "rms_within_subdomain": (
-                                self._rms_from_ss(
-                                    ss_within_subdomain,
-                                    n_specialized * n_methods,
-                                    n_coordinates,
-                                )
-                            ),
-                        }
-                    )
-
-            hierarchy_path = self._write_csv(
-                output_dir / "task_hierarchy.csv",
-                (
-                    "signature",
-                    "component",
-                    "n_coordinates",
-                    "ss_task",
-                    "ss_task_group",
-                    "ss_individual_task",
-                    "r_task_group_within_task",
-                    "r_individual_task_within_task",
-                    "rms_task",
-                    "rms_task_group",
-                    "rms_individual_task",
-                ),
-                hierarchy_records,
-            )
-
-            specialized_path = self._write_csv(
-                output_dir / "specialized_hierarchy.csv",
-                (
-                    "signature",
-                    "component",
-                    "n_coordinates",
-                    "ss_within_specialized",
-                    "ss_remote_vs_medical",
-                    "ss_within_subdomain",
-                    "r_remote_vs_medical_within_specialized",
-                    "r_within_subdomain_within_specialized",
-                    "rms_within_specialized",
-                    "rms_remote_vs_medical",
-                    "rms_within_subdomain",
-                ),
-                specialized_records,
-            )
-
-            self._log(
-                f"\nSaved SQ2 "
-                f"[{representation}] results:"
-                f"\n  {hierarchy_path}"
-                f"\n  {specialized_path}"
-            )
-
-            all_paths[representation] = {
-                "task_hierarchy": (hierarchy_path),
-                "specialized_hierarchy": (specialized_path),
-            }
-
-        return all_paths
-
-    # ======================================================================
-    # SQ3: TASK-CENTERED CONSISTENCY ACROSS METHODS
-    # ======================================================================
-
-    def analyze_task_consistency(
-        self,
-    ):
-        """
-        SQ3
-        ---
-        For each individual task or predefined task set, how much of its
-        deviation from the grand pattern is shared across methods, and
-        how much is method-conditioned?
-
-        For a task set G:
-
-            x_tj - mu
-              = alpha_G
-              + (alpha_t - alpha_G)
-              + (beta_j + gamma_tj)
-
-        For a single task, the within-set task term is identically zero.
-
-        The same analysis is run for raw and delta profiles.
-        """
-        all_paths = {}
-
-        n_methods = len(self.ADAPTATION_METHODS)
-
-        dataset_index = {name: i for i, name in enumerate(self.DATASETS)}
-
-        for representation in self.REPRESENTATIONS:
-            output_dir = self._analysis_save_dir(
-                "sq3_task_consistency",
-                representation,
-            )
-
-            output_dir.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-            task_records = []
-            group_records = []
-
-            for signature_name in self.PRIMARY_SIGNATURES:
-                self._log(
-                    "\n"
-                    "================================\n"
-                    f"SQ3 [{representation}]: "
-                    f"{signature_name}\n"
-                    "================================"
-                )
-
-                # ------------------------------------------------------
-                # Individual tasks.
-                #
-                # Ordering:
-                # task -> component
-                # ------------------------------------------------------
-
-                for task_name in self.DATASETS:
-                    t = dataset_index[task_name]
-
-                    for component in self.COMPONENTS:
-                        self._log(f"  {task_name}: " f"{component}")
-
-                        result = self._get_decomposition(
-                            representation,
-                            signature_name,
-                            component,
-                        )
-
-                        values = self._get_task_method_values(
-                            representation,
-                            signature_name,
-                            component,
-                        )
-
-                        alpha = result["alpha"]
-
-                        beta = result["beta"]
-
-                        gamma = result["gamma"]
-
-                        n_coordinates = int(np.prod(alpha.shape[1:]))
-
-                        shared = alpha[t]
-
-                        method_conditioned = beta + gamma[t]
-
-                        ss_shared = n_methods * float(np.square(shared).sum())
-
-                        ss_method_conditioned = float(
-                            np.square(method_conditioned).sum()
-                        )
-
-                        ss_total = ss_shared + ss_method_conditioned
-
-                        direct_total = float(np.square(values[t] - result["mu"]).sum())
-
-                        self._check_ss_identity(
-                            direct_total,
-                            (
-                                ss_shared,
-                                ss_method_conditioned,
-                            ),
-                            (
-                                f"SQ3 task "
-                                f"{task_name} "
-                                f"{representation}/"
-                                f"{signature_name}/"
-                                f"{component}"
-                            ),
-                        )
-
-                        n_cells = n_methods
-
-                        task_records.append(
-                            {
-                                "signature": signature_name,
-                                "task": task_name,
-                                "component": component,
-                                "n_coordinates": (n_coordinates),
-                                "ss_shared_task": (ss_shared),
-                                "ss_method_conditioned": (ss_method_conditioned),
-                                "ss_total": ss_total,
-                                "r_shared_task": (
-                                    self._safe_ratio(
-                                        ss_shared,
-                                        ss_total,
-                                    )
-                                ),
-                                "r_method_conditioned": (
-                                    self._safe_ratio(
-                                        ss_method_conditioned,
-                                        ss_total,
-                                    )
-                                ),
-                                "rms_total": (
-                                    self._rms_from_ss(
-                                        ss_total,
-                                        n_cells,
-                                        n_coordinates,
-                                    )
-                                ),
-                                "rms_shared_task": (
-                                    self._rms_from_ss(
-                                        ss_shared,
-                                        n_cells,
-                                        n_coordinates,
-                                    )
-                                ),
-                                "rms_method_conditioned": (
-                                    self._rms_from_ss(
-                                        ss_method_conditioned,
-                                        n_cells,
-                                        n_coordinates,
-                                    )
-                                ),
-                            }
-                        )
-
-                # ------------------------------------------------------
-                # Task sets.
-                #
-                # Ordering:
-                # group -> component
-                #
-                # Each set is analyzed independently.
-                # ------------------------------------------------------
-
-                for (
-                    group_name,
-                    task_names,
-                ) in self.TASK_SETS.items():
-                    indices = self._dataset_indices(task_names)
-
-                    for component in self.COMPONENTS:
-                        self._log(f"  {group_name}: " f"{component}")
-
-                        result = self._get_decomposition(
-                            representation,
-                            signature_name,
-                            component,
-                        )
-
-                        values = self._get_task_method_values(
-                            representation,
-                            signature_name,
-                            component,
-                        )
-
-                        alpha = result["alpha"]
-
-                        beta = result["beta"]
-
-                        gamma = result["gamma"]
-
-                        n_coordinates = int(np.prod(alpha.shape[1:]))
-
-                        group_alpha = alpha[indices].mean(axis=0)
-
-                        within = alpha[indices] - group_alpha
-
-                        method_conditioned = beta[None, ...] + gamma[indices]
-
-                        n_group_tasks = len(indices)
-
-                        n_cells = n_group_tasks * n_methods
-
-                        ss_shared = (
-                            n_group_tasks
-                            * n_methods
-                            * float(np.square(group_alpha).sum())
-                        )
-
-                        ss_within = n_methods * float(np.square(within).sum())
-
-                        ss_method_conditioned = float(
-                            np.square(method_conditioned).sum()
-                        )
-
-                        ss_total = ss_shared + ss_within + ss_method_conditioned
-
-                        direct_total = float(
-                            np.square(values[indices] - result["mu"]).sum()
-                        )
-
-                        self._check_ss_identity(
-                            direct_total,
-                            (
-                                ss_shared,
-                                ss_within,
-                                ss_method_conditioned,
-                            ),
-                            (
-                                f"SQ3 group "
-                                f"{group_name} "
-                                f"{representation}/"
-                                f"{signature_name}/"
-                                f"{component}"
-                            ),
-                        )
-
-                        group_records.append(
-                            {
-                                "signature": signature_name,
-                                "group": group_name,
-                                "component": component,
-                                "n_tasks": (n_group_tasks),
-                                "n_coordinates": (n_coordinates),
-                                "ss_shared_group": (ss_shared),
-                                "ss_within_group_task": (ss_within),
-                                "ss_method_conditioned": (ss_method_conditioned),
-                                "ss_total": ss_total,
-                                "r_shared_group": (
-                                    self._safe_ratio(
-                                        ss_shared,
-                                        ss_total,
-                                    )
-                                ),
-                                "r_within_group_task": (
-                                    self._safe_ratio(
-                                        ss_within,
-                                        ss_total,
-                                    )
-                                ),
-                                "r_method_conditioned": (
-                                    self._safe_ratio(
-                                        ss_method_conditioned,
-                                        ss_total,
-                                    )
-                                ),
-                                "rms_total": (
-                                    self._rms_from_ss(
-                                        ss_total,
-                                        n_cells,
-                                        n_coordinates,
-                                    )
-                                ),
-                                "rms_shared_group": (
-                                    self._rms_from_ss(
-                                        ss_shared,
-                                        n_cells,
-                                        n_coordinates,
-                                    )
-                                ),
-                                "rms_within_group_task": (
-                                    self._rms_from_ss(
-                                        ss_within,
-                                        n_cells,
-                                        n_coordinates,
-                                    )
-                                ),
-                                "rms_method_conditioned": (
-                                    self._rms_from_ss(
-                                        ss_method_conditioned,
-                                        n_cells,
-                                        n_coordinates,
-                                    )
-                                ),
-                            }
-                        )
-
-            tasks_path = self._write_csv(
-                output_dir / "tasks.csv",
-                (
-                    "signature",
-                    "task",
-                    "component",
-                    "n_coordinates",
-                    "ss_shared_task",
-                    "ss_method_conditioned",
-                    "ss_total",
-                    "r_shared_task",
-                    "r_method_conditioned",
-                    "rms_total",
-                    "rms_shared_task",
-                    "rms_method_conditioned",
-                ),
-                task_records,
-            )
-
-            groups_path = self._write_csv(
-                output_dir / "groups.csv",
-                (
-                    "signature",
-                    "group",
-                    "component",
-                    "n_tasks",
-                    "n_coordinates",
-                    "ss_shared_group",
-                    "ss_within_group_task",
-                    "ss_method_conditioned",
-                    "ss_total",
-                    "r_shared_group",
-                    "r_within_group_task",
-                    "r_method_conditioned",
-                    "rms_total",
-                    "rms_shared_group",
-                    "rms_within_group_task",
-                    "rms_method_conditioned",
-                ),
-                group_records,
-            )
-
-            self._log(
-                f"\nSaved SQ3 "
-                f"[{representation}] results:"
-                f"\n  {tasks_path}"
-                f"\n  {groups_path}"
-            )
-
-            all_paths[representation] = {
-                "tasks": tasks_path,
-                "groups": groups_path,
-            }
-
-        return all_paths
-
-    # ======================================================================
-    # SQ4: METHOD-CENTERED SPECIFICITY
-    # ======================================================================
-
-    def analyze_method_specificity(
-        self,
-    ):
-        """
-        SQ4
-        ---
-        For each adaptation method, how much of its deviation from the
-        grand pattern is method-general versus organized by official
-        VTAB task group or individual task identity within those groups?
-
-        For fixed method j:
-
-            x_tj - mu
-                = beta_j + h_tj
-
-            h_tj
-                = alpha_t + gamma_tj
-
-        and:
-
-            SS_j
-                = SS_method_general,j
-                + SS_task_group,j
-                + SS_individual_task,j
-
-        The same analysis is run for raw and delta profiles.
-        """
-        all_paths = {}
-
-        n_tasks = len(self.DATASETS)
-
-        official_group_indices = {
-            name: self._dataset_indices(datasets)
-            for name, datasets in self.OFFICIAL_TASK_GROUPS.items()
-        }
-
-        for representation in self.REPRESENTATIONS:
-            output_dir = self._analysis_save_dir(
-                "sq4_method_specificity",
-                representation,
-            )
-
-            output_dir.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-
-            records = []
-
-            for signature_name in self.PRIMARY_SIGNATURES:
-                self._log(
-                    "\n"
-                    "================================\n"
-                    f"SQ4 [{representation}]: "
-                    f"{signature_name}\n"
-                    "================================"
-                )
-
-                # ------------------------------------------------------
-                # Ordering:
-                # method -> component
-                # ------------------------------------------------------
-
-                for (
-                    j,
-                    method_name,
-                ) in enumerate(self.ADAPTATION_METHODS):
-                    for component in self.COMPONENTS:
-                        self._log(f"  {method_name}: " f"{component}")
-
-                        result = self._get_decomposition(
-                            representation,
-                            signature_name,
-                            component,
-                        )
-
-                        alpha = result["alpha"]
-
-                        beta = result["beta"]
-
-                        gamma = result["gamma"]
-
-                        values = self._get_task_method_values(
-                            representation,
-                            signature_name,
-                            component,
-                        )
-
-                        n_coordinates = int(np.prod(alpha.shape[1:]))
-
-                        h = alpha + gamma[:, j]
-
-                        ss_method_general = n_tasks * float(np.square(beta[j]).sum())
-
-                        ss_task_group = 0.0
-                        ss_individual_task = 0.0
-
-                        for indices in official_group_indices.values():
-                            group_h = h[indices].mean(axis=0)
-
-                            ss_task_group += len(indices) * float(
-                                np.square(group_h).sum()
+                if not path.is_file():
+                    raise FileNotFoundError(path)
+
+                with np.load(
+                    path,
+                    allow_pickle=False,
+                ) as data:
+                    for signature in self.SOURCE_SIGNATURES:
+                        for component in self.COMPONENTS:
+                            key = f"{signature}" f"__{component}"
+
+                            value = np.asarray(
+                                data[key],
+                                dtype=np.float64,
                             )
 
-                            ss_individual_task += float(
-                                np.square(h[indices] - group_h).sum()
+                            shape = self._component_shapes.setdefault(
+                                component,
+                                value.shape,
                             )
 
-                        ss_total = (
-                            ss_method_general + ss_task_group + ss_individual_task
+                            if value.shape != shape:
+                                raise ValueError(
+                                    "Inconsistent shape " f"for {component}"
+                                )
+
+                            loaded[signature][method][component].append(value)
+
+        for signature in self.SOURCE_SIGNATURES:
+            for method in self.METHODS:
+                for component in self.COMPONENTS:
+                    loaded[signature][method][component] = np.stack(
+                        loaded[signature][method][component]
+                    )
+
+        return loaded
+
+    def _get_source_profiles(
+        self,
+    ):
+        if not self._profile_cache:
+            self._profile_cache = self._load_source_profiles()
+
+        return self._profile_cache
+
+    def _get_log_signature_profiles(
+        self,
+        signature,
+    ):
+        if signature in self.SOURCE_SIGNATURES:
+            if signature not in self._log_source_cache:
+                profiles = self._get_source_profiles()[signature]
+
+                self._log_source_cache[signature] = {
+                    method: {
+                        component: np.log(profiles[method][component] + self.eps)
+                        for component in self.COMPONENTS
+                    }
+                    for method in self.METHODS
+                }
+
+            return self._log_source_cache[signature]
+
+        if signature != "S_m":
+            raise ValueError(f"Unknown signature " f"{signature!r}")
+
+        if signature not in self._derived_log_cache:
+            fisher = self._get_log_signature_profiles("F_m")
+
+            participation = self._get_log_signature_profiles("P")
+
+            self._derived_log_cache[signature] = {
+                method: {
+                    component: (
+                        fisher[method][component] - participation[method][component]
+                    )
+                    for component in self.COMPONENTS
+                }
+                for method in self.METHODS
+            }
+
+        return self._derived_log_cache[signature]
+
+    def _get_task_method_values(
+        self,
+        scope,
+        representation,
+        signature,
+        component,
+    ):
+        key = (
+            scope,
+            representation,
+            signature,
+            component,
+        )
+
+        if key in self._values_cache:
+            return self._values_cache[key]
+
+        methods = self._scope_methods(scope)
+
+        profiles = self._get_log_signature_profiles(signature)
+
+        reference = profiles[self.REFERENCE_METHOD][component]
+
+        values = [
+            (
+                profiles[method][component] - reference
+                if representation == "delta"
+                else profiles[method][component]
+            )
+            for method in methods
+        ]
+
+        values = np.stack(
+            values,
+            axis=1,
+        )
+
+        values = values.reshape(
+            values.shape[0],
+            values.shape[1],
+            -1,
+        )
+
+        self._values_cache[key] = values
+
+        return values
+
+    # ==================================================================
+    # SHARED FACTORIAL STATE
+    # ==================================================================
+
+    def _get_effects(
+        self,
+        scope,
+        representation,
+        signature,
+        component,
+    ):
+        key = (
+            scope,
+            representation,
+            signature,
+            component,
+        )
+
+        if key in self._effects_cache:
+            return self._effects_cache[key]
+
+        x = self._get_task_method_values(
+            scope,
+            representation,
+            signature,
+            component,
+        )
+
+        u = x.mean(axis=(0, 1))
+
+        y = x - u
+
+        tau = y.mean(axis=1)
+
+        method = y.mean(axis=0)
+
+        interaction = y - tau[:, None, :] - method[None, :, :]
+
+        group = np.empty_like(tau)
+
+        for indices in self._official_group_indices.values():
+            group[indices] = tau[indices].mean(axis=0)
+
+        task_specific = tau - group
+
+        self._assert_close(
+            y,
+            (tau[:, None] + method[None] + interaction),
+            key,
+        )
+
+        self._assert_close(
+            tau,
+            group + task_specific,
+            key,
+        )
+
+        result = {
+            "x": x,
+            "u": u,
+            "y": y,
+            "tau": tau,
+            "method": method,
+            "interaction": interaction,
+            "group": group,
+            "task_specific": task_specific,
+        }
+
+        self._effects_cache[key] = result
+
+        return result
+
+    def _get_attributions(
+        self,
+        scope,
+        representation,
+        signature,
+        component,
+    ):
+        key = (
+            scope,
+            representation,
+            signature,
+            component,
+        )
+
+        if key in self._attribution_cache:
+            return self._attribution_cache[key]
+
+        effects = self._get_effects(
+            scope,
+            representation,
+            signature,
+            component,
+        )
+
+        y = effects["y"]
+
+        energy = np.sum(
+            y**2,
+            axis=-1,
+        )
+
+        c_task = np.sum(
+            y * effects["tau"][:, None],
+            axis=-1,
+        )
+
+        c_method = np.sum(
+            y * effects["method"][None],
+            axis=-1,
+        )
+
+        c_interaction = np.sum(
+            y * effects["interaction"],
+            axis=-1,
+        )
+
+        c_group = np.sum(
+            y * effects["group"][:, None],
+            axis=-1,
+        )
+
+        c_specific = np.sum(
+            y * effects["task_specific"][:, None],
+            axis=-1,
+        )
+
+        self._assert_close(
+            energy,
+            (c_task + c_method + c_interaction),
+            key,
+        )
+
+        self._assert_close(
+            c_task,
+            c_group + c_specific,
+            key,
+        )
+
+        gross = np.abs(c_task) + np.abs(c_method) + np.abs(c_interaction)
+
+        task_gross = np.abs(c_group) + np.abs(c_specific)
+
+        valid = gross > np.finfo(float).eps
+
+        task_valid = task_gross > np.finfo(float).eps
+
+        result = {
+            "energy": energy,
+            "c_task": c_task,
+            "c_method": c_method,
+            "c_interaction": c_interaction,
+            "c_group": c_group,
+            "c_task_specific": c_specific,
+            "share_task": np.divide(
+                np.abs(c_task),
+                gross,
+                out=np.full_like(
+                    gross,
+                    np.nan,
+                ),
+                where=valid,
+            ),
+            "share_method": np.divide(
+                np.abs(c_method),
+                gross,
+                out=np.full_like(
+                    gross,
+                    np.nan,
+                ),
+                where=valid,
+            ),
+            "share_interaction": np.divide(
+                np.abs(c_interaction),
+                gross,
+                out=np.full_like(
+                    gross,
+                    np.nan,
+                ),
+                where=valid,
+            ),
+            "share_group_within_task": np.divide(
+                np.abs(c_group),
+                task_gross,
+                out=np.full_like(
+                    task_gross,
+                    np.nan,
+                ),
+                where=task_valid,
+            ),
+            "share_specific_within_task": np.divide(
+                np.abs(c_specific),
+                task_gross,
+                out=np.full_like(
+                    task_gross,
+                    np.nan,
+                ),
+                where=task_valid,
+            ),
+        }
+
+        self._attribution_cache[key] = result
+
+        return result
+
+    def _get_dataset_organization(
+        self,
+        scope,
+        representation,
+        signature,
+        component,
+    ):
+        key = (
+            scope,
+            representation,
+            signature,
+            component,
+        )
+
+        if key in self._dataset_org_cache:
+            return self._dataset_org_cache[key]
+
+        methods = self._scope_methods(scope)
+
+        effects = self._get_effects(
+            scope,
+            representation,
+            signature,
+            component,
+        )
+
+        attrs = self._get_attributions(
+            scope,
+            representation,
+            signature,
+            component,
+        )
+
+        n_methods = len(methods)
+
+        rows = []
+
+        for task_index, task in enumerate(self.DATASETS):
+            ss_task = n_methods * np.sum(effects["tau"][task_index] ** 2)
+
+            ss_method_conditioned = np.sum(
+                (effects["method"] + effects["interaction"][task_index]) ** 2
+            )
+
+            energy = attrs["energy"][task_index].sum()
+
+            rows.append(
+                {
+                    "task": task,
+                    "r_method_conditioned": (
+                        self._safe_ratio(
+                            ss_method_conditioned,
+                            energy,
+                        )
+                    ),
+                    "ss_task_shared": float(ss_task),
+                    "ss_method_conditioned": float(ss_method_conditioned),
+                    "energy": float(energy),
+                }
+            )
+
+        self._dataset_org_cache[key] = rows
+
+        return rows
+
+    # ==================================================================
+    # SQ1
+    # ==================================================================
+
+    def analyze_pair_attribution(
+        self,
+    ):
+        paths = {}
+
+        for representation in self.REPRESENTATIONS:
+            paths[representation] = {}
+
+            for (
+                scope,
+                methods,
+            ) in self.METHOD_SCOPES.items():
+                self._log(f"\nSQ1 [{representation}] [{scope}]")
+
+                output_dir = self._analysis_save_dir(
+                    "sq1_pair_attribution",
+                    representation,
+                    scope,
+                )
+
+                records = []
+                payload = {}
+
+                for signature in self.RQ1_SIGNATURES:
+                    for component in self._progress(
+                        self.COMPONENTS,
+                        desc=f"SQ1 {representation}/{scope} {signature}",
+                        total=len(self.COMPONENTS),
+                    ):
+                        effects = self._get_effects(
+                            scope,
+                            representation,
+                            signature,
+                            component,
                         )
 
-                        direct_total = float(
-                            np.square(values[:, j] - result["mu"]).sum()
+                        attrs = self._get_attributions(
+                            scope,
+                            representation,
+                            signature,
+                            component,
                         )
 
-                        self._check_ss_identity(
-                            direct_total,
+                        n_coordinates = effects["y"].shape[-1]
+
+                        rms_universal = self._vector_rms(effects["u"])
+
+                        for (
+                            task_index,
+                            task,
+                        ) in enumerate(self.DATASETS):
+                            for (
+                                method_index,
+                                method,
+                            ) in enumerate(methods):
+                                energy = attrs["energy"][
+                                    task_index,
+                                    method_index,
+                                ]
+
+                                records.append(
+                                    {
+                                        "signature": signature,
+                                        "task": task,
+                                        "method": method,
+                                        "component": component,
+                                        "n_coordinates": n_coordinates,
+                                        "rms_universal": rms_universal,
+                                        "energy_centered": energy,
+                                        "rms_centered": self._rms(
+                                            energy,
+                                            1,
+                                            n_coordinates,
+                                        ),
+                                        "c_task": attrs["c_task"][
+                                            task_index,
+                                            method_index,
+                                        ],
+                                        "c_method": attrs["c_method"][
+                                            task_index,
+                                            method_index,
+                                        ],
+                                        "c_interaction": attrs["c_interaction"][
+                                            task_index,
+                                            method_index,
+                                        ],
+                                        "share_task": attrs["share_task"][
+                                            task_index,
+                                            method_index,
+                                        ],
+                                        "share_method": attrs["share_method"][
+                                            task_index,
+                                            method_index,
+                                        ],
+                                        "share_interaction": attrs["share_interaction"][
+                                            task_index,
+                                            method_index,
+                                        ],
+                                        "c_task_group": attrs["c_group"][
+                                            task_index,
+                                            method_index,
+                                        ],
+                                        "c_individual_task": attrs["c_task_specific"][
+                                            task_index,
+                                            method_index,
+                                        ],
+                                        "share_task_group_within_task": (
+                                            attrs["share_group_within_task"][
+                                                task_index,
+                                                method_index,
+                                            ]
+                                        ),
+                                        "share_individual_task_within_task": (
+                                            attrs["share_specific_within_task"][
+                                                task_index,
+                                                method_index,
+                                            ]
+                                        ),
+                                    }
+                                )
+
+                        prefix = f"{signature}" f"__{component}"
+
+                        for name in (
+                            "u",
+                            "tau",
+                            "method",
+                            "interaction",
+                            "group",
+                            "task_specific",
+                        ):
+                            payload[f"{prefix}" f"__{name}"] = effects[name]
+
+                pairs_path = self._write_csv(
+                    output_dir / "pairs.csv",
+                    tuple(records[0]),
+                    records,
+                )
+
+                effects_path = output_dir / "effects.npz"
+
+                np.savez_compressed(
+                    effects_path,
+                    datasets=np.array(self.DATASETS),
+                    methods=np.array(methods),
+                    signatures=np.array(self.RQ1_SIGNATURES),
+                    components=np.array(self.COMPONENTS),
+                    **payload,
+                )
+
+                paths[representation][scope] = {
+                    "pairs": pairs_path,
+                    "effects": effects_path,
+                }
+
+        return paths
+
+    # ==================================================================
+    # SQ2
+    # ==================================================================
+
+    def analyze_dataset_organization(
+        self,
+    ):
+        paths = {}
+
+        for representation in self.REPRESENTATIONS:
+            paths[representation] = {}
+
+            for (
+                scope,
+                methods,
+            ) in self.METHOD_SCOPES.items():
+                self._log(f"\nSQ2 [{representation}] [{scope}]")
+
+                records = []
+
+                for signature in self.RQ1_SIGNATURES:
+                    for component in self._progress(
+                        self.COMPONENTS,
+                        desc=f"SQ2 {representation}/{scope} {signature}",
+                        total=len(self.COMPONENTS),
+                    ):
+                        effects = self._get_effects(
+                            scope,
+                            representation,
+                            signature,
+                            component,
+                        )
+
+                        attrs = self._get_attributions(
+                            scope,
+                            representation,
+                            signature,
+                            component,
+                        )
+
+                        organization = self._get_dataset_organization(
+                            scope,
+                            representation,
+                            signature,
+                            component,
+                        )
+
+                        n_coordinates = effects["y"].shape[-1]
+
+                        for (
+                            task_index,
+                            task,
+                        ) in enumerate(self.DATASETS):
+                            c_task = attrs["c_task"][task_index].sum()
+
+                            c_method = attrs["c_method"][task_index].sum()
+
+                            c_interaction = attrs["c_interaction"][task_index].sum()
+
+                            c_group = attrs["c_group"][task_index].sum()
+
+                            c_specific = attrs["c_task_specific"][task_index].sum()
+
+                            top_shares = self._safe_abs_shares(
+                                (
+                                    c_task,
+                                    c_method,
+                                    c_interaction,
+                                )
+                            )
+
+                            nested_shares = self._safe_abs_shares(
+                                (
+                                    c_group,
+                                    c_specific,
+                                )
+                            )
+
+                            energy = organization[task_index]["energy"]
+
+                            ss_task = organization[task_index]["ss_task_shared"]
+
+                            ss_method_conditioned = organization[task_index][
+                                "ss_method_conditioned"
+                            ]
+
+                            records.append(
+                                {
+                                    "signature": signature,
+                                    "task": task,
+                                    "component": component,
+                                    "n_coordinates": n_coordinates,
+                                    "rms_universal": self._vector_rms(effects["u"]),
+                                    "energy_centered": energy,
+                                    "c_task": c_task,
+                                    "c_method": c_method,
+                                    "c_interaction": c_interaction,
+                                    "share_task": top_shares[0],
+                                    "share_method": top_shares[1],
+                                    "share_interaction": top_shares[2],
+                                    "c_task_group": c_group,
+                                    "c_individual_task": c_specific,
+                                    "share_task_group_within_task": nested_shares[0],
+                                    "share_individual_task_within_task": nested_shares[
+                                        1
+                                    ],
+                                    "ss_task_shared": ss_task,
+                                    "ss_method_conditioned": ss_method_conditioned,
+                                    "r_task_shared": self._safe_ratio(
+                                        ss_task,
+                                        energy,
+                                    ),
+                                    "r_method_conditioned": self._safe_ratio(
+                                        ss_method_conditioned,
+                                        energy,
+                                    ),
+                                    "rms_centered": self._rms(
+                                        energy,
+                                        len(methods),
+                                        n_coordinates,
+                                    ),
+                                    "rms_task_shared": self._rms(
+                                        ss_task,
+                                        len(methods),
+                                        n_coordinates,
+                                    ),
+                                    "rms_method_conditioned": self._rms(
+                                        ss_method_conditioned,
+                                        len(methods),
+                                        n_coordinates,
+                                    ),
+                                }
+                            )
+
+                output = self._write_csv(
+                    self._analysis_save_dir(
+                        "sq2_dataset_organization",
+                        representation,
+                        scope,
+                    )
+                    / "datasets.csv",
+                    tuple(records[0]),
+                    records,
+                )
+
+                paths[representation][scope] = {"datasets": output}
+
+        return paths
+
+    # ==================================================================
+    # SQ3
+    # ==================================================================
+
+    def analyze_method_organization(
+        self,
+    ):
+        paths = {}
+        n_tasks = len(self.DATASETS)
+
+        for representation in self.REPRESENTATIONS:
+            paths[representation] = {}
+
+            for (
+                scope,
+                methods,
+            ) in self.METHOD_SCOPES.items():
+                self._log(f"\nSQ3 [{representation}] [{scope}]")
+
+                records = []
+
+                for signature in self.RQ1_SIGNATURES:
+                    for component in self._progress(
+                        self.COMPONENTS,
+                        desc=f"SQ3 {representation}/{scope} {signature}",
+                        total=len(self.COMPONENTS),
+                    ):
+                        effects = self._get_effects(
+                            scope,
+                            representation,
+                            signature,
+                            component,
+                        )
+
+                        attrs = self._get_attributions(
+                            scope,
+                            representation,
+                            signature,
+                            component,
+                        )
+
+                        n_coordinates = effects["y"].shape[-1]
+
+                        for (
+                            method_index,
+                            method_name,
+                        ) in enumerate(methods):
+                            task_conditioned = (
+                                effects["tau"]
+                                + effects["interaction"][
+                                    :,
+                                    method_index,
+                                ]
+                            )
+
+                            ss_method = n_tasks * np.sum(
+                                effects["method"][method_index] ** 2
+                            )
+
+                            ss_group = 0.0
+                            ss_individual = 0.0
+
+                            for indices in self._official_group_indices.values():
+                                group_mean = task_conditioned[indices].mean(axis=0)
+
+                                ss_group += len(indices) * np.sum(group_mean**2)
+
+                                ss_individual += np.sum(
+                                    (task_conditioned[indices] - group_mean) ** 2
+                                )
+
+                            energy = attrs["energy"][
+                                :,
+                                method_index,
+                            ].sum()
+
+                            c_task = attrs["c_task"][
+                                :,
+                                method_index,
+                            ].sum()
+
+                            c_method = attrs["c_method"][
+                                :,
+                                method_index,
+                            ].sum()
+
+                            c_interaction = attrs["c_interaction"][
+                                :,
+                                method_index,
+                            ].sum()
+
+                            c_group = attrs["c_group"][
+                                :,
+                                method_index,
+                            ].sum()
+
+                            c_specific = attrs["c_task_specific"][
+                                :,
+                                method_index,
+                            ].sum()
+
+                            top_shares = self._safe_abs_shares(
+                                (
+                                    c_task,
+                                    c_method,
+                                    c_interaction,
+                                )
+                            )
+
+                            nested_shares = self._safe_abs_shares(
+                                (
+                                    c_group,
+                                    c_specific,
+                                )
+                            )
+
+                            ss_task_conditioned = ss_group + ss_individual
+
+                            records.append(
+                                {
+                                    "signature": signature,
+                                    "method": method_name,
+                                    "component": component,
+                                    "n_coordinates": n_coordinates,
+                                    "rms_universal": self._vector_rms(effects["u"]),
+                                    "energy_centered": energy,
+                                    "c_task": c_task,
+                                    "c_method": c_method,
+                                    "c_interaction": c_interaction,
+                                    "share_task": top_shares[0],
+                                    "share_method": top_shares[1],
+                                    "share_interaction": top_shares[2],
+                                    "c_task_group": c_group,
+                                    "c_individual_task": c_specific,
+                                    "share_task_group_within_task": nested_shares[0],
+                                    "share_individual_task_within_task": nested_shares[
+                                        1
+                                    ],
+                                    "ss_method_general": ss_method,
+                                    "ss_task_group": ss_group,
+                                    "ss_individual_task": ss_individual,
+                                    "ss_task_conditioned": ss_task_conditioned,
+                                    "r_method_general": self._safe_ratio(
+                                        ss_method,
+                                        energy,
+                                    ),
+                                    "r_task_group": self._safe_ratio(
+                                        ss_group,
+                                        energy,
+                                    ),
+                                    "r_individual_task": self._safe_ratio(
+                                        ss_individual,
+                                        energy,
+                                    ),
+                                    "r_task_conditioned": self._safe_ratio(
+                                        ss_task_conditioned,
+                                        energy,
+                                    ),
+                                    "rms_centered": self._rms(
+                                        energy,
+                                        n_tasks,
+                                        n_coordinates,
+                                    ),
+                                    "rms_method_general": self._rms(
+                                        ss_method,
+                                        n_tasks,
+                                        n_coordinates,
+                                    ),
+                                    "rms_task_group": self._rms(
+                                        ss_group,
+                                        n_tasks,
+                                        n_coordinates,
+                                    ),
+                                    "rms_individual_task": self._rms(
+                                        ss_individual,
+                                        n_tasks,
+                                        n_coordinates,
+                                    ),
+                                }
+                            )
+
+                output = self._write_csv(
+                    self._analysis_save_dir(
+                        "sq3_method_organization",
+                        representation,
+                        scope,
+                    )
+                    / "methods.csv",
+                    tuple(records[0]),
+                    records,
+                )
+
+                paths[representation][scope] = {"methods": output}
+
+        return paths
+
+    # ==================================================================
+    # SQ4
+    # ==================================================================
+
+    def analyze_global_organization(
+        self,
+    ):
+        paths = {}
+
+        n_tasks = len(self.DATASETS)
+
+        for representation in self.REPRESENTATIONS:
+            paths[representation] = {}
+
+            for (
+                scope,
+                methods,
+            ) in self.METHOD_SCOPES.items():
+                self._log(f"\nSQ4 [{representation}] [{scope}]")
+
+                records = []
+
+                n_methods = len(methods)
+
+                n_cells = n_tasks * n_methods
+
+                for signature in self.RQ1_SIGNATURES:
+                    for component in self._progress(
+                        self.COMPONENTS,
+                        desc=f"SQ4 {representation}/{scope} {signature}",
+                        total=len(self.COMPONENTS),
+                    ):
+                        effects = self._get_effects(
+                            scope,
+                            representation,
+                            signature,
+                            component,
+                        )
+
+                        attrs = self._get_attributions(
+                            scope,
+                            representation,
+                            signature,
+                            component,
+                        )
+
+                        n_coordinates = effects["y"].shape[-1]
+
+                        energy = attrs["energy"].sum()
+
+                        ss_task = n_methods * np.sum(effects["tau"] ** 2)
+
+                        ss_method = n_tasks * np.sum(effects["method"] ** 2)
+
+                        ss_interaction = np.sum(effects["interaction"] ** 2)
+
+                        ss_group = n_methods * np.sum(effects["group"] ** 2)
+
+                        ss_individual = n_methods * np.sum(
+                            effects["task_specific"] ** 2
+                        )
+
+                        c_task = attrs["c_task"].sum()
+
+                        c_method = attrs["c_method"].sum()
+
+                        c_interaction = attrs["c_interaction"].sum()
+
+                        c_group = attrs["c_group"].sum()
+
+                        c_specific = attrs["c_task_specific"].sum()
+
+                        top_shares = self._safe_abs_shares(
                             (
-                                ss_method_general,
-                                ss_task_group,
-                                ss_individual_task,
-                            ),
+                                c_task,
+                                c_method,
+                                c_interaction,
+                            )
+                        )
+
+                        nested_shares = self._safe_abs_shares(
                             (
-                                f"SQ4 method "
-                                f"{method_name} "
-                                f"{representation}/"
-                                f"{signature_name}/"
-                                f"{component}"
-                            ),
+                                c_group,
+                                c_specific,
+                            )
+                        )
+
+                        self._assert_close(
+                            energy,
+                            (ss_task + ss_method + ss_interaction),
+                            component,
+                        )
+
+                        self._assert_close(
+                            ss_task,
+                            (ss_group + ss_individual),
+                            component,
                         )
 
                         records.append(
                             {
-                                "signature": signature_name,
-                                "method": method_name,
+                                "signature": signature,
                                 "component": component,
-                                "n_coordinates": (n_coordinates),
-                                "ss_method_general": (ss_method_general),
-                                "ss_task_group": (ss_task_group),
-                                "ss_individual_task": (ss_individual_task),
-                                "ss_total": (ss_total),
-                                "r_method_general": (
-                                    self._safe_ratio(
-                                        ss_method_general,
-                                        ss_total,
+                                "n_coordinates": n_coordinates,
+                                "universal_energy": (
+                                    n_cells * np.sum(effects["u"] ** 2)
+                                ),
+                                "rms_universal": self._vector_rms(effects["u"]),
+                                "energy_centered": energy,
+                                "c_task": c_task,
+                                "c_method": c_method,
+                                "c_interaction": c_interaction,
+                                "share_task": top_shares[0],
+                                "share_method": top_shares[1],
+                                "share_interaction": top_shares[2],
+                                "c_task_group": c_group,
+                                "c_individual_task": c_specific,
+                                "share_task_group_within_task": nested_shares[0],
+                                "share_individual_task_within_task": nested_shares[1],
+                                "ss_task": ss_task,
+                                "ss_method": ss_method,
+                                "ss_interaction": ss_interaction,
+                                "ss_task_group": ss_group,
+                                "ss_individual_task": ss_individual,
+                                "r_task": self._safe_ratio(
+                                    ss_task,
+                                    energy,
+                                ),
+                                "r_method": self._safe_ratio(
+                                    ss_method,
+                                    energy,
+                                ),
+                                "r_interaction": self._safe_ratio(
+                                    ss_interaction,
+                                    energy,
+                                ),
+                                "r_task_group": self._safe_ratio(
+                                    ss_group,
+                                    energy,
+                                ),
+                                "r_individual_task": self._safe_ratio(
+                                    ss_individual,
+                                    energy,
+                                ),
+                                "r_task_group_within_task": self._safe_ratio(
+                                    ss_group,
+                                    ss_task,
+                                ),
+                                "r_individual_task_within_task": self._safe_ratio(
+                                    ss_individual,
+                                    ss_task,
+                                ),
+                                "rms_centered": self._rms(
+                                    energy,
+                                    n_cells,
+                                    n_coordinates,
+                                ),
+                                "rms_task": self._rms(
+                                    ss_task,
+                                    n_cells,
+                                    n_coordinates,
+                                ),
+                                "rms_method": self._rms(
+                                    ss_method,
+                                    n_cells,
+                                    n_coordinates,
+                                ),
+                                "rms_interaction": self._rms(
+                                    ss_interaction,
+                                    n_cells,
+                                    n_coordinates,
+                                ),
+                            }
+                        )
+
+                output = self._write_csv(
+                    self._analysis_save_dir(
+                        "sq4_global_organization",
+                        representation,
+                        scope,
+                    )
+                    / "global.csv",
+                    tuple(records[0]),
+                    records,
+                )
+
+                paths[representation][scope] = {"global": output}
+
+        return paths
+
+    # ==================================================================
+    # SQ5: CHECKPOINT / PREDICTION HELPERS
+    # ==================================================================
+
+    def _get_runs(
+        self,
+        dataset_name,
+        method_name,
+    ):
+        key = (
+            dataset_name,
+            method_name,
+        )
+
+        if key in self._runs_cache:
+            return self._runs_cache[key]
+
+        runs = []
+
+        for path in self._method_dir(
+            dataset_name,
+            method_name,
+        ).iterdir():
+            if not path.is_dir():
+                continue
+
+            config_path = path / "config.json"
+
+            model_path = path / "model.pt"
+
+            accuracy_path = path / "test_acc_eval.json"
+
+            if not (
+                config_path.is_file()
+                and model_path.is_file()
+                and accuracy_path.is_file()
+            ):
+                continue
+
+            with config_path.open() as f:
+                config = json.load(f)
+
+            with accuracy_path.open() as f:
+                accuracy = float(json.load(f)["accuracy"]["top1"])
+
+            runs.append(
+                {
+                    "seed": int(config["run_seed"]),
+                    "path": path,
+                    "config": config,
+                    "accuracy": accuracy,
+                }
+            )
+
+        if not runs:
+            raise FileNotFoundError(
+                "No completed runs found for " f"{dataset_name}/" f"{method_name}"
+            )
+
+        runs.sort(key=lambda x: x["seed"])
+
+        self._runs_cache[key] = runs
+
+        return runs
+
+    def _prediction_cache_path(
+        self,
+        dataset_name,
+        method_name,
+        seed,
+    ):
+        path = (
+            self.save_dir
+            / "prediction_cache"
+            / dataset_name
+            / method_name
+            / f"seed-{seed}.npz"
+        )
+
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        return path
+
+    def _get_seed_logits(
+        self,
+        dataset_name,
+        method_name,
+        run,
+    ):
+        cache = self._prediction_cache_path(
+            dataset_name,
+            method_name,
+            run["seed"],
+        )
+
+        if cache.is_file():
+            with np.load(
+                cache,
+                allow_pickle=False,
+            ) as data:
+                return (
+                    data["logits"],
+                    data["labels"],
+                )
+
+        config = run["config"]
+
+        dataset = datasets[dataset_name](split="test")
+
+        loader = dataset.get_dataloader(
+            batch_size=int(config["gpu_batch_size"]),
+            worker_init_fn=seed_worker,
+        )
+
+        model = models[self.backbone_name][config["peft_name"]](
+            img_size=datasets[dataset_name].IMG_SIZE,
+            n_classes=datasets[dataset_name].N_CLASSES,
+            freeze_backbone=bool(config["freeze_backbone"]),
+            **config["peft_config"],
+        )
+
+        model.load_from_path(
+            str(run["path"] / "model.pt"),
+            map_location="cpu",
+        )
+
+        model.to(self.device).eval()
+
+        logits = []
+        labels = []
+
+        with torch.inference_mode():
+            for x, y in self._progress(
+                loader,
+                desc=(f"Predict {dataset_name}/{method_name}/" f"seed-{run['seed']}"),
+                total=len(loader),
+            ):
+                logits.append(model(x.to(self.device)).cpu())
+
+                labels.append(y.cpu())
+
+        logits = torch.cat(logits).numpy().astype(np.float32)
+
+        labels = torch.cat(labels).numpy()
+
+        np.savez(
+            cache,
+            logits=logits,
+            labels=labels,
+        )
+
+        del model
+        del dataset
+        del loader
+
+        gc.collect()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return (
+            logits,
+            labels,
+        )
+
+    def _get_method_prediction(
+        self,
+        dataset_name,
+        method_name,
+    ):
+        probabilities = []
+        accuracies = []
+        labels = None
+
+        for run in self._get_runs(
+            dataset_name,
+            method_name,
+        ):
+            logits, y = self._get_seed_logits(
+                dataset_name,
+                method_name,
+                run,
+            )
+
+            if labels is None:
+                labels = y
+
+            elif not np.array_equal(
+                labels,
+                y,
+            ):
+                raise RuntimeError("Test ordering mismatch " f"for {dataset_name}")
+
+            values = logits.astype(np.float64)
+
+            values -= values.max(
+                axis=1,
+                keepdims=True,
+            )
+
+            probs = np.exp(values)
+
+            probs /= probs.sum(
+                axis=1,
+                keepdims=True,
+            )
+
+            probabilities.append(probs)
+
+            accuracies.append(run["accuracy"])
+
+        if len(probabilities) > 1:
+            seed_noise = float(
+                np.mean(
+                    [
+                        self._jsd(
+                            probabilities[i],
+                            probabilities[j],
+                        )
+                        for i, j in itertools.combinations(
+                            range(len(probabilities)),
+                            2,
+                        )
+                    ]
+                )
+            )
+
+        else:
+            seed_noise = np.nan
+
+        return {
+            "probabilities": np.mean(
+                probabilities,
+                axis=0,
+            ),
+            "accuracy": float(np.mean(accuracies)),
+            "seed_noise": seed_noise,
+            "n_seeds": len(probabilities),
+            "labels": labels,
+        }
+
+    def _get_full_behavior(
+        self,
+        dataset_name,
+    ):
+        if dataset_name in self._full_behavior_cache:
+            return self._full_behavior_cache[dataset_name]
+
+        methods = self.METHODS
+
+        predictions = {
+            method: (
+                self._get_method_prediction(
+                    dataset_name,
+                    method,
+                )
+            )
+            for method in methods
+        }
+
+        jsd = np.zeros(
+            (
+                len(methods),
+                len(methods),
+            ),
+            dtype=float,
+        )
+
+        for i, j in itertools.combinations(
+            range(len(methods)),
+            2,
+        ):
+            value = self._jsd(
+                predictions[methods[i]]["probabilities"],
+                predictions[methods[j]]["probabilities"],
+            )
+
+            jsd[
+                i,
+                j,
+            ] = value
+
+            jsd[
+                j,
+                i,
+            ] = value
+
+        result = {
+            "methods": methods,
+            "jsd": jsd,
+            "accuracy": np.array(
+                [predictions[method]["accuracy"] for method in methods]
+            ),
+            "seed_noise": np.array(
+                [predictions[method]["seed_noise"] for method in methods]
+            ),
+            "n_seeds": np.array([predictions[method]["n_seeds"] for method in methods]),
+        }
+
+        self._full_behavior_cache[dataset_name] = result
+
+        return result
+
+    def _get_behavior(
+        self,
+        dataset_name,
+        scope,
+    ):
+        key = (
+            dataset_name,
+            scope,
+        )
+
+        if key in self._behavior_cache:
+            return self._behavior_cache[key]
+
+        full = self._get_full_behavior(dataset_name)
+
+        wanted = (
+            self.REFERENCE_METHOD,
+            *self._scope_methods(scope),
+        )
+
+        indices = [full["methods"].index(method) for method in wanted]
+
+        result = {
+            "methods": wanted,
+            "jsd": full["jsd"][
+                np.ix_(
+                    indices,
+                    indices,
+                )
+            ],
+            "accuracy": full["accuracy"][indices],
+            "seed_noise": full["seed_noise"][indices],
+            "n_seeds": full["n_seeds"][indices],
+        }
+
+        self._behavior_cache[key] = result
+
+        return result
+
+    # ==================================================================
+    # SQ5
+    # ==================================================================
+
+    def analyze_prediction_alignment(
+        self,
+    ):
+        """
+        SQ5
+
+        A) Functional method geometry vs predictive JSD geometry.
+        B) Task method-conditioning vs predictive diversity.
+        C) LP-referenced functional movement vs predictive movement.
+
+        Pairwise functional distance is computed only once in raw log
+        space because raw and LP-delta pairwise distances are identical.
+        """
+
+        all_paths = {}
+
+        for (
+            scope,
+            methods,
+        ) in self.METHOD_SCOPES.items():
+            self._log(f"\nSQ5 [{scope}]")
+
+            output_dir = self._analysis_save_dir(
+                "sq5_prediction_alignment",
+                scope,
+            )
+
+            pair_records = []
+            rsa_records = []
+
+            diversity_records = []
+            diversity_corr_records = []
+
+            delta_records = []
+            delta_rsa_records = []
+
+            noise_records = []
+
+            # ----------------------------------------------------------
+            # SQ5-A + SQ5-C
+            # ----------------------------------------------------------
+
+            for (
+                task_index,
+                task,
+            ) in self._progress(
+                enumerate(self.DATASETS),
+                desc=f"SQ5-A/C {scope}",
+                total=len(self.DATASETS),
+            ):
+                behavior = self._get_behavior(
+                    task,
+                    scope,
+                )
+
+                # Index 0 is LP.
+                prediction_matrix = behavior["jsd"][
+                    1:,
+                    1:,
+                ]
+
+                accuracies = behavior["accuracy"][1:]
+
+                prediction_vector = self._upper(prediction_matrix)
+
+                accuracy_matrix = np.abs(accuracies[:, None] - accuracies[None, :])
+
+                accuracy_vector = self._upper(accuracy_matrix)
+
+                for index, method in enumerate(behavior["methods"]):
+                    noise_records.append(
+                        {
+                            "task": task,
+                            "method": method,
+                            "n_seeds": int(behavior["n_seeds"][index]),
+                            "mean_seed_jsd": behavior["seed_noise"][index],
+                            "mean_accuracy": behavior["accuracy"][index],
+                        }
+                    )
+
+                for signature in self.RQ1_SIGNATURES:
+                    profiles = self._get_log_signature_profiles(signature)
+
+                    for component in self.COMPONENTS:
+                        # ----------------------------------------------
+                        # Pairwise functional geometry
+                        # ----------------------------------------------
+
+                        x = np.stack(
+                            [
+                                profiles[method][component][task_index].reshape(-1)
+                                for method in methods
+                            ]
+                        )
+
+                        functional_matrix = self._pairwise_rms_distance(x)
+
+                        functional_vector = self._upper(functional_matrix)
+
+                        for i, j in itertools.combinations(
+                            range(len(methods)),
+                            2,
+                        ):
+                            pair_records.append(
+                                {
+                                    "task": task,
+                                    "signature": signature,
+                                    "component": component,
+                                    "method_a": methods[i],
+                                    "method_b": methods[j],
+                                    "functional_distance": functional_matrix[
+                                        i,
+                                        j,
+                                    ],
+                                    "prediction_jsd": prediction_matrix[
+                                        i,
+                                        j,
+                                    ],
+                                    "accuracy_difference": abs(
+                                        accuracies[i] - accuracies[j]
+                                    ),
+                                }
+                            )
+
+                        rsa_records.append(
+                            {
+                                "task": task,
+                                "signature": signature,
+                                "component": component,
+                                "is_core": (component in self.CORE_COMPONENTS),
+                                "rho": self._spearman(
+                                    functional_vector,
+                                    prediction_vector,
+                                ),
+                                "p_permutation": (
+                                    self._rsa_permutation_p(
+                                        functional_matrix,
+                                        prediction_matrix,
                                     )
                                 ),
-                                "r_task_group": (
-                                    self._safe_ratio(
-                                        ss_task_group,
-                                        ss_total,
+                                "partial_rho_accuracy": (
+                                    self._partial_spearman(
+                                        functional_vector,
+                                        prediction_vector,
+                                        accuracy_vector,
                                     )
                                 ),
-                                "r_individual_task": (
-                                    self._safe_ratio(
-                                        ss_individual_task,
-                                        ss_total,
-                                    )
-                                ),
-                                "rms_total": (
-                                    self._rms_from_ss(
-                                        ss_total,
-                                        n_tasks,
-                                        n_coordinates,
-                                    )
-                                ),
-                                "rms_method_general": (
-                                    self._rms_from_ss(
-                                        ss_method_general,
-                                        n_tasks,
-                                        n_coordinates,
-                                    )
-                                ),
-                                "rms_task_group": (
-                                    self._rms_from_ss(
-                                        ss_task_group,
-                                        n_tasks,
-                                        n_coordinates,
-                                    )
-                                ),
-                                "rms_individual_task": (
-                                    self._rms_from_ss(
-                                        ss_individual_task,
-                                        n_tasks,
-                                        n_coordinates,
+                                "partial_p_permutation_accuracy": (
+                                    self._rsa_permutation_p(
+                                        functional_matrix,
+                                        prediction_matrix,
+                                        accuracy_matrix,
                                     )
                                 ),
                             }
                         )
 
-            methods_path = self._write_csv(
-                output_dir / "methods.csv",
-                (
-                    "signature",
-                    "method",
-                    "component",
-                    "n_coordinates",
-                    "ss_method_general",
-                    "ss_task_group",
-                    "ss_individual_task",
-                    "ss_total",
-                    "r_method_general",
-                    "r_task_group",
-                    "r_individual_task",
-                    "rms_total",
-                    "rms_method_general",
-                    "rms_task_group",
-                    "rms_individual_task",
+                        # ----------------------------------------------
+                        # LP-referenced movement
+                        # ----------------------------------------------
+
+                        reference = profiles[self.REFERENCE_METHOD][component][
+                            task_index
+                        ].reshape(-1)
+
+                        functional_to_lp = np.sqrt(
+                            np.mean(
+                                (x - reference) ** 2,
+                                axis=1,
+                            )
+                        )
+
+                        prediction_to_lp = behavior["jsd"][
+                            0,
+                            1:,
+                        ]
+
+                        for (
+                            method_index,
+                            method,
+                        ) in enumerate(methods):
+                            delta_records.append(
+                                {
+                                    "task": task,
+                                    "method": method,
+                                    "signature": signature,
+                                    "component": component,
+                                    "functional_distance_to_lp": functional_to_lp[
+                                        method_index
+                                    ],
+                                    "prediction_jsd_to_lp": prediction_to_lp[
+                                        method_index
+                                    ],
+                                    "accuracy_gain_over_lp": (
+                                        accuracies[method_index]
+                                        - behavior["accuracy"][0]
+                                    ),
+                                }
+                            )
+
+                        delta_rsa_records.append(
+                            {
+                                "task": task,
+                                "signature": signature,
+                                "component": component,
+                                "is_core": (component in self.CORE_COMPONENTS),
+                                "rho": self._spearman(
+                                    functional_to_lp,
+                                    prediction_to_lp,
+                                ),
+                            }
+                        )
+
+            # ----------------------------------------------------------
+            # SQ5-B
+            # ----------------------------------------------------------
+
+            for representation in self.REPRESENTATIONS:
+                for signature in self.RQ1_SIGNATURES:
+                    for component in self._progress(
+                        self.COMPONENTS,
+                        desc=f"SQ5-B {scope} {representation} {signature}",
+                        total=len(self.COMPONENTS),
+                    ):
+                        organization = self._get_dataset_organization(
+                            scope,
+                            representation,
+                            signature,
+                            component,
+                        )
+
+                        method_conditioning = []
+                        prediction_diversity = []
+
+                        for task in self.DATASETS:
+                            task_index = self._dataset_index[task]
+
+                            behavior = self._get_behavior(
+                                task,
+                                scope,
+                            )
+
+                            prediction_matrix = behavior["jsd"][
+                                1:,
+                                1:,
+                            ]
+
+                            mean_jsd = float(self._upper(prediction_matrix).mean())
+
+                            r_method_conditioned = organization[task_index][
+                                "r_method_conditioned"
+                            ]
+
+                            method_conditioning.append(r_method_conditioned)
+
+                            prediction_diversity.append(mean_jsd)
+
+                            diversity_records.append(
+                                {
+                                    "representation": representation,
+                                    "task": task,
+                                    "signature": signature,
+                                    "component": component,
+                                    "is_core": (component in self.CORE_COMPONENTS),
+                                    "r_method_conditioned": r_method_conditioned,
+                                    "mean_prediction_jsd": mean_jsd,
+                                }
+                            )
+
+                        correlation = spearmanr(
+                            method_conditioning,
+                            prediction_diversity,
+                        )
+
+                        diversity_corr_records.append(
+                            {
+                                "representation": representation,
+                                "signature": signature,
+                                "component": component,
+                                "is_core": (component in self.CORE_COMPONENTS),
+                                "rho": correlation.statistic,
+                                "p_value": correlation.pvalue,
+                            }
+                        )
+
+            files = {
+                "pairwise_distances": self._write_csv(
+                    output_dir / "pairwise_distances.csv",
+                    tuple(pair_records[0]),
+                    pair_records,
                 ),
-                records,
-            )
-
-            self._log(
-                f"\nSaved SQ4 " f"[{representation}] results:" f"\n  {methods_path}"
-            )
-
-            all_paths[representation] = {
-                "methods": methods_path,
+                "rsa_by_task": self._write_csv(
+                    output_dir / "rsa_by_task.csv",
+                    tuple(rsa_records[0]),
+                    rsa_records,
+                ),
+                "dataset_prediction_diversity": self._write_csv(
+                    output_dir / "dataset_prediction_diversity.csv",
+                    tuple(diversity_records[0]),
+                    diversity_records,
+                ),
+                "dataset_diversity_correlations": self._write_csv(
+                    output_dir / "dataset_diversity_correlations.csv",
+                    tuple(diversity_corr_records[0]),
+                    diversity_corr_records,
+                ),
+                "delta_to_lp": self._write_csv(
+                    output_dir / "delta_to_lp.csv",
+                    tuple(delta_records[0]),
+                    delta_records,
+                ),
+                "delta_rsa_by_task": self._write_csv(
+                    output_dir / "delta_rsa_by_task.csv",
+                    tuple(delta_rsa_records[0]),
+                    delta_rsa_records,
+                ),
+                "seed_prediction_noise": self._write_csv(
+                    output_dir / "seed_prediction_noise.csv",
+                    tuple(noise_records[0]),
+                    noise_records,
+                ),
             }
+
+            all_paths[scope] = files
 
         return all_paths
