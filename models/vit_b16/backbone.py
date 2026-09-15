@@ -222,3 +222,44 @@ class ViTB16Backbone(TransformerBackbone):
             "cls": encoded[:, 0],
             "patch_tokens": encoded[:, 1:],
         }
+
+    def get_layerwise_features(
+        self,
+        x: torch.Tensor,
+    ):
+        """
+        Return CLS and patch representations after every Transformer layer.
+
+        Returns:
+            cls:
+                [num_layers, B, embed_dim]
+            patch_tokens:
+                [num_layers, B, num_patches, embed_dim]
+        """
+        batch_size = x.shape[0]
+
+        patch_tokens = self.get_patch_tokens(x)
+        cls_token = self.get_cls_token(batch_size)
+
+        cls_pos, patch_pos = self.get_positional_embeddings()
+
+        hidden = torch.cat(
+            (
+                cls_token + cls_pos,
+                patch_tokens + patch_pos,
+            ),
+            dim=1,
+        )
+        hidden = self.input_dropout(hidden)
+
+        layer_outputs = []
+        for block in self.blocks:
+            hidden, _ = block(hidden)
+            layer_outputs.append(hidden)
+
+        layer_outputs = torch.stack(layer_outputs, dim=0)
+
+        return {
+            "cls": layer_outputs[:, :, 0],
+            "patch_tokens": layer_outputs[:, :, 1:],
+        }

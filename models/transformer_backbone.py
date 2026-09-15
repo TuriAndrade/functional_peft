@@ -106,6 +106,19 @@ class TransformerBackbone(nn.Module, ABC):
         ...
 
     @abstractmethod
+    def get_layerwise_features(
+        self,
+        x: torch.Tensor,
+    ) -> Mapping[str, torch.Tensor]:
+        """
+        Return the intermediate representations after every Transformer layer.
+
+        The returned mapping must contain at least:
+            "cls": [L, B, embed_dim]
+        """
+        ...
+
+    @abstractmethod
     def freeze(self) -> None:
         """Freeze all native backbone parameters."""
         ...

@@ -164,6 +164,86 @@ class ViTB16VPT(PEFTModel):
             "patch_tokens": encoded[:, prompt_end:],
         }
 
+    def get_layerwise_features(
+        self,
+        x: torch.Tensor,
+    ):
+        """
+        Return CLS, prompt, and patch representations after every Transformer layer.
+
+        Returns:
+            cls:
+                [num_layers, B, embed_dim]
+            prompt_tokens:
+                [num_layers, B, prompt_length, embed_dim]
+            patch_tokens:
+                [num_layers, B, num_patches, embed_dim]
+        """
+        batch_size = x.shape[0]
+
+        patch_tokens = self.backbone.get_patch_tokens(x)
+        cls_token = self.backbone.get_cls_token(batch_size)
+        cls_pos, patch_pos = self.backbone.get_positional_embeddings()
+
+        hidden = torch.cat(
+            (
+                cls_token + cls_pos,
+                patch_tokens + patch_pos,
+            ),
+            dim=1,
+        )
+        hidden = self.backbone.input_dropout(hidden)
+
+        cls_features = []
+        prompt_features = []
+        patch_features = []
+
+        if self.prompt_mode == "shallow":
+            hidden = torch.cat(
+                (
+                    hidden[:, :1],
+                    self.get_prompt_tokens(batch_size),
+                    hidden[:, 1:],
+                ),
+                dim=1,
+            )
+
+            for block in self.backbone.blocks:
+                hidden, _ = block(hidden)
+
+                prompt_end = 1 + self.prompt_length
+
+                cls_features.append(hidden[:, 0])
+                prompt_features.append(hidden[:, 1:prompt_end])
+                patch_features.append(hidden[:, prompt_end:])
+
+        else:
+            for layer_idx, block in enumerate(self.backbone.blocks):
+                patch_start = 1 if layer_idx == 0 else 1 + self.prompt_length
+
+                hidden = torch.cat(
+                    (
+                        hidden[:, :1],
+                        self.get_prompt_tokens(batch_size, layer_idx),
+                        hidden[:, patch_start:],
+                    ),
+                    dim=1,
+                )
+
+                hidden, _ = block(hidden)
+
+                prompt_end = 1 + self.prompt_length
+
+                cls_features.append(hidden[:, 0])
+                prompt_features.append(hidden[:, 1:prompt_end])
+                patch_features.append(hidden[:, prompt_end:])
+
+        return {
+            "cls": torch.stack(cls_features, dim=0),
+            "prompt_tokens": torch.stack(prompt_features, dim=0),
+            "patch_tokens": torch.stack(patch_features, dim=0),
+        }
+
     def save(
         self,
         path: str,

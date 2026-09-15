@@ -96,6 +96,12 @@ class PEFTModel(nn.Module, ABC):
     ) -> Mapping[str, torch.Tensor]:
         return self.backbone.forward_features(x)
 
+    def get_layerwise_features(
+        self,
+        x: torch.Tensor,
+    ) -> Mapping[str, torch.Tensor]:
+        return self.backbone.get_layerwise_features(x)
+
     def forward(
         self,
         x: torch.Tensor,

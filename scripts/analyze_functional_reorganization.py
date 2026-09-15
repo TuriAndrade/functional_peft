@@ -37,11 +37,7 @@ def main():
         verbose=not args.quiet,
     )
 
-    analyzer.analyze_pair_attribution()  # SQ1
-    analyzer.analyze_dataset_organization()  # SQ2
-    analyzer.analyze_method_organization()  # SQ3
-    analyzer.analyze_global_organization()  # SQ4
-    analyzer.analyze_prediction_alignment()  # SQ5
+    analyzer.analyze_all()
 
 
 if __name__ == "__main__":
