@@ -1461,7 +1461,91 @@ class FunctionalReorganizationAnalyzer:
             with open(path, encoding="utf-8") as f:
                 return list(csv.DictReader(f))
 
-        # Global decomposition.
+        # Color-vision-deficiency-safe Paul Tol "Bright" palette.
+        COLORS = {
+            "blue": "#4477AA",
+            "cyan": "#66CCEE",
+            "green": "#228833",
+            "yellow": "#CCBB44",
+            "red": "#EE6677",
+            "purple": "#AA3377",
+            "gray": "#BBBBBB",
+        }
+
+        # Same semantic colors across decomposition figures.
+        DECOMP_COLORS = {
+            "group": COLORS["blue"],
+            "dataset": COLORS["cyan"],
+            "method": COLORS["yellow"],
+            "interaction": COLORS["purple"],
+            "seed": COLORS["gray"],
+            "method_general": COLORS["blue"],
+            "task_group": COLORS["cyan"],
+            "dataset_specific": COLORS["yellow"],
+            "task_shared": COLORS["blue"],
+            "method_conditioned": COLORS["yellow"],
+        }
+
+        SOURCE_COLORS = {
+            "F": COLORS["blue"],
+            "P": COLORS["green"],
+            "S": COLORS["red"],
+            "CKA": COLORS["purple"],
+        }
+
+        PRETTY_METHOD = {
+            "full_ft": "Full FT",
+            "vpt_shallow": "VPT-Shallow",
+            "vpt_deep": "VPT-Deep",
+            "lora": "LoRA",
+            "ssf": "SSF",
+            "adaptformer": "AdaptFormer",
+        }
+
+        PRETTY_EFFECT = {
+            "group": "Task group",
+            "dataset": "Dataset",
+            "method": "Method",
+            "interaction": "Interaction",
+            "seed": "Seed",
+            "method_general": "Method-general",
+            "task_group": "Task group",
+            "dataset_specific": "Dataset-specific",
+            "task_shared": "Task-shared",
+            "method_conditioned": "Method-conditioned",
+        }
+
+        PRETTY_BEHAVIOR = {
+            "jsd": "Jensen–Shannon divergence",
+            "top1_disagreement": "Top-1 disagreement",
+            "error_dissimilarity": "Error dissimilarity",
+        }
+
+        def style_ax(ax, grid_axis="y"):
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.spines["left"].set_color("#B8B8B8")
+            ax.spines["bottom"].set_color("#B8B8B8")
+            ax.tick_params(length=3, color="#777777")
+            if grid_axis is not None:
+                ax.grid(
+                    axis=grid_axis,
+                    color="#D9D9D9",
+                    linewidth=0.65,
+                    alpha=0.55,
+                    zorder=0,
+                )
+                ax.set_axisbelow(True)
+
+        def style_heatmap(ax):
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            ax.tick_params(length=0)
+
+        # ------------------------------------------------------------------
+        # Global decomposition
+        # ------------------------------------------------------------------
+
         rows = [
             r
             for r in read(signature_outputs["decomposition"]["global"])
@@ -1469,23 +1553,56 @@ class FunctionalReorganizationAnalyzer:
             and r["channel"] == "model"
             and r["component"] == "balanced_core"
         ]
+
         order = ["F", "P", "S"]
         rows.sort(key=lambda r: order.index(r["signature"]))
-        fig, ax = plt.subplots(figsize=(7, 4))
-        bottom = np.zeros(3)
+
+        fig, ax = plt.subplots(figsize=(7.2, 4.4))
+        bottom = np.zeros(len(order))
+
         for key in ("group", "dataset", "method", "interaction", "seed"):
-            v = np.array([float(r[f"r_{key}"]) for r in rows])
-            ax.bar(order, v, bottom=bottom, label=key)
-            bottom += v
+            values = np.array([float(r[f"r_{key}"]) for r in rows])
+
+            ax.bar(
+                order,
+                values,
+                bottom=bottom,
+                width=0.62,
+                color=DECOMP_COLORS[key],
+                edgecolor="white",
+                linewidth=0.8,
+                label=PRETTY_EFFECT[key],
+                zorder=3,
+            )
+
+            bottom += values
+
+        ax.set_ylim(0, 1)
         ax.set_ylabel("Fraction of centered reorganization energy")
-        ax.legend(fontsize=8)
+        ax.set_title("Global functional reorganization", pad=10)
+
+        style_ax(ax)
+
+        ax.legend(
+            frameon=False,
+            fontsize=8,
+            ncol=3,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.12),
+        )
+
         fig.tight_layout()
+
         path = out / "decomposition_global.pdf"
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
+
         paths["decomposition_global"] = path
 
-        # Per-method decomposition.
+        # ------------------------------------------------------------------
+        # Per-method decomposition
+        # ------------------------------------------------------------------
+
         rows = [
             r
             for r in read(signature_outputs["decomposition"]["method"])
@@ -1493,28 +1610,77 @@ class FunctionalReorganizationAnalyzer:
             and r["channel"] == "model"
             and r["component"] == "balanced_core"
         ]
-        fig, axes = plt.subplots(1, 3, figsize=(13, 5), sharey=True)
+
+        fig, axes = plt.subplots(
+            1,
+            3,
+            figsize=(13.5, 5.2),
+            sharey=True,
+        )
+
         for ax, sig in zip(axes, order):
             by = {r["method"]: r for r in rows if r["signature"] == sig}
+
             y = np.arange(len(self.ADAPTATION_METHODS))
             left = np.zeros(len(y))
-            for key in ("method_general", "task_group", "dataset_specific", "seed"):
-                v = np.array(
+
+            for key in (
+                "method_general",
+                "task_group",
+                "dataset_specific",
+                "seed",
+            ):
+                values = np.array(
                     [float(by[m][f"r_{key}"]) for m in self.ADAPTATION_METHODS]
                 )
-                ax.barh(y, v, left=left, label=key)
-                left += v
-            ax.set_title(sig)
-            ax.set_yticks(y, self.ADAPTATION_METHODS)
+
+                ax.barh(
+                    y,
+                    values,
+                    left=left,
+                    height=0.68,
+                    color=DECOMP_COLORS[key],
+                    edgecolor="white",
+                    linewidth=0.6,
+                    label=PRETTY_EFFECT[key],
+                    zorder=3,
+                )
+
+                left += values
+
+            ax.set_title(sig, pad=8)
             ax.set_xlim(0, 1)
-        axes[0].legend(fontsize=7)
+            ax.set_xticks(np.linspace(0, 1, 6))
+            ax.set_xlabel("Fraction of energy")
+
+            ax.set_yticks(
+                y,
+                [PRETTY_METHOD[m] for m in self.ADAPTATION_METHODS],
+            )
+
+            ax.invert_yaxis()
+            style_ax(ax, "x")
+
+        axes[0].legend(
+            frameon=False,
+            fontsize=8,
+            ncol=2,
+            loc="upper left",
+            bbox_to_anchor=(0, -0.14),
+        )
+
         fig.tight_layout()
+
         path = out / "decomposition_by_method.pdf"
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
+
         paths["decomposition_by_method"] = path
 
-        # Per-dataset decomposition.
+        # ------------------------------------------------------------------
+        # Per-dataset decomposition
+        # ------------------------------------------------------------------
+
         rows = [
             r
             for r in read(signature_outputs["decomposition"]["dataset"])
@@ -1522,27 +1688,85 @@ class FunctionalReorganizationAnalyzer:
             and r["channel"] == "model"
             and r["component"] == "balanced_core"
         ]
-        fig, axes = plt.subplots(1, 3, figsize=(14, 8), sharey=True)
-        short = [t.removeprefix("vtab_") for t in self.DATASETS]
+
+        short = [t.removeprefix("vtab_").replace("_", " ") for t in self.DATASETS]
+
+        fig, axes = plt.subplots(
+            1,
+            3,
+            figsize=(14.5, 8.2),
+            sharey=True,
+        )
+
         for ax, sig in zip(axes, order):
             by = {r["task"]: r for r in rows if r["signature"] == sig}
+
             y = np.arange(len(self.DATASETS))
             left = np.zeros(len(y))
-            for key in ("task_shared", "method_conditioned", "seed"):
-                v = np.array([float(by[t][f"r_{key}"]) for t in self.DATASETS])
-                ax.barh(y, v, left=left, label=key)
-                left += v
-            ax.set_title(sig)
-            ax.set_yticks(y, short, fontsize=7)
+
+            for key in (
+                "task_shared",
+                "method_conditioned",
+                "seed",
+            ):
+                values = np.array([float(by[t][f"r_{key}"]) for t in self.DATASETS])
+
+                ax.barh(
+                    y,
+                    values,
+                    left=left,
+                    height=0.70,
+                    color=DECOMP_COLORS[key],
+                    edgecolor="white",
+                    linewidth=0.55,
+                    label=PRETTY_EFFECT[key],
+                    zorder=3,
+                )
+
+                left += values
+
+            # Separate Natural / Specialized / Structured visually.
+            for boundary in (
+                len(self.NATURAL) - 0.5,
+                len(self.NATURAL) + len(self.SPECIALIZED) - 0.5,
+            ):
+                ax.axhline(
+                    boundary,
+                    color="#888888",
+                    linewidth=0.7,
+                    linestyle="--",
+                    alpha=0.55,
+                )
+
+            ax.set_title(sig, pad=8)
             ax.set_xlim(0, 1)
-        axes[0].legend(fontsize=7)
+            ax.set_xticks(np.linspace(0, 1, 6))
+            ax.set_xlabel("Fraction of energy")
+            ax.set_yticks(y, short, fontsize=7.5)
+
+            ax.invert_yaxis()
+            style_ax(ax, "x")
+
+        axes[0].legend(
+            frameon=False,
+            fontsize=8,
+            ncol=3,
+            loc="upper left",
+            bbox_to_anchor=(0, -0.08),
+        )
+
         fig.tight_layout()
+
         path = out / "decomposition_by_dataset.pdf"
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
+
         paths["decomposition_by_dataset"] = path
 
-        # Dataset x method attribution, model Fisher balanced core.
+        # ------------------------------------------------------------------
+        # Dataset × method attribution
+        # ------------------------------------------------------------------
+
         rows = [
             r
             for r in read(signature_outputs["decomposition"]["dataset_method"])
@@ -1551,41 +1775,87 @@ class FunctionalReorganizationAnalyzer:
             and r["signature"] == "F"
             and r["component"] == "balanced_core"
         ]
+
         lookup = {(r["task"], r["method"]): r for r in rows}
+
         panels = (
-            ("r_group_signed", "task group"),
-            ("r_dataset_signed", "dataset"),
-            ("r_method_signed", "method"),
-            ("r_interaction_signed", "interaction"),
-            ("r_seed", "seed"),
+            ("r_group_signed", "Task group"),
+            ("r_dataset_signed", "Dataset"),
+            ("r_method_signed", "Method"),
+            ("r_interaction_signed", "Interaction"),
+            ("r_seed", "Seed"),
         )
-        fig, axes = plt.subplots(2, 3, figsize=(12, 10))
-        for ax, (key, title) in zip(axes.ravel(), panels):
+
+        fig, axes = plt.subplots(
+            2,
+            3,
+            figsize=(12.5, 10.2),
+        )
+
+        for ax, (key, title) in zip(
+            axes.ravel(),
+            panels,
+        ):
             matrix = np.array(
                 [
                     [float(lookup[t, m][key]) for m in self.ADAPTATION_METHODS]
                     for t in self.DATASETS
                 ]
             )
-            im = ax.imshow(matrix, aspect="auto")
-            ax.set_title(title)
+
+            # Same palette for every heatmap, including seed.
+            im = ax.imshow(
+                matrix,
+                aspect="auto",
+                cmap="viridis",
+                interpolation="nearest",
+            )
+
+            ax.set_title(title, pad=7)
+
             ax.set_xticks(
                 range(len(self.ADAPTATION_METHODS)),
-                self.ADAPTATION_METHODS,
-                rotation=45,
+                [PRETTY_METHOD[m] for m in self.ADAPTATION_METHODS],
+                rotation=40,
                 ha="right",
-                fontsize=7,
+                fontsize=7.5,
             )
-            ax.set_yticks(range(len(self.DATASETS)), short, fontsize=6)
-            fig.colorbar(im, ax=ax, fraction=0.046)
+
+            ax.set_yticks(
+                range(len(self.DATASETS)),
+                short,
+                fontsize=6.5,
+            )
+
+            style_heatmap(ax)
+
+            cbar = fig.colorbar(
+                im,
+                ax=ax,
+                fraction=0.046,
+                pad=0.03,
+            )
+
+            cbar.ax.tick_params(
+                labelsize=7,
+                length=2,
+            )
+            cbar.outline.set_visible(False)
+
         axes.ravel()[-1].axis("off")
+
         fig.tight_layout()
+
         path = out / "decomposition_dataset_method.pdf"
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
+
         paths["decomposition_dataset_method"] = path
 
-        # Global F=P+S decomposition.
+        # ------------------------------------------------------------------
+        # Global F = P + S decomposition
+        # ------------------------------------------------------------------
+
         rows = [
             r
             for r in read(signature_outputs["fisher_ps"]["global"])
@@ -1594,31 +1864,79 @@ class FunctionalReorganizationAnalyzer:
             and r["component"] == "balanced_core"
             and r["effect"] not in {"task", "total"}
         ]
+
+        effect_order = [
+            "group",
+            "dataset",
+            "method",
+            "interaction",
+            "seed",
+        ]
+
+        rows.sort(key=lambda r: effect_order.index(r["effect"]))
+
         x = np.arange(len(rows))
-        width = 0.26
-        fig, ax = plt.subplots(figsize=(8, 4))
-        for offset, key, label in (
-            (-width, "p_over_f", "P"),
-            (0, "s_over_f", "S"),
-            (width, "cross_over_f", "P×S"),
+        width = 0.24
+
+        fig, ax = plt.subplots(figsize=(8.5, 4.4))
+
+        for offset, key, label, color in (
+            (-width, "p_over_f", "P", COLORS["blue"]),
+            (0, "s_over_f", "S", COLORS["green"]),
+            (
+                width,
+                "cross_over_f",
+                "P × S",
+                COLORS["purple"],
+            ),
         ):
             ax.bar(
                 x + offset,
                 [np.nan if r[key] == "NA" else float(r[key]) for r in rows],
                 width,
+                color=color,
+                edgecolor="white",
+                linewidth=0.65,
                 label=label,
+                zorder=3,
             )
-        ax.axhline(0, linewidth=0.8)
-        ax.set_xticks(x, [r["effect"] for r in rows])
+
+        ax.axhline(
+            0,
+            color="#555555",
+            linewidth=0.9,
+        )
+
+        ax.set_xticks(
+            x,
+            [PRETTY_EFFECT[r["effect"]] for r in rows],
+        )
+
         ax.set_ylabel("Term / Fisher energy")
-        ax.legend()
+        ax.set_title(
+            "Participation–sensitivity decomposition",
+            pad=10,
+        )
+
+        style_ax(ax)
+
+        ax.legend(
+            frameon=False,
+            ncol=3,
+        )
+
         fig.tight_layout()
+
         path = out / "fisher_ps_decomposition.pdf"
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
+
         paths["fisher_ps"] = path
 
-        # Behavioral grounding: balanced-core model F/P/S plus CKA.
+        # ------------------------------------------------------------------
+        # Behavioral grounding
+        # ------------------------------------------------------------------
+
         core = [
             r
             for r in alignment_summary
@@ -1634,50 +1952,178 @@ class FunctionalReorganizationAnalyzer:
                 or r["source"] == "CKA"
             )
         ]
-        source_order = ["F", "P", "S", "CKA"]
-        fig, axes = plt.subplots(1, 3, figsize=(11, 3.6), sharey=True)
-        for ax, behavior in zip(axes, self.BEHAVIOR_METRICS):
-            r = {x["source"]: x for x in core if x["behavior_metric"] == behavior}
-            y = np.array([float(r[s]["mean_rho"]) for s in source_order])
-            lo = np.array([float(r[s]["ci_low"]) for s in source_order])
-            hi = np.array([float(r[s]["ci_high"]) for s in source_order])
-            ax.errorbar(
-                np.arange(4), y, yerr=np.vstack((y - lo, hi - y)), fmt="o", capsize=3
+
+        source_order = [
+            "F",
+            "P",
+            "S",
+            "CKA",
+        ]
+
+        fig, axes = plt.subplots(
+            1,
+            3,
+            figsize=(11.8, 4.0),
+            sharey=True,
+        )
+
+        for ax, behavior in zip(
+            axes,
+            self.BEHAVIOR_METRICS,
+        ):
+            by_source = {
+                r["source"]: r for r in core if r["behavior_metric"] == behavior
+            }
+
+            y = np.array([float(by_source[s]["mean_rho"]) for s in source_order])
+
+            lo = np.array([float(by_source[s]["ci_low"]) for s in source_order])
+
+            hi = np.array([float(by_source[s]["ci_high"]) for s in source_order])
+
+            xpos = np.arange(len(source_order))
+
+            for i, source in enumerate(source_order):
+                ax.errorbar(
+                    xpos[i],
+                    y[i],
+                    yerr=np.array(
+                        [
+                            [y[i] - lo[i]],
+                            [hi[i] - y[i]],
+                        ]
+                    ),
+                    fmt="o",
+                    markersize=7,
+                    color=SOURCE_COLORS[source],
+                    ecolor=SOURCE_COLORS[source],
+                    markeredgecolor="white",
+                    markeredgewidth=0.8,
+                    elinewidth=1.4,
+                    capsize=4,
+                    capthick=1.2,
+                    zorder=3,
+                )
+
+            ax.set_xticks(
+                xpos,
+                source_order,
             )
-            ax.set_xticks(np.arange(4), source_order)
-            ax.set_title(behavior.replace("_", " "))
-            ax.axhline(0, linewidth=0.8)
+
+            ax.set_title(
+                PRETTY_BEHAVIOR[behavior],
+                pad=8,
+                fontsize=10,
+            )
+
+            # Fixed scale for alignment.
+            ax.set_ylim(-1, 1)
+            ax.set_yticks(np.linspace(-1, 1, 9))
+
+            style_ax(ax)
+
         axes[0].set_ylabel("Mean task-level Spearman ρ")
+
         fig.tight_layout()
+
         path = out / "behavior_alignment.pdf"
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
+
         paths["alignment"] = path
 
+        # ------------------------------------------------------------------
+        # Method geometry
+        # ------------------------------------------------------------------
+
         methods = self.ADAPTATION_METHODS
+
         mats = [
-            ("F", functional["peft_plus_ft"][("model", "balanced_core", "F")].mean(0)),
-            ("P", functional["peft_plus_ft"][("model", "balanced_core", "P")].mean(0)),
-            ("S", functional["peft_plus_ft"][("model", "balanced_core", "S")].mean(0)),
-            ("JSD", prediction["peft_plus_ft"]["jsd"].mean(0)),
-            ("CKA", cka["peft_plus_ft"].mean(0)),
+            (
+                "F",
+                functional["peft_plus_ft"][("model", "balanced_core", "F")].mean(0),
+            ),
+            (
+                "P",
+                functional["peft_plus_ft"][("model", "balanced_core", "P")].mean(0),
+            ),
+            (
+                "S",
+                functional["peft_plus_ft"][("model", "balanced_core", "S")].mean(0),
+            ),
+            (
+                "JSD",
+                prediction["peft_plus_ft"]["jsd"].mean(0),
+            ),
+            (
+                "CKA",
+                cka["peft_plus_ft"].mean(0),
+            ),
         ]
-        fig, axes = plt.subplots(2, 3, figsize=(11, 7))
-        for ax, (title, matrix) in zip(axes.ravel(), mats):
-            im = ax.imshow(matrix)
-            ax.set_title(title)
-            ax.set_xticks(
-                range(len(methods)), methods, rotation=45, ha="right", fontsize=7
+
+        fig, axes = plt.subplots(
+            2,
+            3,
+            figsize=(11.5, 7.6),
+        )
+
+        for ax, (title, matrix) in zip(
+            axes.ravel(),
+            mats,
+        ):
+            # Same heatmap palette used throughout the analysis.
+            im = ax.imshow(
+                matrix,
+                cmap="viridis",
+                interpolation="nearest",
             )
-            ax.set_yticks(range(len(methods)), methods, fontsize=7)
-            fig.colorbar(im, ax=ax, fraction=0.046)
+
+            ax.set_title(
+                title,
+                pad=7,
+            )
+
+            ax.set_xticks(
+                range(len(methods)),
+                [PRETTY_METHOD[m] for m in methods],
+                rotation=40,
+                ha="right",
+                fontsize=7.5,
+            )
+
+            ax.set_yticks(
+                range(len(methods)),
+                [PRETTY_METHOD[m] for m in methods],
+                fontsize=7.5,
+            )
+
+            style_heatmap(ax)
+
+            cbar = fig.colorbar(
+                im,
+                ax=ax,
+                fraction=0.046,
+                pad=0.03,
+            )
+
+            cbar.ax.tick_params(
+                labelsize=7,
+                length=2,
+            )
+
+            cbar.outline.set_visible(False)
+
         for ax in axes.ravel()[len(mats) :]:
             ax.axis("off")
+
         fig.tight_layout()
+
         path = out / "method_geometry.pdf"
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
+
         paths["geometry"] = path
+
         return paths
 
     # ----------------------------- manifests + full analysis -----------------------------
