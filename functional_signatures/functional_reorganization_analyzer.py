@@ -16,8 +16,95 @@ from datasets import datasets
 from models import models
 from utils import seed_worker
 
+# -----------------------------------------------------------------------------
+# Small numerical / I/O helpers
+# -----------------------------------------------------------------------------
+
+
+def _write_csv(path, rows):
+    if not rows:
+        raise ValueError(f"No rows for {path}")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    keys = list(dict.fromkeys(k for row in rows for k in row))
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    k: (
+                        "NA"
+                        if isinstance(v, (float, np.floating)) and not np.isfinite(v)
+                        else v
+                    )
+                    for k, v in row.items()
+                }
+            )
+    return path
+
+
+def _read_csv(path):
+    with open(path, encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def _assert_close(a, b, label, rtol=1e-8, atol=1e-9):
+    if not np.allclose(a, b, rtol=rtol, atol=atol, equal_nan=True):
+        err = float(np.nanmax(np.abs(np.asarray(a) - np.asarray(b))))
+        raise RuntimeError(f"{label} failed; max error={err}")
+
+
+def _safe_ratio(a, b):
+    return np.nan if abs(float(b)) <= np.finfo(float).eps else float(a) / float(b)
+
+
+def _cosine(a, b):
+    d = np.linalg.norm(a) * np.linalg.norm(b)
+    return np.nan if d <= np.finfo(float).eps else float(np.dot(a, b) / d)
+
+
+def _upper(x):
+    return x[np.triu_indices(x.shape[0], 1)]
+
+
+def _spearman(a, b):
+    a, b = np.asarray(a, float).reshape(-1), np.asarray(b, float).reshape(-1)
+    keep = np.isfinite(a) & np.isfinite(b)
+    a, b = a[keep], b[keep]
+    if a.size < 2 or np.std(a) == 0 or np.std(b) == 0:
+        return np.nan
+    return float(np.corrcoef(rankdata(a), rankdata(b))[0, 1])
+
+
+def _row_corr(x, y):
+    x, y = x - x.mean(1, keepdims=True), y - y.mean()
+    d = np.linalg.norm(x, axis=1) * np.linalg.norm(y)
+    return np.divide(x @ y, d, out=np.full(x.shape[0], np.nan), where=d > 1e-12)
+
+
+def _bh(p):
+    p = np.asarray(p, float)
+    out = np.full_like(p, np.nan)
+    idx = np.flatnonzero(np.isfinite(p))
+    if not idx.size:
+        return out
+    order = idx[np.argsort(p[idx])]
+    q = p[order] * len(order) / np.arange(1, len(order) + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    out[order] = np.minimum(q, 1.0)
+    return out
+
+
+def _cleanup_cuda():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 class FunctionalReorganizationAnalyzer:
+    """RQ1 analysis: functional reorganization, behavioral grounding, and CKA baseline."""
+
     NATURAL = (
         "vtab_caltech101",
         "vtab_cifar100",
@@ -81,6 +168,7 @@ class FunctionalReorganizationAnalyzer:
 
     EVAL_EXPERIMENT_NAME = "top_1_acc_eval"
     SIGNATURE_FILENAME = "functional_signatures.npz"
+    LEVELS = ("dataset_method", "dataset", "method", "global")
 
     def __init__(
         self,
@@ -115,9 +203,9 @@ class FunctionalReorganizationAnalyzer:
         }
         self._runs_cache = {}
 
-    def _log(self, msg):
-        if self.verbose:
-            print(msg, flush=True)
+    # ------------------------------------------------------------------
+    # Paths / experiment loading
+    # ------------------------------------------------------------------
 
     def _progress(self, x, desc, total=None):
         return tqdm(
@@ -130,9 +218,12 @@ class FunctionalReorganizationAnalyzer:
         )
 
     def _dir(self, *parts):
-        p = self.save_dir.joinpath(*parts)
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        path = self.save_dir.joinpath(*parts)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _scope_methods(self, scope):
+        return self.METHOD_SCOPES[scope]
 
     def _method_dir(self, task, method):
         return (
@@ -143,106 +234,6 @@ class FunctionalReorganizationAnalyzer:
             / method
         )
 
-    def _scope_methods(self, scope):
-        return self.METHOD_SCOPES[scope]
-
-    @staticmethod
-    def _write_csv(path, rows):
-        if not rows:
-            raise ValueError(f"No rows for {path}")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        keys = []
-        for row in rows:
-            for key in row:
-                if key not in keys:
-                    keys.append(key)
-        with path.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=keys)
-            w.writeheader()
-            for row in rows:
-                w.writerow(
-                    {
-                        k: (
-                            "NA"
-                            if isinstance(v, (float, np.floating))
-                            and not np.isfinite(v)
-                            else v
-                        )
-                        for k, v in row.items()
-                    }
-                )
-        return path
-
-    @staticmethod
-    def _assert_close(a, b, label, rtol=1e-8, atol=1e-9):
-        if not np.allclose(a, b, rtol=rtol, atol=atol, equal_nan=True):
-            err = float(np.nanmax(np.abs(np.asarray(a) - np.asarray(b))))
-            raise RuntimeError(f"{label} failed; max error={err}")
-
-    @staticmethod
-    def _safe_ratio(a, b):
-        return np.nan if abs(float(b)) <= np.finfo(float).eps else float(a) / float(b)
-
-    @staticmethod
-    def _upper(x):
-        return x[np.triu_indices(x.shape[0], 1)]
-
-    @staticmethod
-    def _cosine(a, b):
-        d = np.linalg.norm(a) * np.linalg.norm(b)
-        return np.nan if d <= np.finfo(float).eps else float(np.dot(a, b) / d)
-
-    @staticmethod
-    def _spearman(a, b):
-        a, b = np.asarray(a, float).reshape(-1), np.asarray(b, float).reshape(-1)
-        keep = np.isfinite(a) & np.isfinite(b)
-        a, b = a[keep], b[keep]
-        if a.size < 2 or np.std(a) == 0 or np.std(b) == 0:
-            return np.nan
-        return float(np.corrcoef(rankdata(a), rankdata(b))[0, 1])
-
-    @staticmethod
-    def _row_corr(x, y):
-        x, y = x - x.mean(1, keepdims=True), y - y.mean()
-        d = np.linalg.norm(x, axis=1) * np.linalg.norm(y)
-        return np.divide(x @ y, d, out=np.full(x.shape[0], np.nan), where=d > 1e-12)
-
-    @staticmethod
-    def _bh(p):
-        p = np.asarray(p, float)
-        out = np.full_like(p, np.nan)
-        idx = np.flatnonzero(np.isfinite(p))
-        if not idx.size:
-            return out
-        order = idx[np.argsort(p[idx])]
-        q = p[order] * len(order) / np.arange(1, len(order) + 1)
-        q = np.minimum.accumulate(q[::-1])[::-1]
-        out[order] = np.minimum(q, 1.0)
-        return out
-
-    def _rsa(self, source, target):
-        x, y = self._upper(np.asarray(source, float)), self._upper(
-            np.asarray(target, float)
-        )
-        observed = self._spearman(x, y)
-        if not np.isfinite(observed):
-            return np.nan, np.nan, np.empty(0)
-        n = source.shape[0]
-        perms = self._perms[n]
-        iu, ju = np.triu_indices(n, 1)
-        xp = source[perms[:, iu], perms[:, ju]]
-        if np.all(np.isfinite(xp)) and np.all(np.isfinite(y)):
-            null = self._row_corr(rankdata(xp, axis=1), rankdata(y))
-        else:
-            null = np.asarray([self._spearman(row, y) for row in xp])
-        null = null[np.isfinite(null)]
-        p = (
-            np.nan
-            if not null.size
-            else float(np.mean(np.abs(null) >= abs(observed) - 1e-15))
-        )
-        return observed, p, null
-
     def _get_runs(self, task, method):
         key = (task, method)
         if key in self._runs_cache:
@@ -250,6 +241,7 @@ class FunctionalReorganizationAnalyzer:
         root = self._method_dir(task, method)
         if not root.is_dir():
             raise FileNotFoundError(root)
+
         runs = []
         for path in root.iterdir():
             cfg, model, acc = (
@@ -266,7 +258,8 @@ class FunctionalReorganizationAnalyzer:
             runs.append(
                 {"seed": int(config["run_seed"]), "path": path, "config": config}
             )
-        runs.sort(key=lambda z: z["seed"])
+
+        runs.sort(key=lambda r: r["seed"])
         seeds = tuple(r["seed"] for r in runs)
         if seeds != self.SEEDS:
             raise RuntimeError(
@@ -275,21 +268,21 @@ class FunctionalReorganizationAnalyzer:
         self._runs_cache[key] = runs
         return runs
 
-    def _signature_path(self, task, method, run):
-        return run["path"] / self.SIGNATURE_FILENAME
-
-    # ----------------------------- functional signatures -----------------------------
+    # ------------------------------------------------------------------
+    # Functional signatures
+    # ------------------------------------------------------------------
 
     def _load_component(self, scope, component):
         methods = self._scope_methods(scope)
-        task_values = {k: [] for k in self.SOURCE_SIGNATURES}
+        tasks = {sig: [] for sig in self.SOURCE_SIGNATURES}
         native_shape = None
+
         for task in self._progress(self.DATASETS, f"Signatures {scope}/{component}"):
-            by_method = {k: {} for k in self.SOURCE_SIGNATURES}
+            by_method = {sig: {} for sig in self.SOURCE_SIGNATURES}
             for method in (self.REFERENCE_METHOD, *methods):
-                per_seed = {k: [] for k in self.SOURCE_SIGNATURES}
+                per_seed = {sig: [] for sig in self.SOURCE_SIGNATURES}
                 for run in self._get_runs(task, method):
-                    path = self._signature_path(task, method, run)
+                    path = run["path"] / self.SIGNATURE_FILENAME
                     with np.load(path, allow_pickle=False) as data:
                         for sig in self.SOURCE_SIGNATURES:
                             key = f"{sig}__{component}"
@@ -298,10 +291,9 @@ class FunctionalReorganizationAnalyzer:
                             value = np.asarray(data[key], np.float64)
                             if np.any(value < -self.eps):
                                 raise ValueError(f"Negative values in {key!r}: {path}")
-                            native_shape = (
-                                value.shape if native_shape is None else native_shape
-                            )
-                            if value.shape != native_shape:
+                            if native_shape is None:
+                                native_shape = value.shape
+                            elif value.shape != native_shape:
                                 raise ValueError(
                                     f"Shape mismatch for {component}: expected {native_shape}, "
                                     f"got {value.shape} in {path}"
@@ -311,42 +303,37 @@ class FunctionalReorganizationAnalyzer:
                             )
                 for sig in self.SOURCE_SIGNATURES:
                     by_method[sig][method] = np.stack(per_seed[sig])
+
             for sig in self.SOURCE_SIGNATURES:
-                lp = by_method[sig][self.REFERENCE_METHOD].mean(axis=0)
-                task_values[sig].append(
-                    np.stack([by_method[sig][m] - lp for m in methods])
-                )
-        out = {
-            k: np.stack(v) for k, v in task_values.items()
-        }  # [task, method, seed, coord]
+                lp = by_method[sig][self.REFERENCE_METHOD].mean(0)
+                tasks[sig].append(np.stack([by_method[sig][m] - lp for m in methods]))
+
+        out = {sig: np.stack(values) for sig, values in tasks.items()}
         out["S_m"] = out["F_m"] - out["P"]
         out["S_e"] = out["F_e"] - out["P"]
-        self._assert_close(
-            out["F_m"], out["P"] + out["S_m"], (component, "model F=P+S")
-        )
-        self._assert_close(
-            out["F_e"], out["P"] + out["S_e"], (component, "observed F=P+S")
-        )
+        _assert_close(out["F_m"], out["P"] + out["S_m"], (component, "model F=P+S"))
+        _assert_close(out["F_e"], out["P"] + out["S_e"], (component, "observed F=P+S"))
         return out, native_shape
 
     @staticmethod
-    def _normalized_component(x):
+    def _normalize_component(x):
         return x / np.sqrt(x.shape[-1])
 
     @staticmethod
-    def _balanced_core(component_arrays):
-        c = len(component_arrays)
-        return np.concatenate(
-            [x / np.sqrt(c * x.shape[-1]) for x in component_arrays], axis=-1
-        )
+    def _balanced_core(arrays):
+        c = len(arrays)
+        return np.concatenate([x / np.sqrt(c * x.shape[-1]) for x in arrays], axis=-1)
+
+    # ------------------------------------------------------------------
+    # Four-level decomposition
+    # ------------------------------------------------------------------
 
     def _effects(self, x, group_labels=None):
-        # x: [task, method, seed, coordinate], already component-normalized
-        cell = x.mean(axis=2)
-        grand = cell.mean(axis=(0, 1))
+        cell = x.mean(2)
+        grand = cell.mean((0, 1))
         y = cell - grand
-        task = y.mean(axis=1)
-        method = y.mean(axis=0)
+        task = y.mean(1)
+        method = y.mean(0)
         interaction = y - task[:, None] - method[None]
         labels = np.asarray(
             group_labels
@@ -356,7 +343,7 @@ class FunctionalReorganizationAnalyzer:
         group = np.empty_like(task)
         for g in np.unique(labels):
             idx = np.flatnonzero(labels == g)
-            group[idx] = task[idx].mean(axis=0)
+            group[idx] = task[idx].mean(0)
         dataset = task - group
         seed = x - cell[:, :, None]
         centered = x - grand
@@ -369,7 +356,7 @@ class FunctionalReorganizationAnalyzer:
             "seed": np.sum(seed**2),
         }
         total = np.sum(centered**2)
-        self._assert_close(total, sum(ss.values()), "SS decomposition")
+        _assert_close(total, sum(ss.values()), "SS decomposition")
         return {
             "grand": grand,
             "cell": cell,
@@ -391,8 +378,8 @@ class FunctionalReorganizationAnalyzer:
             return {f"r_{k}_ci_low": np.nan for k in keys} | {
                 f"r_{k}_ci_high": np.nan for k in keys
             }
+
         rng = np.random.default_rng(self.random_seed)
-        labels0 = np.asarray([self._task_group[t] for t in self.DATASETS])
         vals = {k: [] for k in keys}
         for _ in range(self.n_bootstrap):
             idx, labels = [], []
@@ -406,7 +393,8 @@ class FunctionalReorganizationAnalyzer:
             xb = xb[np.arange(T)[:, None, None], np.arange(M)[None, :, None], seed_idx]
             e = self._effects(xb, labels)
             for k in keys:
-                vals[k].append(self._safe_ratio(e["ss"][k], e["total"]))
+                vals[k].append(_safe_ratio(e["ss"][k], e["total"]))
+
         out = {}
         for k in keys:
             out[f"r_{k}_ci_low"], out[f"r_{k}_ci_high"] = np.nanquantile(
@@ -422,9 +410,7 @@ class FunctionalReorganizationAnalyzer:
     def _ps_row(meta, effect, f, p, s, weight=1.0):
         ss_f, ss_p, ss_s = (weight * np.sum(x**2) for x in (f, p, s))
         cross = 2 * weight * np.sum(p * s)
-        FunctionalReorganizationAnalyzer._assert_close(
-            ss_f, ss_p + ss_s + cross, (*meta.values(), effect, "PS")
-        )
+        _assert_close(ss_f, ss_p + ss_s + cross, (*meta.values(), effect, "PS"))
         return {
             **meta,
             "effect": effect,
@@ -432,22 +418,20 @@ class FunctionalReorganizationAnalyzer:
             "ss_p": float(ss_p),
             "ss_s": float(ss_s),
             "cross_ps": float(cross),
-            "p_over_f": FunctionalReorganizationAnalyzer._safe_ratio(ss_p, ss_f),
-            "s_over_f": FunctionalReorganizationAnalyzer._safe_ratio(ss_s, ss_f),
-            "cross_over_f": FunctionalReorganizationAnalyzer._safe_ratio(cross, ss_f),
-            "cos_ps": FunctionalReorganizationAnalyzer._cosine(
-                p.reshape(-1), s.reshape(-1)
-            ),
+            "p_over_f": _safe_ratio(ss_p, ss_f),
+            "s_over_f": _safe_ratio(ss_s, ss_f),
+            "cross_over_f": _safe_ratio(cross, ss_f),
+            "cos_ps": _cosine(p.reshape(-1), s.reshape(-1)),
         }
 
     def _method_task_parts(self, e, mi):
         h = e["task"] + e["interaction"][:, mi]
         group = np.empty_like(h)
         for idx in self._group_indices.values():
-            group[idx] = h[idx].mean(axis=0)
+            group[idx] = h[idx].mean(0)
         return group, h - group
 
-    def _decomposition(self, scope, channel, signature, component, x, e):
+    def _decomposition_rows(self, scope, channel, signature, component, x, e):
         methods = self._scope_methods(scope)
         T, M, S = x.shape[:3]
         base = {
@@ -456,7 +440,7 @@ class FunctionalReorganizationAnalyzer:
             "signature": signature,
             "component": component,
         }
-        out = {"dataset_method": [], "dataset": [], "method": [], "global": []}
+        out = {level: [] for level in self.LEVELS}
 
         for ti, task in enumerate(self.DATASETS):
             task_ss = M * S * np.sum(e["task"][ti] ** 2)
@@ -464,7 +448,7 @@ class FunctionalReorganizationAnalyzer:
             method_ss = S * np.sum(conditioned**2)
             seed_ss = np.sum(e["seed"][ti] ** 2)
             total = np.sum(e["centered"][ti] ** 2)
-            self._assert_close(total, task_ss + method_ss + seed_ss, (task, signature))
+            _assert_close(total, task_ss + method_ss + seed_ss, (task, signature))
             out["dataset"].append(
                 {
                     **base,
@@ -474,11 +458,12 @@ class FunctionalReorganizationAnalyzer:
                     "ss_method_conditioned": float(method_ss),
                     "ss_seed": float(seed_ss),
                     "ss_total": float(total),
-                    "r_task_shared": self._safe_ratio(task_ss, total),
-                    "r_method_conditioned": self._safe_ratio(method_ss, total),
-                    "r_seed": self._safe_ratio(seed_ss, total),
+                    "r_task_shared": _safe_ratio(task_ss, total),
+                    "r_method_conditioned": _safe_ratio(method_ss, total),
+                    "r_seed": _safe_ratio(seed_ss, total),
                 }
             )
+
             for mi, method in enumerate(methods):
                 y = e["y"][ti, mi]
                 stable = S * np.sum(y**2)
@@ -488,11 +473,11 @@ class FunctionalReorganizationAnalyzer:
                     "method": e["method"][mi],
                     "interaction": e["interaction"][ti, mi],
                 }
-                c = {k: float(S * np.dot(y, v)) for k, v in parts.items()}
-                self._assert_close(stable, sum(c.values()), (task, method, signature))
+                contrib = {k: float(S * np.dot(y, v)) for k, v in parts.items()}
+                _assert_close(stable, sum(contrib.values()), (task, method, signature))
                 seed = float(np.sum(e["seed"][ti, mi] ** 2))
                 total_cell = stable + seed
-                gross = sum(abs(v) for v in c.values())
+                gross = sum(abs(v) for v in contrib.values())
                 row = {
                     **base,
                     "task": task,
@@ -501,13 +486,13 @@ class FunctionalReorganizationAnalyzer:
                     "ss_stable": float(stable),
                     "ss_seed": seed,
                     "ss_total": float(total_cell),
-                    "r_stable": self._safe_ratio(stable, total_cell),
-                    "r_seed": self._safe_ratio(seed, total_cell),
+                    "r_stable": _safe_ratio(stable, total_cell),
+                    "r_seed": _safe_ratio(seed, total_cell),
                 }
-                for k, v in c.items():
+                for k, v in contrib.items():
                     row[f"c_{k}"] = v
-                    row[f"r_{k}_signed"] = self._safe_ratio(v, stable)
-                    row[f"r_{k}_gross"] = self._safe_ratio(abs(v), gross)
+                    row[f"r_{k}_signed"] = _safe_ratio(v, stable)
+                    row[f"r_{k}_gross"] = _safe_ratio(abs(v), gross)
                 out["dataset_method"].append(row)
 
         for mi, method in enumerate(methods):
@@ -517,7 +502,7 @@ class FunctionalReorganizationAnalyzer:
             ss_dataset = S * np.sum(dataset**2)
             ss_seed = np.sum(e["seed"][:, mi] ** 2)
             total = np.sum(e["centered"][:, mi] ** 2)
-            self._assert_close(
+            _assert_close(
                 total, ss_method + ss_group + ss_dataset + ss_seed, (method, signature)
             )
             out["method"].append(
@@ -530,13 +515,11 @@ class FunctionalReorganizationAnalyzer:
                     "ss_task_conditioned": float(ss_group + ss_dataset),
                     "ss_seed": float(ss_seed),
                     "ss_total": float(total),
-                    "r_method_general": self._safe_ratio(ss_method, total),
-                    "r_task_group": self._safe_ratio(ss_group, total),
-                    "r_dataset_specific": self._safe_ratio(ss_dataset, total),
-                    "r_task_conditioned": self._safe_ratio(
-                        ss_group + ss_dataset, total
-                    ),
-                    "r_seed": self._safe_ratio(ss_seed, total),
+                    "r_method_general": _safe_ratio(ss_method, total),
+                    "r_task_group": _safe_ratio(ss_group, total),
+                    "r_dataset_specific": _safe_ratio(ss_dataset, total),
+                    "r_task_conditioned": _safe_ratio(ss_group + ss_dataset, total),
+                    "r_seed": _safe_ratio(ss_seed, total),
                 }
             )
 
@@ -546,19 +529,19 @@ class FunctionalReorganizationAnalyzer:
             **{f"ss_{k}": float(v) for k, v in ss.items()},
             "ss_task": float(ss["group"] + ss["dataset"]),
             "ss_total": float(e["total"]),
-            **{f"r_{k}": self._safe_ratio(v, e["total"]) for k, v in ss.items()},
-            "r_task": self._safe_ratio(ss["group"] + ss["dataset"], e["total"]),
+            **{f"r_{k}": _safe_ratio(v, e["total"]) for k, v in ss.items()},
+            "r_task": _safe_ratio(ss["group"] + ss["dataset"], e["total"]),
         }
         if component == "balanced_core":
             row |= self._bootstrap_decomposition(x)
         out["global"].append(row)
         return out
 
-    def _ps_levels(self, scope, channel, component, ef, ep, es):
+    def _ps_rows(self, scope, channel, component, ef, ep, es):
         methods = self._scope_methods(scope)
         T, M, S = ef["centered"].shape[:3]
         base = {"scope": scope, "channel": channel, "component": component}
-        out = {"dataset_method": [], "dataset": [], "method": [], "global": []}
+        out = {level: [] for level in self.LEVELS}
 
         for ti, task in enumerate(self.DATASETS):
             meta = {**base, "task": task, "task_group": self._task_group[task]}
@@ -567,8 +550,11 @@ class FunctionalReorganizationAnalyzer:
                 ("seed", "seed", 1),
                 ("total", "centered", 1),
             ):
-                f, p, s = ef[key][ti], ep[key][ti], es[key][ti]
-                out["dataset"].append(self._ps_row(meta, effect, f, p, s, weight))
+                out["dataset"].append(
+                    self._ps_row(
+                        meta, effect, ef[key][ti], ep[key][ti], es[key][ti], weight
+                    )
+                )
             out["dataset"].append(
                 self._ps_row(
                     meta,
@@ -586,10 +572,15 @@ class FunctionalReorganizationAnalyzer:
                     ("seed", "seed"),
                     ("total", "centered"),
                 ):
-                    f, p, s = ef[key][ti, mi], ep[key][ti, mi], es[key][ti, mi]
-                    weight = S if effect == "stable" else 1
                     out["dataset_method"].append(
-                        self._ps_row(cell_meta, effect, f, p, s, weight)
+                        self._ps_row(
+                            cell_meta,
+                            effect,
+                            ef[key][ti, mi],
+                            ep[key][ti, mi],
+                            es[key][ti, mi],
+                            S if effect == "stable" else 1,
+                        )
                     )
 
         for mi, method in enumerate(methods):
@@ -597,7 +588,7 @@ class FunctionalReorganizationAnalyzer:
             gf, df = self._method_task_parts(ef, mi)
             gp, dp = self._method_task_parts(ep, mi)
             gs, ds = self._method_task_parts(es, mi)
-            for effect, f, p, s, weight in (
+            rows = (
                 (
                     "method_general",
                     ef["method"][mi],
@@ -616,10 +607,10 @@ class FunctionalReorganizationAnalyzer:
                     es["centered"][:, mi],
                     1,
                 ),
-            ):
-                out["method"].append(self._ps_row(meta, effect, f, p, s, weight))
+            )
+            out["method"].extend(self._ps_row(meta, *row) for row in rows)
 
-        for effect, f, p, s, weight in (
+        rows = (
             ("group", ef["group"], ep["group"], es["group"], M * S),
             ("dataset", ef["dataset"], ep["dataset"], es["dataset"], M * S),
             ("task", ef["task"], ep["task"], es["task"], M * S),
@@ -627,13 +618,17 @@ class FunctionalReorganizationAnalyzer:
             ("interaction", ef["interaction"], ep["interaction"], es["interaction"], S),
             ("seed", ef["seed"], ep["seed"], es["seed"], 1),
             ("total", ef["centered"], ep["centered"], es["centered"], 1),
-        ):
-            out["global"].append(self._ps_row(base, effect, f, p, s, weight))
+        )
+        out["global"].extend(self._ps_row(base, *row) for row in rows)
         return out
+
+    # ------------------------------------------------------------------
+    # Functional pairwise geometry
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _within_seed(x):
-        centroid = x.mean(axis=0)
+        centroid = x.mean(0)
         variance = float(np.mean(np.sum((x - centroid) ** 2, axis=-1)))
         pairs = list(itertools.combinations(range(len(x)), 2))
         pair_sq = [np.sum((x[i] - x[j]) ** 2) for i, j in pairs]
@@ -644,23 +639,20 @@ class FunctionalReorganizationAnalyzer:
         )
 
     def _functional_distances(self, scope, channel, component, f, p, s):
-        methods, T, M = (
-            self._scope_methods(scope),
-            len(self.DATASETS),
-            len(self._scope_methods(scope)),
-        )
-        matrices = {k: np.zeros((T, M, M), float) for k in ("F", "P", "S")}
-        pair_rows, seed_rows = [], []
-        within = {}
+        methods = self._scope_methods(scope)
+        T, M = len(self.DATASETS), len(methods)
+        matrices = {name: np.zeros((T, M, M), float) for name in ("F", "P", "S")}
+        pair_rows, seed_rows, within = [], [], {}
+
         for ti, task in enumerate(self.DATASETS):
             for mi, method in enumerate(methods):
-                vals = {}
+                values = {}
                 for name, x in (("F", f), ("P", p), ("S", s)):
                     var, rms, pairs = self._within_seed(x[ti, mi])
-                    vals[f"within_variance_{name.lower()}"] = var
-                    vals[f"within_pair_rms_{name.lower()}"] = rms
+                    values[f"within_variance_{name.lower()}"] = var
+                    values[f"within_pair_rms_{name.lower()}"] = rms
                     for pi, value in enumerate(pairs):
-                        vals[f"pair_{pi}_{name.lower()}"] = value
+                        values[f"pair_{pi}_{name.lower()}"] = value
                     within[(ti, mi, name)] = (var, rms)
                 seed_rows.append(
                     {
@@ -670,9 +662,10 @@ class FunctionalReorganizationAnalyzer:
                         "method": method,
                         "channel": channel,
                         "component": component,
-                        **vals,
+                        **values,
                     }
                 )
+
             for i, j in itertools.combinations(range(M), 2):
                 row = {
                     "scope": scope,
@@ -682,7 +675,7 @@ class FunctionalReorganizationAnalyzer:
                     "method_b": methods[j],
                     "channel": channel,
                     "component": component,
-                    "n_seed_pairs": 9,
+                    "n_seed_pairs": len(self.SEEDS) ** 2,
                 }
                 diffs = {}
                 for name, x in (("F", f), ("P", p), ("S", s)):
@@ -694,7 +687,7 @@ class FunctionalReorganizationAnalyzer:
                     )
                     va, wa = within[(ti, i, name)]
                     vb, wb = within[(ti, j, name)]
-                    self._assert_close(
+                    _assert_close(
                         dist**2,
                         centroid**2 + va + vb,
                         (task, methods[i], methods[j], name, "seed identity"),
@@ -711,9 +704,10 @@ class FunctionalReorganizationAnalyzer:
                     }
                     matrices[name][ti, i, j] = matrices[name][ti, j, i] = dist
                     diffs[name] = d
+
                 dot = float(np.mean(np.sum(diffs["P"] * diffs["S"], axis=-1)))
                 cross = 2 * dot
-                self._assert_close(
+                _assert_close(
                     row["d2_f"],
                     row["d2_p"] + row["d2_s"] + cross,
                     (task, methods[i], methods[j], "pair PS"),
@@ -725,12 +719,11 @@ class FunctionalReorganizationAnalyzer:
                     else dot / (row["d_p"] * row["d_s"])
                 )
                 pair_rows.append(row)
+
         return matrices, pair_rows, seed_rows
 
     def analyze_signatures(self):
-        profiles_dir = self._dir("profiles")
-        decomp_dir = self._dir("decomposition")
-        dist_dir = self._dir("distances")
+        pairwise_dir = self._dir("pairwise")
         metadata, core_raw, core_norm = {}, {}, {}
 
         for component in self.CORE_COMPONENTS:
@@ -743,7 +736,7 @@ class FunctionalReorganizationAnalyzer:
             }
             core_raw[component] = raw
             core_norm[component] = {
-                k: self._normalized_component(v) for k, v in raw.items()
+                k: self._normalize_component(v) for k, v in raw.items()
             }
 
         balanced = {
@@ -761,44 +754,11 @@ class FunctionalReorganizationAnalyzer:
             ),
         }
 
-        payload = {
-            "datasets": np.array(self.DATASETS),
-            "methods": np.array(self.ADAPTATION_METHODS),
-            "seeds": np.array(self.SEEDS),
-        }
-        for component in self.CORE_COMPONENTS:
-            for sig, x in core_raw[component].items():
-                payload[f"{sig}__{component}"] = x.astype(np.float32)
-        for sig, x in balanced.items():
-            payload[f"{sig}__balanced_core"] = x.astype(np.float32)
-        profile_path = profiles_dir / "delta_profiles_peft_plus_ft.npz"
-        np.savez_compressed(profile_path, **payload)
-
         peft_idx = [self.ADAPTATION_METHODS.index(m) for m in self.PEFT_METHODS]
-        peft_core_path = profiles_dir / "delta_profiles_peft_only_core.npz"
-        np.savez_compressed(
-            peft_core_path,
-            datasets=np.array(self.DATASETS),
-            methods=np.array(self.PEFT_METHODS),
-            seeds=np.array(self.SEEDS),
-            **{
-                f"{sig}__{component}": core_raw[component][sig][:, peft_idx].astype(
-                    np.float32
-                )
-                for component in self.CORE_COMPONENTS
-                for sig in self.SOURCE_SIGNATURES
-            },
-            **{
-                f"{sig}__balanced_core": balanced[sig][:, peft_idx].astype(np.float32)
-                for sig in self.SOURCE_SIGNATURES
-            },
-        )
-
         functional = {scope: {} for scope in self.METHOD_SCOPES}
         pair_rows, seed_rows = [], []
-        decomp = {k: [] for k in ("dataset_method", "dataset", "method", "global")}
-        ps = {k: [] for k in decomp}
-        effects_payload = {"model": {}, "observed": {}}
+        decomp = {level: [] for level in self.LEVELS}
+        ps = {level: [] for level in self.LEVELS}
 
         def process(scope, component, data):
             channels = {
@@ -814,28 +774,22 @@ class FunctionalReorganizationAnalyzer:
                 for source, matrix in matrices.items():
                     functional[scope][(channel, component, source)] = matrix
 
-                self._assert_close(f, p + s, (scope, channel, component, "profile PS"))
-                ef, ep, es = self._effects(f), self._effects(p), self._effects(s)
-                for source, x, e in (("F", f, ef), ("P", p, ep), ("S", s, es)):
-                    rows = self._decomposition(scope, channel, source, component, x, e)
-                    for level in decomp:
+                _assert_close(f, p + s, (scope, channel, component, "profile PS"))
+                effects = {
+                    "F": self._effects(f),
+                    "P": self._effects(p),
+                    "S": self._effects(s),
+                }
+                for source, x in (("F", f), ("P", p), ("S", s)):
+                    rows = self._decomposition_rows(
+                        scope, channel, source, component, x, effects[source]
+                    )
+                    for level in self.LEVELS:
                         decomp[level].extend(rows[level])
-                    if scope == "peft_plus_ft":
-                        prefix = f"{component}__{source}"
-                        for name in (
-                            "grand",
-                            "task",
-                            "group",
-                            "dataset",
-                            "method",
-                            "interaction",
-                            "seed",
-                        ):
-                            effects_payload[channel][f"{prefix}__{name}"] = e[
-                                name
-                            ].astype(np.float32)
-                rows = self._ps_levels(scope, channel, component, ef, ep, es)
-                for level in ps:
+                rows = self._ps_rows(
+                    scope, channel, component, effects["F"], effects["P"], effects["S"]
+                )
+                for level in self.LEVELS:
                     ps[level].extend(rows[level])
 
         for component in (*self.CORE_COMPONENTS, "balanced_core"):
@@ -859,82 +813,46 @@ class FunctionalReorganizationAnalyzer:
             process(
                 "peft_only",
                 component,
-                {k: self._normalized_component(v) for k, v in raw.items()},
-            )
-            np.savez_compressed(
-                self._dir("profiles", "peft_only") / f"{component}.npz",
-                datasets=np.array(self.DATASETS),
-                methods=np.array(self.PEFT_METHODS),
-                seeds=np.array(self.SEEDS),
-                **{k: raw[k].astype(np.float32) for k in self.SOURCE_SIGNATURES},
+                {k: self._normalize_component(v) for k, v in raw.items()},
             )
             del raw
             gc.collect()
 
-        metadata_path = profiles_dir / "component_metadata.json"
-        metadata_path.write_text(json.dumps(metadata, indent=2))
-
-        matrix_paths = {}
-        for scope, bundles in functional.items():
-            path = dist_dir / f"functional_matrices_{scope}.npz"
-            np.savez_compressed(
-                path,
-                datasets=np.array(self.DATASETS),
-                methods=np.array(self._scope_methods(scope)),
-                **{f"{ch}__{comp}__{src}": x for (ch, comp, src), x in bundles.items()},
-            )
-            matrix_paths[scope] = path
-
-        effects_paths = {}
-        effects_dir = self._dir("decomposition", "effects")
-        for channel, payload in effects_payload.items():
-            path = effects_dir / f"{channel}.npz"
-            np.savez_compressed(
-                path,
-                datasets=np.array(self.DATASETS),
-                methods=np.array(self.ADAPTATION_METHODS),
-                **payload,
-            )
-            effects_paths[channel] = path
-
-        decomposition_paths = {}
-        ps_paths = {}
-        for level in decomp:
+        decomposition_paths, ps_paths = {}, {}
+        for level in self.LEVELS:
             out = self._dir("decomposition", level)
-            decomposition_paths[level] = self._write_csv(
+            decomposition_paths[level] = _write_csv(
                 out / "decomposition.csv", decomp[level]
             )
-            ps_paths[level] = self._write_csv(out / "fisher_ps.csv", ps[level])
+            ps_paths[level] = _write_csv(out / "fisher_ps.csv", ps[level])
 
         return functional, {
-            "profiles_peft_plus_ft": profile_path,
-            "profiles_peft_only_core": peft_core_path,
-            "profiles_peft_only_components": profiles_dir / "peft_only",
-            "metadata": metadata_path,
             "decomposition": decomposition_paths,
             "fisher_ps": ps_paths,
-            "functional_pairwise": self._write_csv(
-                dist_dir / "functional_pairwise.csv", pair_rows
+            "functional_pairwise": _write_csv(
+                pairwise_dir / "functional_pairwise.csv", pair_rows
             ),
-            "functional_seed_variability": self._write_csv(
-                dist_dir / "functional_seed_variability.csv", seed_rows
+            "functional_seed_variability": _write_csv(
+                pairwise_dir / "functional_seed_variability.csv", seed_rows
             ),
-            "effects": effects_paths,
-            "matrices": matrix_paths,
+            "metadata": metadata,
         }
 
-    # ----------------------------- prediction behavior -----------------------------
+    # ------------------------------------------------------------------
+    # Prediction behavior + unchanged prediction cache path
+    # ------------------------------------------------------------------
 
     def _prediction_cache_path(self, task, method, seed):
-        p = self.save_dir / "prediction_cache" / task / method / f"seed-{seed}.npz"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        return p
+        path = self.save_dir / "prediction_cache" / task / method / f"seed-{seed}.npz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
 
     def _get_seed_logits(self, task, method, run):
         cache = self._prediction_cache_path(task, method, run["seed"])
         if cache.is_file():
             with np.load(cache, allow_pickle=False) as data:
                 return data["logits"], data["labels"]
+
         cfg = run["config"]
         dataset = datasets[task](split="test")
         loader = dataset.get_dataloader(
@@ -948,6 +866,7 @@ class FunctionalReorganizationAnalyzer:
         )
         model.load_from_path(str(run["path"] / "model.pt"), map_location="cpu")
         model.to(self.device).eval()
+
         logits, labels = [], []
         with torch.inference_mode():
             for x, y in self._progress(
@@ -955,15 +874,11 @@ class FunctionalReorganizationAnalyzer:
             ):
                 logits.append(model(x.to(self.device)).cpu())
                 labels.append(y.cpu())
-        logits, labels = (
-            torch.cat(logits).numpy().astype(np.float32),
-            torch.cat(labels).numpy(),
-        )
+        logits = torch.cat(logits).numpy().astype(np.float32)
+        labels = torch.cat(labels).numpy()
         np.savez(cache, logits=logits, labels=labels)
         del model, dataset, loader
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _cleanup_cuda()
         return logits, labels
 
     def _method_predictions(self, task, method):
@@ -975,9 +890,9 @@ class FunctionalReorganizationAnalyzer:
             elif not np.array_equal(labels, y):
                 raise RuntimeError(f"Test ordering mismatch for {task}/{method}")
             z = logits.astype(np.float64)
-            z -= z.max(axis=1, keepdims=True)
+            z -= z.max(1, keepdims=True)
             p = np.exp(z)
-            probs.append(p / p.sum(axis=1, keepdims=True))
+            probs.append(p / p.sum(1, keepdims=True))
         probs = np.stack(probs)
         top1 = probs.argmax(-1)
         correct = top1 == labels[None]
@@ -1031,12 +946,15 @@ class FunctionalReorganizationAnalyzer:
         }
 
     def analyze_predictions(self):
-        out = self._dir("distances")
+        pairwise_dir = self._dir("pairwise")
         matrices = {
-            scope: {m: [] for m in self.PREDICTION_METRICS}
+            scope: {metric: [] for metric in self.PREDICTION_METRICS}
             for scope in self.METHOD_SCOPES
         }
         pair_rows, seed_rows = [], []
+        within_pairs = list(itertools.combinations(range(len(self.SEEDS)), 2))
+        cross_pairs = list(itertools.product(range(len(self.SEEDS)), repeat=2))
+
         for task in self._progress(self.DATASETS, "Prediction behavior"):
             pred = {m: self._method_predictions(task, m) for m in self.METHODS}
             labels = pred[self.METHODS[0]]["labels"]
@@ -1044,7 +962,7 @@ class FunctionalReorganizationAnalyzer:
                 not np.array_equal(labels, pred[m]["labels"]) for m in self.METHODS[1:]
             ):
                 raise RuntimeError(f"Test ordering mismatch across methods for {task}")
-            within_pairs = list(itertools.combinations(range(3), 2))
+
             for method in self.METHODS:
                 v = self._behavior(pred[method], pred[method], within_pairs)
                 seed_rows.append(
@@ -1057,20 +975,17 @@ class FunctionalReorganizationAnalyzer:
                         "within_top1_disagreement": v["top1_disagreement"],
                         "within_error_consistency": v["error_consistency"],
                         "within_error_dissimilarity": v["error_dissimilarity"],
-                        "n_seed_pairs": 3,
+                        "n_seed_pairs": len(within_pairs),
                     }
                 )
+
             for scope, methods in self.METHOD_SCOPES.items():
                 mats = {
-                    m: np.zeros((len(methods), len(methods)))
-                    for m in self.PREDICTION_METRICS
+                    metric: np.zeros((len(methods), len(methods)))
+                    for metric in self.PREDICTION_METRICS
                 }
                 for i, j in itertools.combinations(range(len(methods)), 2):
-                    v = self._behavior(
-                        pred[methods[i]],
-                        pred[methods[j]],
-                        itertools.product(range(3), repeat=2),
-                    )
+                    v = self._behavior(pred[methods[i]], pred[methods[j]], cross_pairs)
                     pair_rows.append(
                         {
                             "scope": scope,
@@ -1087,31 +1002,26 @@ class FunctionalReorganizationAnalyzer:
                     matrices[scope][metric].append(mats[metric])
             del pred
             gc.collect()
-        paths = {}
-        for scope in self.METHOD_SCOPES:
-            matrices[scope] = {k: np.stack(v) for k, v in matrices[scope].items()}
-            path = out / f"prediction_matrices_{scope}.npz"
-            np.savez_compressed(
-                path,
-                datasets=np.array(self.DATASETS),
-                methods=np.array(self._scope_methods(scope)),
-                **matrices[scope],
-            )
-            paths[scope] = path
+
+        matrices = {
+            scope: {metric: np.stack(values) for metric, values in bundle.items()}
+            for scope, bundle in matrices.items()
+        }
         return matrices, {
-            "pairwise": self._write_csv(out / "prediction_pairwise.csv", pair_rows),
-            "seed_variability": self._write_csv(
-                out / "prediction_seed_variability.csv", seed_rows
+            "pairwise": _write_csv(pairwise_dir / "prediction_pairwise.csv", pair_rows),
+            "seed_variability": _write_csv(
+                pairwise_dir / "prediction_seed_variability.csv", seed_rows
             ),
-            "matrices": paths,
         }
 
-    # ----------------------------- CKA baseline -----------------------------
+    # ------------------------------------------------------------------
+    # CKA baseline + unchanged CKA cache path
+    # ------------------------------------------------------------------
 
     def _cka_cache_path(self, task):
-        p = self.save_dir / "cka_cache" / f"{task}.npz"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        return p
+        path = self.save_dir / "cka_cache" / f"{task}.npz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
 
     def _get_task_cka(self, task):
         cache = self._cka_cache_path(task)
@@ -1122,6 +1032,7 @@ class FunctionalReorganizationAnalyzer:
                 distances = data["layerwise_distance"]
             if methods == self.ADAPTATION_METHODS and seeds == self.SEEDS:
                 return distances
+
         runs = {m: self._get_runs(task, m) for m in self.ADAPTATION_METHODS}
         dataset = datasets[task](split="train+val")
         features, labels_ref = [], None
@@ -1139,6 +1050,7 @@ class FunctionalReorganizationAnalyzer:
                 )
                 model.load_from_path(str(run["path"] / "model.pt"), map_location="cpu")
                 model.to(self.device).eval()
+
                 cls_batches, labels = [], []
                 with torch.inference_mode():
                     for x, y in self._progress(
@@ -1158,9 +1070,8 @@ class FunctionalReorganizationAnalyzer:
                     raise RuntimeError(f"Train+val ordering mismatch for CKA on {task}")
                 features.append(cls)
                 del model, loader, cls_batches
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                _cleanup_cuda()
+
         shape = features[0].shape
         if any(f.shape != shape for f in features[1:]):
             raise RuntimeError(f"Layerwise feature shape mismatch for {task}")
@@ -1180,6 +1091,7 @@ class FunctionalReorganizationAnalyzer:
                 kernels.append((k / norm).reshape(-1))
             kernels = torch.stack(kernels)
             sim[:, :, layer] = (kernels @ kernels.T).clamp(0, 1).cpu().numpy()
+
         n_m, n_s = len(self.ADAPTATION_METHODS), len(self.SEEDS)
         distances = (
             (1 - sim).reshape(n_m, n_s, n_m, n_s, n_layers).transpose(0, 2, 1, 3, 4)
@@ -1191,21 +1103,39 @@ class FunctionalReorganizationAnalyzer:
             layerwise_distance=distances,
         )
         del features, dataset
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _cleanup_cuda()
         return distances
 
     def analyze_cka(self):
-        out = self._dir("distances")
+        pairwise_dir = self._dir("pairwise")
         matrices = {scope: [] for scope in self.METHOD_SCOPES}
-        rows = []
+        pair_rows, seed_rows = [], []
         indices = {
             scope: [self.ADAPTATION_METHODS.index(m) for m in methods]
             for scope, methods in self.METHOD_SCOPES.items()
         }
-        for ti, task in enumerate(self._progress(self.DATASETS, "CKA baseline")):
+        within_pairs = list(itertools.combinations(range(len(self.SEEDS)), 2))
+
+        for task in self._progress(self.DATASETS, "CKA baseline"):
             final = self._get_task_cka(task)[..., -1]  # [method, method, seed, seed]
+
+            for mi, method in enumerate(self.ADAPTATION_METHODS):
+                values = np.asarray(
+                    [final[mi, mi, i, j] for i, j in within_pairs], float
+                )
+                d = float(values.mean())
+                seed_rows.append(
+                    {
+                        "task": task,
+                        "task_group": self._task_group[task],
+                        "method": method,
+                        "within_cka": 1 - d,
+                        "within_cka_distance": d,
+                        "seed_pair_sd": float(values.std()),
+                        "n_seed_pairs": len(values),
+                    }
+                )
+
             for scope, idx in indices.items():
                 methods = self._scope_methods(scope)
                 matrix = np.zeros((len(methods), len(methods)))
@@ -1213,7 +1143,7 @@ class FunctionalReorganizationAnalyzer:
                     values = final[idx[i], idx[j]].reshape(-1)
                     d = float(values.mean())
                     matrix[i, j] = matrix[j, i] = d
-                    rows.append(
+                    pair_rows.append(
                         {
                             "scope": scope,
                             "task": task,
@@ -1227,23 +1157,41 @@ class FunctionalReorganizationAnalyzer:
                         }
                     )
                 matrices[scope].append(matrix)
-        paths = {}
-        for scope in self.METHOD_SCOPES:
-            matrices[scope] = np.stack(matrices[scope])
-            path = out / f"cka_matrices_{scope}.npz"
-            np.savez_compressed(
-                path,
-                datasets=np.array(self.DATASETS),
-                methods=np.array(self._scope_methods(scope)),
-                cka_distance=matrices[scope],
-            )
-            paths[scope] = path
+
+        matrices = {scope: np.stack(values) for scope, values in matrices.items()}
         return matrices, {
-            "pairwise": self._write_csv(out / "cka_pairwise.csv", rows),
-            "matrices": paths,
+            "pairwise": _write_csv(pairwise_dir / "cka_pairwise.csv", pair_rows),
+            "seed_variability": _write_csv(
+                pairwise_dir / "cka_seed_variability.csv", seed_rows
+            ),
         }
 
-    # ----------------------------- behavioral grounding -----------------------------
+    # ------------------------------------------------------------------
+    # Behavioral grounding / RSA
+    # ------------------------------------------------------------------
+
+    def _rsa(self, source, target):
+        x, y = _upper(np.asarray(source, float)), _upper(np.asarray(target, float))
+        observed = _spearman(x, y)
+        if not np.isfinite(observed):
+            return np.nan, np.nan, np.empty(0)
+
+        n = source.shape[0]
+        perms = self._perms[n]
+        iu, ju = np.triu_indices(n, 1)
+        xp = source[perms[:, iu], perms[:, ju]]
+        null = (
+            _row_corr(rankdata(xp, axis=1), rankdata(y))
+            if np.all(np.isfinite(xp)) and np.all(np.isfinite(y))
+            else np.asarray([_spearman(row, y) for row in xp])
+        )
+        null = null[np.isfinite(null)]
+        p = (
+            np.nan
+            if not null.size
+            else float(np.mean(np.abs(null) >= abs(observed) - 1e-15))
+        )
+        return observed, p, null
 
     def _bootstrap_mean_ci(self, values, groups, stratified=True):
         values, groups = np.asarray(values, float), np.asarray(groups)
@@ -1251,9 +1199,10 @@ class FunctionalReorganizationAnalyzer:
         values, groups = values[keep], groups[keep]
         if not len(values) or self.n_bootstrap <= 0:
             return np.nan, np.nan
+
         rng = np.random.default_rng(self.random_seed)
         samples = np.empty(self.n_bootstrap)
-        unique = np.unique(groups) if stratified else ["all"]
+        unique = np.unique(groups) if stratified else ("all",)
         for b in range(self.n_bootstrap):
             chosen = []
             if stratified:
@@ -1277,6 +1226,7 @@ class FunctionalReorganizationAnalyzer:
         grouped = defaultdict(list)
         for rec in records:
             grouped[tuple(rec["row"][k] for k in keys)].append(rec)
+
         rows = []
         rng = np.random.default_rng(self.random_seed)
         for key, items in grouped.items():
@@ -1285,10 +1235,9 @@ class FunctionalReorganizationAnalyzer:
                 use = [
                     x
                     for x in items
-                    if aggregation == "all" or x["row"]["task_group"] == aggregation
-                ]
-                use = [
-                    x for x in use if np.isfinite(x["row"]["rho"]) and len(x["null"])
+                    if (aggregation == "all" or x["row"]["task_group"] == aggregation)
+                    and np.isfinite(x["row"]["rho"])
+                    and len(x["null"])
                 ]
                 if not use:
                     continue
@@ -1297,11 +1246,12 @@ class FunctionalReorganizationAnalyzer:
                 lo, hi = self._bootstrap_mean_ci(
                     rho, groups, stratified=aggregation == "all"
                 )
+
                 null_mean = np.zeros(self.n_global_permutations)
                 for x in use:
-                    n = x["null"]
-                    null_mean += n[
-                        rng.integers(0, len(n), size=self.n_global_permutations)
+                    null = x["null"]
+                    null_mean += null[
+                        rng.integers(0, len(null), size=self.n_global_permutations)
                     ]
                 null_mean /= len(use)
                 obs = float(rho.mean())
@@ -1322,49 +1272,53 @@ class FunctionalReorganizationAnalyzer:
                         "n_tasks": len(rho),
                     }
                 )
-        q = self._bh([r["p_global_permutation"] for r in rows])
-        for r, v in zip(rows, q):
-            r["q_global_bh"] = v
+
+        q = _bh([r["p_global_permutation"] for r in rows])
+        for row, value in zip(rows, q):
+            row["q_global_bh"] = value
         return rows
 
     def _method_pair_summary(self, functional, prediction, cka):
         rows = []
+        groups = np.asarray([self._task_group[t] for t in self.DATASETS])
         for scope, methods in self.METHOD_SCOPES.items():
-            f = functional[scope][("model", "balanced_core", "F")]
-            p = functional[scope][("model", "balanced_core", "P")]
-            s = functional[scope][("model", "balanced_core", "S")]
-            for i, j in itertools.combinations(range(len(methods)), 2):
-                values = {
-                    "d_f": f[:, i, j],
-                    "d_p": p[:, i, j],
-                    "d_s": s[:, i, j],
-                    "jsd": prediction[scope]["jsd"][:, i, j],
-                    "top1_disagreement": prediction[scope]["top1_disagreement"][
-                        :, i, j
-                    ],
-                    "error_dissimilarity": prediction[scope]["error_dissimilarity"][
-                        :, i, j
-                    ],
-                    "accuracy_gap": prediction[scope]["accuracy_gap"][:, i, j],
-                    "cka_distance": cka[scope][:, i, j],
-                }
-                row = {"scope": scope, "method_a": methods[i], "method_b": methods[j]}
-                groups = np.asarray([self._task_group[t] for t in self.DATASETS])
-                for name, x in values.items():
-                    lo, hi = self._bootstrap_mean_ci(x, groups, stratified=True)
-                    row[name], row[f"{name}_ci_low"], row[f"{name}_ci_high"] = (
-                        float(np.nanmean(x)),
-                        lo,
-                        hi,
-                    )
-                rows.append(row)
+            for channel in ("model", "observed"):
+                f = functional[scope][(channel, "balanced_core", "F")]
+                p = functional[scope][(channel, "balanced_core", "P")]
+                s = functional[scope][(channel, "balanced_core", "S")]
+                for i, j in itertools.combinations(range(len(methods)), 2):
+                    values = {
+                        "d_f": f[:, i, j],
+                        "d_p": p[:, i, j],
+                        "d_s": s[:, i, j],
+                        "jsd": prediction[scope]["jsd"][:, i, j],
+                        "top1_disagreement": prediction[scope]["top1_disagreement"][
+                            :, i, j
+                        ],
+                        "error_dissimilarity": prediction[scope]["error_dissimilarity"][
+                            :, i, j
+                        ],
+                        "accuracy_gap": prediction[scope]["accuracy_gap"][:, i, j],
+                        "cka_distance": cka[scope][:, i, j],
+                    }
+                    row = {
+                        "scope": scope,
+                        "channel": channel,
+                        "method_a": methods[i],
+                        "method_b": methods[j],
+                    }
+                    for name, x in values.items():
+                        lo, hi = self._bootstrap_mean_ci(x, groups, stratified=True)
+                        row[name] = float(np.nanmean(x))
+                        row[f"{name}_ci_low"] = lo
+                        row[f"{name}_ci_high"] = hi
+                    rows.append(row)
         return rows
 
     def analyze_alignment(self, functional, prediction, cka):
         out = self._dir("alignment")
-        records = []
+        records, configs = [], []
 
-        configs = []
         for channel in ("model", "observed"):
             for source in ("F", "P", "S"):
                 configs.append(
@@ -1434,702 +1388,27 @@ class FunctionalReorganizationAnalyzer:
                         "behavior_metric": behavior,
                         "rho": rho,
                         "p_permutation": p,
-                        "n_method_pairs": len(self._upper(matrices[ti])),
+                        "n_method_pairs": len(_upper(matrices[ti])),
                     }
                     records.append({"row": row, "null": null})
 
-        task_rows = [x["row"] for x in records]
         summary = self._alignment_summary(records)
-        pair_summary = self._method_pair_summary(functional, prediction, cka)
         return {
-            "by_task": self._write_csv(out / "alignment_by_task.csv", task_rows),
-            "summary": self._write_csv(out / "alignment_summary.csv", summary),
-            "method_pair_summary": self._write_csv(
-                out / "method_pair_summary.csv", pair_summary
+            "by_task": _write_csv(
+                out / "alignment_by_task.csv", [x["row"] for x in records]
+            ),
+            "summary": _write_csv(out / "alignment_summary.csv", summary),
+            "method_pair_summary": _write_csv(
+                out / "method_pair_summary.csv",
+                self._method_pair_summary(functional, prediction, cka),
             ),
         }, summary
 
-    # ----------------------------- compact paper figures -----------------------------
-
-    def analyze_figures(
-        self, signature_outputs, alignment_summary, functional, prediction, cka
-    ):
-        out = self._dir("figures")
-        paths = {}
-
-        def read(path):
-            with open(path, encoding="utf-8") as f:
-                return list(csv.DictReader(f))
-
-        # Color-vision-deficiency-safe Paul Tol "Bright" palette.
-        COLORS = {
-            "blue": "#4477AA",
-            "cyan": "#66CCEE",
-            "green": "#228833",
-            "yellow": "#CCBB44",
-            "red": "#EE6677",
-            "purple": "#AA3377",
-            "gray": "#BBBBBB",
-        }
-
-        # Same semantic colors across decomposition figures.
-        DECOMP_COLORS = {
-            "group": COLORS["blue"],
-            "dataset": COLORS["cyan"],
-            "method": COLORS["yellow"],
-            "interaction": COLORS["purple"],
-            "seed": COLORS["gray"],
-            "method_general": COLORS["blue"],
-            "task_group": COLORS["cyan"],
-            "dataset_specific": COLORS["yellow"],
-            "task_shared": COLORS["blue"],
-            "method_conditioned": COLORS["yellow"],
-        }
-
-        SOURCE_COLORS = {
-            "F": COLORS["blue"],
-            "P": COLORS["green"],
-            "S": COLORS["red"],
-            "CKA": COLORS["purple"],
-        }
-
-        PRETTY_METHOD = {
-            "full_ft": "Full FT",
-            "vpt_shallow": "VPT-Shallow",
-            "vpt_deep": "VPT-Deep",
-            "lora": "LoRA",
-            "ssf": "SSF",
-            "adaptformer": "AdaptFormer",
-        }
-
-        PRETTY_EFFECT = {
-            "group": "Task group",
-            "dataset": "Dataset",
-            "method": "Method",
-            "interaction": "Interaction",
-            "seed": "Seed",
-            "method_general": "Method-general",
-            "task_group": "Task group",
-            "dataset_specific": "Dataset-specific",
-            "task_shared": "Task-shared",
-            "method_conditioned": "Method-conditioned",
-        }
-
-        PRETTY_BEHAVIOR = {
-            "jsd": "Jensen–Shannon divergence",
-            "top1_disagreement": "Top-1 disagreement",
-            "error_dissimilarity": "Error dissimilarity",
-        }
-
-        def style_ax(ax, grid_axis="y"):
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            ax.spines["left"].set_color("#B8B8B8")
-            ax.spines["bottom"].set_color("#B8B8B8")
-            ax.tick_params(length=3, color="#777777")
-            if grid_axis is not None:
-                ax.grid(
-                    axis=grid_axis,
-                    color="#D9D9D9",
-                    linewidth=0.65,
-                    alpha=0.55,
-                    zorder=0,
-                )
-                ax.set_axisbelow(True)
-
-        def style_heatmap(ax):
-            for spine in ax.spines.values():
-                spine.set_visible(False)
-            ax.tick_params(length=0)
-
-        # ------------------------------------------------------------------
-        # Global decomposition
-        # ------------------------------------------------------------------
-
-        rows = [
-            r
-            for r in read(signature_outputs["decomposition"]["global"])
-            if r["scope"] == "peft_plus_ft"
-            and r["channel"] == "model"
-            and r["component"] == "balanced_core"
-        ]
-
-        order = ["F", "P", "S"]
-        rows.sort(key=lambda r: order.index(r["signature"]))
-
-        fig, ax = plt.subplots(figsize=(7.2, 4.4))
-        bottom = np.zeros(len(order))
-
-        for key in ("group", "dataset", "method", "interaction", "seed"):
-            values = np.array([float(r[f"r_{key}"]) for r in rows])
-
-            ax.bar(
-                order,
-                values,
-                bottom=bottom,
-                width=0.62,
-                color=DECOMP_COLORS[key],
-                edgecolor="white",
-                linewidth=0.8,
-                label=PRETTY_EFFECT[key],
-                zorder=3,
-            )
-
-            bottom += values
-
-        ax.set_ylim(0, 1)
-        ax.set_ylabel("Fraction of centered reorganization energy")
-        ax.set_title("Global functional reorganization", pad=10)
-
-        style_ax(ax)
-
-        ax.legend(
-            frameon=False,
-            fontsize=8,
-            ncol=3,
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.12),
-        )
-
-        fig.tight_layout()
-
-        path = out / "decomposition_global.pdf"
-        fig.savefig(path, bbox_inches="tight")
-        plt.close(fig)
-
-        paths["decomposition_global"] = path
-
-        # ------------------------------------------------------------------
-        # Per-method decomposition
-        # ------------------------------------------------------------------
-
-        rows = [
-            r
-            for r in read(signature_outputs["decomposition"]["method"])
-            if r["scope"] == "peft_plus_ft"
-            and r["channel"] == "model"
-            and r["component"] == "balanced_core"
-        ]
-
-        fig, axes = plt.subplots(
-            1,
-            3,
-            figsize=(13.5, 5.2),
-            sharey=True,
-        )
-
-        for ax, sig in zip(axes, order):
-            by = {r["method"]: r for r in rows if r["signature"] == sig}
-
-            y = np.arange(len(self.ADAPTATION_METHODS))
-            left = np.zeros(len(y))
-
-            for key in (
-                "method_general",
-                "task_group",
-                "dataset_specific",
-                "seed",
-            ):
-                values = np.array(
-                    [float(by[m][f"r_{key}"]) for m in self.ADAPTATION_METHODS]
-                )
-
-                ax.barh(
-                    y,
-                    values,
-                    left=left,
-                    height=0.68,
-                    color=DECOMP_COLORS[key],
-                    edgecolor="white",
-                    linewidth=0.6,
-                    label=PRETTY_EFFECT[key],
-                    zorder=3,
-                )
-
-                left += values
-
-            ax.set_title(sig, pad=8)
-            ax.set_xlim(0, 1)
-            ax.set_xticks(np.linspace(0, 1, 6))
-            ax.set_xlabel("Fraction of energy")
-
-            ax.set_yticks(
-                y,
-                [PRETTY_METHOD[m] for m in self.ADAPTATION_METHODS],
-            )
-
-            ax.invert_yaxis()
-            style_ax(ax, "x")
-
-        axes[0].legend(
-            frameon=False,
-            fontsize=8,
-            ncol=2,
-            loc="upper left",
-            bbox_to_anchor=(0, -0.14),
-        )
-
-        fig.tight_layout()
-
-        path = out / "decomposition_by_method.pdf"
-        fig.savefig(path, bbox_inches="tight")
-        plt.close(fig)
-
-        paths["decomposition_by_method"] = path
-
-        # ------------------------------------------------------------------
-        # Per-dataset decomposition
-        # ------------------------------------------------------------------
-
-        rows = [
-            r
-            for r in read(signature_outputs["decomposition"]["dataset"])
-            if r["scope"] == "peft_plus_ft"
-            and r["channel"] == "model"
-            and r["component"] == "balanced_core"
-        ]
-
-        short = [t.removeprefix("vtab_").replace("_", " ") for t in self.DATASETS]
-
-        fig, axes = plt.subplots(
-            1,
-            3,
-            figsize=(14.5, 8.2),
-            sharey=True,
-        )
-
-        for ax, sig in zip(axes, order):
-            by = {r["task"]: r for r in rows if r["signature"] == sig}
-
-            y = np.arange(len(self.DATASETS))
-            left = np.zeros(len(y))
-
-            for key in (
-                "task_shared",
-                "method_conditioned",
-                "seed",
-            ):
-                values = np.array([float(by[t][f"r_{key}"]) for t in self.DATASETS])
-
-                ax.barh(
-                    y,
-                    values,
-                    left=left,
-                    height=0.70,
-                    color=DECOMP_COLORS[key],
-                    edgecolor="white",
-                    linewidth=0.55,
-                    label=PRETTY_EFFECT[key],
-                    zorder=3,
-                )
-
-                left += values
-
-            # Separate Natural / Specialized / Structured visually.
-            for boundary in (
-                len(self.NATURAL) - 0.5,
-                len(self.NATURAL) + len(self.SPECIALIZED) - 0.5,
-            ):
-                ax.axhline(
-                    boundary,
-                    color="#888888",
-                    linewidth=0.7,
-                    linestyle="--",
-                    alpha=0.55,
-                )
-
-            ax.set_title(sig, pad=8)
-            ax.set_xlim(0, 1)
-            ax.set_xticks(np.linspace(0, 1, 6))
-            ax.set_xlabel("Fraction of energy")
-            ax.set_yticks(y, short, fontsize=7.5)
-
-            ax.invert_yaxis()
-            style_ax(ax, "x")
-
-        axes[0].legend(
-            frameon=False,
-            fontsize=8,
-            ncol=3,
-            loc="upper left",
-            bbox_to_anchor=(0, -0.08),
-        )
-
-        fig.tight_layout()
-
-        path = out / "decomposition_by_dataset.pdf"
-        fig.savefig(path, bbox_inches="tight")
-        plt.close(fig)
-
-        paths["decomposition_by_dataset"] = path
-
-        # ------------------------------------------------------------------
-        # Dataset × method attribution
-        # ------------------------------------------------------------------
-
-        rows = [
-            r
-            for r in read(signature_outputs["decomposition"]["dataset_method"])
-            if r["scope"] == "peft_plus_ft"
-            and r["channel"] == "model"
-            and r["signature"] == "F"
-            and r["component"] == "balanced_core"
-        ]
-
-        lookup = {(r["task"], r["method"]): r for r in rows}
-
-        panels = (
-            ("r_group_signed", "Task group"),
-            ("r_dataset_signed", "Dataset"),
-            ("r_method_signed", "Method"),
-            ("r_interaction_signed", "Interaction"),
-            ("r_seed", "Seed"),
-        )
-
-        fig, axes = plt.subplots(
-            2,
-            3,
-            figsize=(12.5, 10.2),
-        )
-
-        for ax, (key, title) in zip(
-            axes.ravel(),
-            panels,
-        ):
-            matrix = np.array(
-                [
-                    [float(lookup[t, m][key]) for m in self.ADAPTATION_METHODS]
-                    for t in self.DATASETS
-                ]
-            )
-
-            # Same palette for every heatmap, including seed.
-            im = ax.imshow(
-                matrix,
-                aspect="auto",
-                cmap="viridis",
-                interpolation="nearest",
-            )
-
-            ax.set_title(title, pad=7)
-
-            ax.set_xticks(
-                range(len(self.ADAPTATION_METHODS)),
-                [PRETTY_METHOD[m] for m in self.ADAPTATION_METHODS],
-                rotation=40,
-                ha="right",
-                fontsize=7.5,
-            )
-
-            ax.set_yticks(
-                range(len(self.DATASETS)),
-                short,
-                fontsize=6.5,
-            )
-
-            style_heatmap(ax)
-
-            cbar = fig.colorbar(
-                im,
-                ax=ax,
-                fraction=0.046,
-                pad=0.03,
-            )
-
-            cbar.ax.tick_params(
-                labelsize=7,
-                length=2,
-            )
-            cbar.outline.set_visible(False)
-
-        axes.ravel()[-1].axis("off")
-
-        fig.tight_layout()
-
-        path = out / "decomposition_dataset_method.pdf"
-        fig.savefig(path, bbox_inches="tight")
-        plt.close(fig)
-
-        paths["decomposition_dataset_method"] = path
-
-        # ------------------------------------------------------------------
-        # Global F = P + S decomposition
-        # ------------------------------------------------------------------
-
-        rows = [
-            r
-            for r in read(signature_outputs["fisher_ps"]["global"])
-            if r["scope"] == "peft_plus_ft"
-            and r["channel"] == "model"
-            and r["component"] == "balanced_core"
-            and r["effect"] not in {"task", "total"}
-        ]
-
-        effect_order = [
-            "group",
-            "dataset",
-            "method",
-            "interaction",
-            "seed",
-        ]
-
-        rows.sort(key=lambda r: effect_order.index(r["effect"]))
-
-        x = np.arange(len(rows))
-        width = 0.24
-
-        fig, ax = plt.subplots(figsize=(8.5, 4.4))
-
-        for offset, key, label, color in (
-            (-width, "p_over_f", "P", COLORS["blue"]),
-            (0, "s_over_f", "S", COLORS["green"]),
-            (
-                width,
-                "cross_over_f",
-                "P × S",
-                COLORS["purple"],
-            ),
-        ):
-            ax.bar(
-                x + offset,
-                [np.nan if r[key] == "NA" else float(r[key]) for r in rows],
-                width,
-                color=color,
-                edgecolor="white",
-                linewidth=0.65,
-                label=label,
-                zorder=3,
-            )
-
-        ax.axhline(
-            0,
-            color="#555555",
-            linewidth=0.9,
-        )
-
-        ax.set_xticks(
-            x,
-            [PRETTY_EFFECT[r["effect"]] for r in rows],
-        )
-
-        ax.set_ylabel("Term / Fisher energy")
-        ax.set_title(
-            "Participation–sensitivity decomposition",
-            pad=10,
-        )
-
-        style_ax(ax)
-
-        ax.legend(
-            frameon=False,
-            ncol=3,
-        )
-
-        fig.tight_layout()
-
-        path = out / "fisher_ps_decomposition.pdf"
-        fig.savefig(path, bbox_inches="tight")
-        plt.close(fig)
-
-        paths["fisher_ps"] = path
-
-        # ------------------------------------------------------------------
-        # Behavioral grounding
-        # ------------------------------------------------------------------
-
-        core = [
-            r
-            for r in alignment_summary
-            if r["analysis_level"] == "core"
-            and r["scope"] == "peft_plus_ft"
-            and r["aggregation"] == "all"
-            and (
-                (
-                    r["channel"] == "model"
-                    and r["component"] == "balanced_core"
-                    and r["source"] in {"F", "P", "S"}
-                )
-                or r["source"] == "CKA"
-            )
-        ]
-
-        source_order = [
-            "F",
-            "P",
-            "S",
-            "CKA",
-        ]
-
-        fig, axes = plt.subplots(
-            1,
-            3,
-            figsize=(11.8, 4.0),
-            sharey=True,
-        )
-
-        for ax, behavior in zip(
-            axes,
-            self.BEHAVIOR_METRICS,
-        ):
-            by_source = {
-                r["source"]: r for r in core if r["behavior_metric"] == behavior
-            }
-
-            y = np.array([float(by_source[s]["mean_rho"]) for s in source_order])
-
-            lo = np.array([float(by_source[s]["ci_low"]) for s in source_order])
-
-            hi = np.array([float(by_source[s]["ci_high"]) for s in source_order])
-
-            xpos = np.arange(len(source_order))
-
-            for i, source in enumerate(source_order):
-                ax.errorbar(
-                    xpos[i],
-                    y[i],
-                    yerr=np.array(
-                        [
-                            [y[i] - lo[i]],
-                            [hi[i] - y[i]],
-                        ]
-                    ),
-                    fmt="o",
-                    markersize=7,
-                    color=SOURCE_COLORS[source],
-                    ecolor=SOURCE_COLORS[source],
-                    markeredgecolor="white",
-                    markeredgewidth=0.8,
-                    elinewidth=1.4,
-                    capsize=4,
-                    capthick=1.2,
-                    zorder=3,
-                )
-
-            ax.set_xticks(
-                xpos,
-                source_order,
-            )
-
-            ax.set_title(
-                PRETTY_BEHAVIOR[behavior],
-                pad=8,
-                fontsize=10,
-            )
-
-            # Fixed scale for alignment.
-            ax.set_ylim(-1, 1)
-            ax.set_yticks(np.linspace(-1, 1, 9))
-
-            style_ax(ax)
-
-        axes[0].set_ylabel("Mean task-level Spearman ρ")
-
-        fig.tight_layout()
-
-        path = out / "behavior_alignment.pdf"
-        fig.savefig(path, bbox_inches="tight")
-        plt.close(fig)
-
-        paths["alignment"] = path
-
-        # ------------------------------------------------------------------
-        # Method geometry
-        # ------------------------------------------------------------------
-
-        methods = self.ADAPTATION_METHODS
-
-        mats = [
-            (
-                "F",
-                functional["peft_plus_ft"][("model", "balanced_core", "F")].mean(0),
-            ),
-            (
-                "P",
-                functional["peft_plus_ft"][("model", "balanced_core", "P")].mean(0),
-            ),
-            (
-                "S",
-                functional["peft_plus_ft"][("model", "balanced_core", "S")].mean(0),
-            ),
-            (
-                "JSD",
-                prediction["peft_plus_ft"]["jsd"].mean(0),
-            ),
-            (
-                "CKA",
-                cka["peft_plus_ft"].mean(0),
-            ),
-        ]
-
-        fig, axes = plt.subplots(
-            2,
-            3,
-            figsize=(11.5, 7.6),
-        )
-
-        for ax, (title, matrix) in zip(
-            axes.ravel(),
-            mats,
-        ):
-            # Same heatmap palette used throughout the analysis.
-            im = ax.imshow(
-                matrix,
-                cmap="viridis",
-                interpolation="nearest",
-            )
-
-            ax.set_title(
-                title,
-                pad=7,
-            )
-
-            ax.set_xticks(
-                range(len(methods)),
-                [PRETTY_METHOD[m] for m in methods],
-                rotation=40,
-                ha="right",
-                fontsize=7.5,
-            )
-
-            ax.set_yticks(
-                range(len(methods)),
-                [PRETTY_METHOD[m] for m in methods],
-                fontsize=7.5,
-            )
-
-            style_heatmap(ax)
-
-            cbar = fig.colorbar(
-                im,
-                ax=ax,
-                fraction=0.046,
-                pad=0.03,
-            )
-
-            cbar.ax.tick_params(
-                labelsize=7,
-                length=2,
-            )
-
-            cbar.outline.set_visible(False)
-
-        for ax in axes.ravel()[len(mats) :]:
-            ax.axis("off")
-
-        fig.tight_layout()
-
-        path = out / "method_geometry.pdf"
-        fig.savefig(path, bbox_inches="tight")
-        plt.close(fig)
-
-        paths["geometry"] = path
-
-        return paths
-
-    # ----------------------------- manifests + full analysis -----------------------------
-
-    def _write_manifests(self):
-        self.save_dir.mkdir(parents=True, exist_ok=True)
+    # ------------------------------------------------------------------
+    # Manifests / orchestration
+    # ------------------------------------------------------------------
+
+    def _write_analysis_manifest(self, component_metadata):
         manifest = {
             "backbone": self.backbone_name,
             "datasets": list(self.DATASETS),
@@ -2146,27 +1425,33 @@ class FunctionalReorganizationAnalyzer:
             },
             "sensitivity_definition": "delta_S = delta_F - delta_P",
             "distance": "cross-seed RMS: sqrt(mean over 9 seed pairs of squared normalized Euclidean distance)",
+            "components": component_metadata,
             "balanced_core": list(self.CORE_COMPONENTS),
             "balanced_core_weighting": "each component contributes equally; coordinates within a component contribute equally",
             "behavior_metrics": list(self.BEHAVIOR_METRICS),
             "cka_baseline": "final-layer CLS linear CKA distance (1-CKA)",
+            "primary_result_dirs": ["alignment", "decomposition", "figures"],
+            "supporting_result_dir": "pairwise",
             "prediction_cache_dir": str(self.save_dir / "prediction_cache"),
             "cka_cache_dir": str(self.save_dir / "cka_cache"),
             "n_bootstrap": self.n_bootstrap,
             "n_global_permutations": self.n_global_permutations,
             "random_seed": self.random_seed,
         }
-        analysis_path = self.save_dir / "analysis_manifest.json"
-        analysis_path.write_text(json.dumps(manifest, indent=2))
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        path = self.save_dir / "analysis_manifest.json"
+        path.write_text(json.dumps(manifest, indent=2))
+        return path
 
-        entries = []
+    def _write_cache_manifest(self):
+        runs = []
         for task in self.DATASETS:
             for method in self.METHODS:
                 for run in self._get_runs(task, method):
                     model = run["path"] / "model.pt"
                     sig = run["path"] / self.SIGNATURE_FILENAME
                     pred = self._prediction_cache_path(task, method, run["seed"])
-                    entries.append(
+                    runs.append(
                         {
                             "task": task,
                             "method": method,
@@ -2184,31 +1469,32 @@ class FunctionalReorganizationAnalyzer:
         cache = {
             "prediction_cache_dir": str(self.save_dir / "prediction_cache"),
             "cka_cache_dir": str(self.save_dir / "cka_cache"),
-            "runs": entries,
+            "runs": runs,
             "cka": [
                 {
-                    "task": t,
-                    "path": str(self._cka_cache_path(t)),
-                    "exists": self._cka_cache_path(t).is_file(),
+                    "task": task,
+                    "path": str(self._cka_cache_path(task)),
+                    "exists": self._cka_cache_path(task).is_file(),
                 }
-                for t in self.DATASETS
+                for task in self.DATASETS
             ],
         }
-        cache_path = self.save_dir / "cache_manifest.json"
-        cache_path.write_text(json.dumps(cache, indent=2))
-        return analysis_path, cache_path
+        path = self.save_dir / "cache_manifest.json"
+        path.write_text(json.dumps(cache, indent=2))
+        return path
 
     def analyze_all(self):
-        manifest, cache_manifest = self._write_manifests()
         functional, signature_outputs = self.analyze_signatures()
         prediction, prediction_outputs = self.analyze_predictions()
         cka, cka_outputs = self.analyze_cka()
         alignment_outputs, alignment_summary = self.analyze_alignment(
             functional, prediction, cka
         )
-        figures = self.analyze_figures(
-            signature_outputs, alignment_summary, functional, prediction, cka
+        figures = make_figures(
+            self, signature_outputs, alignment_summary, functional, prediction, cka
         )
+        manifest = self._write_analysis_manifest(signature_outputs["metadata"])
+        cache_manifest = self._write_cache_manifest()
         return {
             "manifest": manifest,
             "cache_manifest": cache_manifest,
@@ -2218,3 +1504,396 @@ class FunctionalReorganizationAnalyzer:
             "alignment": alignment_outputs,
             "figures": figures,
         }
+
+
+# -----------------------------------------------------------------------------
+# Paper figures
+# -----------------------------------------------------------------------------
+
+
+COLORS = {
+    "blue": "#4477AA",
+    "cyan": "#66CCEE",
+    "green": "#228833",
+    "yellow": "#CCBB44",
+    "red": "#EE6677",
+    "purple": "#AA3377",
+    "gray": "#BBBBBB",
+}
+DECOMP_COLORS = {
+    "group": COLORS["blue"],
+    "dataset": COLORS["cyan"],
+    "method": COLORS["yellow"],
+    "interaction": COLORS["purple"],
+    "seed": COLORS["gray"],
+    "method_general": COLORS["blue"],
+    "task_group": COLORS["cyan"],
+    "dataset_specific": COLORS["yellow"],
+    "task_shared": COLORS["blue"],
+    "method_conditioned": COLORS["yellow"],
+}
+SOURCE_COLORS = {
+    "F": COLORS["blue"],
+    "P": COLORS["green"],
+    "S": COLORS["red"],
+    "CKA": COLORS["purple"],
+}
+PRETTY_METHOD = {
+    "full_ft": "Full FT",
+    "vpt_shallow": "VPT-Shallow",
+    "vpt_deep": "VPT-Deep",
+    "lora": "LoRA",
+    "ssf": "SSF",
+    "adaptformer": "AdaptFormer",
+}
+PRETTY_EFFECT = {
+    "group": "Task group",
+    "dataset": "Dataset",
+    "method": "Method",
+    "interaction": "Interaction",
+    "seed": "Seed",
+    "method_general": "Method-general",
+    "task_group": "Task group",
+    "dataset_specific": "Dataset-specific",
+    "task_shared": "Task-shared",
+    "method_conditioned": "Method-conditioned",
+}
+PRETTY_BEHAVIOR = {
+    "jsd": "Jensen–Shannon divergence",
+    "top1_disagreement": "Top-1 disagreement",
+    "error_dissimilarity": "Error dissimilarity",
+}
+
+
+def _style_ax(ax, grid_axis="y"):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#B8B8B8")
+    ax.spines["bottom"].set_color("#B8B8B8")
+    ax.tick_params(length=3, color="#777777")
+    if grid_axis is not None:
+        ax.grid(axis=grid_axis, color="#D9D9D9", linewidth=0.65, alpha=0.55, zorder=0)
+        ax.set_axisbelow(True)
+
+
+def _heatmap(fig, ax, matrix, title, methods, ylabels=None, aspect="equal"):
+    im = ax.imshow(matrix, aspect=aspect, cmap="viridis", interpolation="nearest")
+    labels = [PRETTY_METHOD[m] for m in methods]
+    ax.set_title(title, pad=7)
+    ax.set_xticks(range(len(methods)), labels, rotation=40, ha="right", fontsize=7.5)
+    ax.set_yticks(range(len(ylabels or methods)), ylabels or labels, fontsize=7.5)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.tick_params(length=0)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+    cbar.ax.tick_params(labelsize=7, length=2)
+    cbar.outline.set_visible(False)
+
+
+def _save(fig, out, name):
+    path = out / name
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def make_figures(a, signature_outputs, alignment_summary, functional, prediction, cka):
+    out = a._dir("figures")
+    paths = {}
+    order = ("F", "P", "S")
+    short_tasks = [t.removeprefix("vtab_").replace("_", " ") for t in a.DATASETS]
+
+    # Global decomposition
+    rows = [
+        r
+        for r in _read_csv(signature_outputs["decomposition"]["global"])
+        if r["scope"] == "peft_plus_ft"
+        and r["channel"] == "model"
+        and r["component"] == "balanced_core"
+    ]
+    rows.sort(key=lambda r: order.index(r["signature"]))
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    bottom = np.zeros(len(order))
+    for key in ("group", "dataset", "method", "interaction", "seed"):
+        values = np.array([float(r[f"r_{key}"]) for r in rows])
+        ax.bar(
+            order,
+            values,
+            bottom=bottom,
+            width=0.62,
+            color=DECOMP_COLORS[key],
+            edgecolor="white",
+            linewidth=0.8,
+            label=PRETTY_EFFECT[key],
+            zorder=3,
+        )
+        bottom += values
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("Fraction of centered reorganization energy")
+    ax.set_title("Global functional reorganization", pad=10)
+    _style_ax(ax)
+    ax.legend(
+        frameon=False,
+        fontsize=8,
+        ncol=3,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.12),
+    )
+    fig.tight_layout()
+    paths["decomposition_global"] = _save(fig, out, "decomposition_global.pdf")
+
+    # Per-method decomposition
+    rows = [
+        r
+        for r in _read_csv(signature_outputs["decomposition"]["method"])
+        if r["scope"] == "peft_plus_ft"
+        and r["channel"] == "model"
+        and r["component"] == "balanced_core"
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 5.2), sharey=True)
+    for ax, sig in zip(axes, order):
+        by = {r["method"]: r for r in rows if r["signature"] == sig}
+        y, left = np.arange(len(a.ADAPTATION_METHODS)), np.zeros(
+            len(a.ADAPTATION_METHODS)
+        )
+        for key in ("method_general", "task_group", "dataset_specific", "seed"):
+            values = np.array([float(by[m][f"r_{key}"]) for m in a.ADAPTATION_METHODS])
+            ax.barh(
+                y,
+                values,
+                left=left,
+                height=0.68,
+                color=DECOMP_COLORS[key],
+                edgecolor="white",
+                linewidth=0.6,
+                label=PRETTY_EFFECT[key],
+                zorder=3,
+            )
+            left += values
+        ax.set(title=sig, xlim=(0, 1), xlabel="Fraction of energy")
+        ax.set_xticks(np.linspace(0, 1, 6))
+        ax.set_yticks(y, [PRETTY_METHOD[m] for m in a.ADAPTATION_METHODS])
+        ax.invert_yaxis()
+        _style_ax(ax, "x")
+    axes[0].legend(
+        frameon=False, fontsize=8, ncol=2, loc="upper left", bbox_to_anchor=(0, -0.14)
+    )
+    fig.tight_layout()
+    paths["decomposition_by_method"] = _save(fig, out, "decomposition_by_method.pdf")
+
+    # Per-dataset decomposition
+    rows = [
+        r
+        for r in _read_csv(signature_outputs["decomposition"]["dataset"])
+        if r["scope"] == "peft_plus_ft"
+        and r["channel"] == "model"
+        and r["component"] == "balanced_core"
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(14.5, 8.2), sharey=True)
+    for ax, sig in zip(axes, order):
+        by = {r["task"]: r for r in rows if r["signature"] == sig}
+        y, left = np.arange(len(a.DATASETS)), np.zeros(len(a.DATASETS))
+        for key in ("task_shared", "method_conditioned", "seed"):
+            values = np.array([float(by[t][f"r_{key}"]) for t in a.DATASETS])
+            ax.barh(
+                y,
+                values,
+                left=left,
+                height=0.70,
+                color=DECOMP_COLORS[key],
+                edgecolor="white",
+                linewidth=0.55,
+                label=PRETTY_EFFECT[key],
+                zorder=3,
+            )
+            left += values
+        for boundary in (
+            len(a.NATURAL) - 0.5,
+            len(a.NATURAL) + len(a.SPECIALIZED) - 0.5,
+        ):
+            ax.axhline(
+                boundary, color="#888888", linewidth=0.7, linestyle="--", alpha=0.55
+            )
+        ax.set(title=sig, xlim=(0, 1), xlabel="Fraction of energy")
+        ax.set_xticks(np.linspace(0, 1, 6))
+        ax.set_yticks(y, short_tasks, fontsize=7.5)
+        ax.invert_yaxis()
+        _style_ax(ax, "x")
+    axes[0].legend(
+        frameon=False, fontsize=8, ncol=3, loc="upper left", bbox_to_anchor=(0, -0.08)
+    )
+    fig.tight_layout()
+    paths["decomposition_by_dataset"] = _save(fig, out, "decomposition_by_dataset.pdf")
+
+    # Dataset x method attribution
+    rows = [
+        r
+        for r in _read_csv(signature_outputs["decomposition"]["dataset_method"])
+        if r["scope"] == "peft_plus_ft"
+        and r["channel"] == "model"
+        and r["signature"] == "F"
+        and r["component"] == "balanced_core"
+    ]
+    lookup = {(r["task"], r["method"]): r for r in rows}
+    panels = (
+        ("r_group_signed", "Task group"),
+        ("r_dataset_signed", "Dataset"),
+        ("r_method_signed", "Method"),
+        ("r_interaction_signed", "Interaction"),
+        ("r_seed", "Seed"),
+    )
+    fig, axes = plt.subplots(2, 3, figsize=(12.5, 10.2))
+    for ax, (key, title) in zip(axes.ravel(), panels):
+        matrix = np.array(
+            [
+                [float(lookup[t, m][key]) for m in a.ADAPTATION_METHODS]
+                for t in a.DATASETS
+            ]
+        )
+        _heatmap(
+            fig, ax, matrix, title, a.ADAPTATION_METHODS, short_tasks, aspect="auto"
+        )
+    axes.ravel()[-1].axis("off")
+    fig.tight_layout()
+    paths["decomposition_dataset_method"] = _save(
+        fig, out, "decomposition_dataset_method.pdf"
+    )
+
+    # Global F=P+S decomposition
+    rows = [
+        r
+        for r in _read_csv(signature_outputs["fisher_ps"]["global"])
+        if r["scope"] == "peft_plus_ft"
+        and r["channel"] == "model"
+        and r["component"] == "balanced_core"
+        and r["effect"] not in {"task", "total"}
+    ]
+    effect_order = ("group", "dataset", "method", "interaction", "seed")
+    rows.sort(key=lambda r: effect_order.index(r["effect"]))
+    x, width = np.arange(len(rows)), 0.24
+    fig, ax = plt.subplots(figsize=(8.5, 4.4))
+    for offset, key, label, color in (
+        (-width, "p_over_f", "P", COLORS["blue"]),
+        (0, "s_over_f", "S", COLORS["green"]),
+        (width, "cross_over_f", "P × S", COLORS["purple"]),
+    ):
+        ax.bar(
+            x + offset,
+            [np.nan if r[key] == "NA" else float(r[key]) for r in rows],
+            width,
+            color=color,
+            edgecolor="white",
+            linewidth=0.65,
+            label=label,
+            zorder=3,
+        )
+    ax.axhline(0, color="#555555", linewidth=0.9)
+    ax.set_xticks(x, [PRETTY_EFFECT[r["effect"]] for r in rows])
+    ax.set_ylabel("Term / Fisher energy")
+    ax.set_title("Participation–sensitivity decomposition", pad=10)
+    _style_ax(ax)
+    ax.legend(frameon=False, ncol=3)
+    fig.tight_layout()
+    paths["fisher_ps"] = _save(fig, out, "fisher_ps_decomposition.pdf")
+
+    # Behavioral grounding
+    core = [
+        r
+        for r in alignment_summary
+        if r["analysis_level"] == "core"
+        and r["scope"] == "peft_plus_ft"
+        and r["aggregation"] == "all"
+        and (
+            (
+                r["channel"] == "model"
+                and r["component"] == "balanced_core"
+                and r["source"] in {"F", "P", "S"}
+            )
+            or r["source"] == "CKA"
+        )
+    ]
+    source_order = ("F", "P", "S", "CKA")
+    fig, axes = plt.subplots(1, 3, figsize=(11.8, 4.0), sharey=True)
+    for ax, behavior in zip(axes, a.BEHAVIOR_METRICS):
+        by = {r["source"]: r for r in core if r["behavior_metric"] == behavior}
+        y = np.array([float(by[s]["mean_rho"]) for s in source_order])
+        lo = np.array([float(by[s]["ci_low"]) for s in source_order])
+        hi = np.array([float(by[s]["ci_high"]) for s in source_order])
+        for i, source in enumerate(source_order):
+            ax.errorbar(
+                i,
+                y[i],
+                yerr=np.array([[max(0.0, y[i] - lo[i])], [max(0.0, hi[i] - y[i])]]),
+                fmt="o",
+                markersize=7,
+                color=SOURCE_COLORS[source],
+                ecolor=SOURCE_COLORS[source],
+                markeredgecolor="white",
+                markeredgewidth=0.8,
+                elinewidth=1.4,
+                capsize=4,
+                capthick=1.2,
+                zorder=3,
+            )
+        ax.set_xticks(range(len(source_order)), source_order)
+        ax.set_title(PRETTY_BEHAVIOR[behavior], pad=8, fontsize=10)
+        ax.set_ylim(-1, 1)
+        ax.set_yticks(np.linspace(-1, 1, 9))
+        _style_ax(ax)
+    axes[0].set_ylabel("Mean task-level Spearman ρ")
+    fig.tight_layout()
+    paths["alignment"] = _save(fig, out, "behavior_alignment.pdf")
+
+    # Method geometry: model / representation distances vs prediction distances.
+    methods = a.ADAPTATION_METHODS
+    model_mats = (
+        ("$F_m$", functional["peft_plus_ft"][("model", "balanced_core", "F")].mean(0)),
+        ("$P$", functional["peft_plus_ft"][("model", "balanced_core", "P")].mean(0)),
+        ("$S_m$", functional["peft_plus_ft"][("model", "balanced_core", "S")].mean(0)),
+        (
+            "$F_e$",
+            functional["peft_plus_ft"][("observed", "balanced_core", "F")].mean(0),
+        ),
+        (
+            "$S_e$",
+            functional["peft_plus_ft"][("observed", "balanced_core", "S")].mean(0),
+        ),
+        ("CKA", cka["peft_plus_ft"].mean(0)),
+    )
+    prediction_mats = (
+        ("JSD", prediction["peft_plus_ft"]["jsd"].mean(0)),
+        ("Top-1 disagreement", prediction["peft_plus_ft"]["top1_disagreement"].mean(0)),
+        (
+            "Error dissimilarity",
+            prediction["peft_plus_ft"]["error_dissimilarity"].mean(0),
+        ),
+    )
+    fig = plt.figure(figsize=(12.2, 11.0))
+    gs = fig.add_gridspec(3, 3, hspace=0.62, wspace=0.38)
+    model_axes = [fig.add_subplot(gs[r, c]) for r in range(2) for c in range(3)]
+    pred_axes = [fig.add_subplot(gs[2, c]) for c in range(3)]
+    for ax, (title, matrix) in zip(model_axes, model_mats):
+        _heatmap(fig, ax, matrix, title, methods)
+    for ax, (title, matrix) in zip(pred_axes, prediction_mats):
+        _heatmap(fig, ax, matrix, title, methods)
+    fig.text(
+        0.5,
+        0.965,
+        "Model / representation distance",
+        ha="center",
+        va="top",
+        fontsize=12,
+        fontweight="bold",
+    )
+    fig.text(
+        0.5,
+        0.335,
+        "Prediction distance",
+        ha="center",
+        va="top",
+        fontsize=12,
+        fontweight="bold",
+    )
+    paths["geometry"] = _save(fig, out, "method_geometry.pdf")
+
+    return paths
