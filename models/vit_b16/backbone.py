@@ -74,22 +74,6 @@ class ViTB16Backbone(TransformerBackbone):
     def mlp_dim(self) -> int:
         return self.blocks[0].ffn.fc1.out_features
 
-    def get_patch_coordinates(self) -> torch.Tensor:
-        """
-        Return spatial patch coordinates in patch-token order.
-
-        Shape:
-            [num_patches, 2]
-        """
-        return torch.stack(
-            torch.meshgrid(
-                torch.arange(self.grid_size),
-                torch.arange(self.grid_size),
-                indexing="ij",
-            ),
-            dim=-1,
-        ).reshape(-1, 2)
-
     def get_attention_output_weight(
         self,
         layer_idx: int,
@@ -263,3 +247,24 @@ class ViTB16Backbone(TransformerBackbone):
             "cls": layer_outputs[:, :, 0],
             "patch_tokens": layer_outputs[:, :, 1:],
         }
+
+    def get_attention_input_weight(
+        self,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        attention = self.blocks[layer_idx].attn
+
+        return torch.cat(
+            (
+                attention.query.weight,
+                attention.key.weight,
+                attention.value.weight,
+            ),
+            dim=0,
+        )
+
+    def get_mlp_input_weight(
+        self,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        return self.blocks[layer_idx].ffn.fc1.weight

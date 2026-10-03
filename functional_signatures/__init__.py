@@ -1,2 +1,2 @@
-from .functional_signatures_validator import FunctionalSignaturesValidator
+from .functional_signature_validator import FunctionalSignatureValidator
 from .functional_reorganization_analyzer import FunctionalReorganizationAnalyzer

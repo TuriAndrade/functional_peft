@@ -26,23 +26,6 @@ def test_backbone_metadata(model):
     assert model.num_patches == 196
 
 
-def test_patch_coordinates(model):
-    coordinates = model.get_patch_coordinates()
-
-    assert coordinates.shape == (196, 2)
-
-    expected = torch.stack(
-        torch.meshgrid(
-            torch.arange(14),
-            torch.arange(14),
-            indexing="ij",
-        ),
-        dim=-1,
-    ).reshape(-1, 2)
-
-    assert torch.equal(coordinates, expected)
-
-
 def test_attention_output_weight_shape(model):
     for layer_idx in range(model.num_layers):
         weight = model.get_attention_output_weight(layer_idx)

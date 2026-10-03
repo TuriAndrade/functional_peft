@@ -311,7 +311,7 @@ def test_save_and_load_trainable_parameters(tmp_path):
     assert torch.allclose(target_model.head.bias, source_model.head.bias)
 
 
-def test_functional_gates_preserve_forward():
+def test_functional_gates_preserve_forward(tmp_path):
     model = ViTB16LoRA(
         img_size=IMG_SIZE,
         n_classes=N_CLASSES,
@@ -330,13 +330,54 @@ def test_functional_gates_preserve_forward():
     with torch.no_grad():
         expected = model.forward_features(x)
 
-    model._create_functional_artifacts()
-    model._reset_functional_artifacts()
+    param_count_before = model.get_param_count()
+
+    model.prepare_functional_analysis(
+        tmp_path / "spectral_basis.pt",
+    )
+    model.reset_functional_gates()
+
+    assert set(model.functional_gates) == {
+        "attention_qk",
+        "attention_ov",
+        "mlp_in",
+        "mlp_out",
+    }
+
+    assert model.functional_gates["attention_qk"].shape == (
+        model.backbone.num_layers,
+        model.backbone.num_heads,
+        model.backbone.head_dim,
+    )
+    assert model.functional_gates["attention_ov"].shape == (
+        model.backbone.num_layers,
+        model.backbone.num_heads,
+        model.backbone.head_dim,
+    )
+    assert model.functional_gates["mlp_in"].shape == (
+        model.backbone.num_layers,
+        model.backbone.embed_dim,
+    )
+    assert model.functional_gates["mlp_out"].shape == (
+        model.backbone.num_layers,
+        model.backbone.embed_dim,
+    )
+
+    assert all(torch.all(gate == 1) for gate in model.functional_gates.values())
+    assert all(not gate.requires_grad for gate in model.functional_gates.values())
+
+    # Functional gates must not affect PEFT parameter counting.
+    assert model.get_param_count() == param_count_before
 
     with torch.no_grad():
         actual = model.forward_features(x)
 
-    assert torch.allclose(actual["cls"], expected["cls"], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(
+        actual["cls"],
+        expected["cls"],
+        rtol=1e-5,
+        atol=1e-6,
+    )
     assert torch.allclose(
         actual["patch_tokens"],
         expected["patch_tokens"],

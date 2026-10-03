@@ -1,6 +1,6 @@
 import argparse
 
-from functional_signatures import FunctionalSignaturesValidator
+from functional_signatures import FunctionalSignatureValidator
 
 
 def _build_parser():
@@ -13,11 +13,6 @@ def _build_parser():
         default="vit_b16",
     )
     parser.add_argument(
-        "--eps",
-        type=float,
-        default=1e-12,
-    )
-    parser.add_argument(
         "--quiet",
         action="store_true",
     )
@@ -28,9 +23,8 @@ def _build_parser():
 def main():
     args = _build_parser().parse_args()
 
-    validator = FunctionalSignaturesValidator(
+    validator = FunctionalSignatureValidator(
         backbone_name=args.backbone_name,
-        eps=args.eps,
         verbose=not args.quiet,
     )
 

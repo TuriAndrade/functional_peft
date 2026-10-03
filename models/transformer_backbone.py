@@ -54,19 +54,6 @@ class TransformerBackbone(nn.Module, ABC):
         ...
 
     @abstractmethod
-    def get_patch_coordinates(self) -> torch.Tensor:
-        """
-        Return patch coordinates in the same order as patch tokens.
-
-        Shape:
-            [P, K]
-
-        P is the number of patch tokens. Only Euclidean distances between
-        coordinates are used, so K need not be two.
-        """
-        ...
-
-    @abstractmethod
     def get_attention_output_weight(
         self,
         layer_idx: int,
@@ -126,4 +113,34 @@ class TransformerBackbone(nn.Module, ABC):
     @abstractmethod
     def unfreeze(self) -> None:
         """Unfreeze all native backbone parameters."""
+        ...
+
+    @abstractmethod
+    def get_attention_input_weight(
+        self,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """
+        Return the stacked pretrained Q/K/V input-projection weights.
+
+        Shape:
+            [3 * embed_dim, embed_dim]
+
+        Columns define residual-channel read directions.
+        """
+        ...
+
+    @abstractmethod
+    def get_mlp_input_weight(
+        self,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """
+        Return the pretrained MLP input-projection weight.
+
+        Shape:
+            [mlp_dim, embed_dim]
+
+        Columns define residual-channel read directions.
+        """
         ...
