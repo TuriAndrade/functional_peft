@@ -1,3 +1,7 @@
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import argparse
 import gc
 import json
@@ -5,11 +9,11 @@ import torch
 import os
 import math
 
-from datasets import datasets
-from models import models
-from optimizers import AdamW
-from trainers import SupervisedTrainer
-from utils import save_config, set_seed, seed_worker, parse_args_json
+from src.datasets import datasets
+from src.models import models
+from src.optimizers import AdamW
+from src.trainers import SupervisedTrainer
+from src.utils import save_config, set_seed, seed_worker, parse_args_json
 
 
 def _build_parser():
@@ -372,3 +376,7 @@ def main():
             args,
             run_seed,
         )
+
+
+if __name__ == "__main__":
+    main()

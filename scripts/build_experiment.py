@@ -1,9 +1,10 @@
-import argparse
-import json
-
 from dotenv import load_dotenv
 
-from experiments import experiments
+load_dotenv()
+
+import argparse
+import json
+from src.experiments import experiments
 
 
 def _parse_value(value: str):
@@ -36,8 +37,6 @@ def _parse_extra_args(args):
 
 
 def main():
-    load_dotenv()
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp-name", required=True, choices=experiments.keys())
 

@@ -21,7 +21,6 @@ class AdaptFormerAdapter(nn.Module):
         super().__init__()
 
         self.scale = float(scale)
-
         self.down = nn.Linear(embed_dim, bottleneck_dim)
         self.act = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
@@ -35,16 +34,10 @@ class AdaptFormerAdapter(nn.Module):
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
 
-    def forward_features(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         return self.dropout(self.act(self.down(x)))
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.up(self.forward_features(x)) * self.scale
 
 
@@ -62,10 +55,8 @@ class ViTB16AdaptFormer(PEFTModel):
     ):
         if bottleneck_dim < 0:
             raise ValueError("bottleneck_dim must be non-negative")
-
         if bottleneck_dim > 0 and adapter_scale <= 0:
             raise ValueError("adapter_scale must be positive when bottleneck_dim > 0")
-
         if not 0.0 <= adapter_dropout < 1.0:
             raise ValueError("adapter_dropout must be in [0, 1)")
 
@@ -79,7 +70,6 @@ class ViTB16AdaptFormer(PEFTModel):
         self.bottleneck_dim = bottleneck_dim
         self.adapter_scale = float(adapter_scale)
         self.adapter_dropout = float(adapter_dropout)
-
         self.adapters = nn.ModuleList(
             [
                 AdaptFormerAdapter(
@@ -99,32 +89,20 @@ class ViTB16AdaptFormer(PEFTModel):
         if bottleneck_dim > 0:
             self._patch_adaptformer_ffns()
 
-    def init_peft(
-        self,
-        init_from: nn.ModuleList | None = None,
-    ) -> None:
+    def init_peft(self, init_from: nn.ModuleList | None = None) -> None:
         if self.bottleneck_dim == 0:
             return
-
         if init_from is not None:
             try:
-                self.adapters.load_state_dict(
-                    init_from.state_dict(),
-                    strict=True,
-                )
+                self.adapters.load_state_dict(init_from.state_dict(), strict=True)
             except RuntimeError as exc:
                 raise ValueError("AdaptFormer adapter shape mismatch.") from exc
-
             return
-
         for adapter in self.adapters:
             adapter.reset_parameters()
 
     def _patch_adaptformer_ffns(self) -> None:
-        def make_forward(
-            layer_idx,
-            original_forward,
-        ):
+        def make_forward(layer_idx, original_forward):
             def forward(_, x):
                 return original_forward(x) + self.adapters[layer_idx](x)
 
@@ -132,42 +110,15 @@ class ViTB16AdaptFormer(PEFTModel):
 
         for layer_idx, block in enumerate(self.backbone.blocks):
             block.ffn.forward = MethodType(
-                make_forward(
-                    layer_idx,
-                    block.ffn.forward,
-                ),
-                block.ffn,
+                make_forward(layer_idx, block.ffn.forward), block.ffn
             )
 
-    def save(
-        self,
-        path: str,
-    ) -> None:
+    def save(self, path: str) -> None:
         state_dict = {
             key: value.detach().cpu()
             for key, value in self.state_dict().items()
-            if (
-                key.startswith("head.")
-                or key.startswith("adapters.")
-                or (not self.is_backbone_frozen and key.startswith("backbone."))
-            )
+            if key.startswith("head.")
+            or key.startswith("adapters.")
+            or (not self.is_backbone_frozen and key.startswith("backbone."))
         }
-
-        torch.save(
-            state_dict,
-            path,
-        )
-
-    # ======================================================================
-    # Functional Fisher hook
-    # ======================================================================
-
-    def _functional_extra_mlp_update(
-        self,
-        layer_idx: int,
-        value: torch.Tensor,
-    ) -> torch.Tensor | None:
-        if self.bottleneck_dim == 0:
-            return None
-
-        return self.adapters[layer_idx](value)
+        torch.save(state_dict, path)

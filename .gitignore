@@ -3,11 +3,11 @@ slurm/
 logs/
 
 # Experiment
-experiments/**
-!experiments/**/*.py
+src/experiments/**
+!src/experiments/**/*.py
 
 # Checkpoints
-third_party/vit_pytorch/ckpts/ViT-B_16.npz
+src/third_party/vit_pytorch/ckpts/ViT-B_16.npz
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
