@@ -5,9 +5,10 @@ load_dotenv()
 import argparse
 import gc
 import json
-import torch
-import os
 import math
+import os
+
+import torch
 
 from src.datasets import datasets
 from src.models import models
@@ -24,7 +25,7 @@ def _build_parser():
     parser.add_argument(
         "--dataset-name",
         type=str,
-        default="vtab_caltech101",
+        default="cifar100",
         help="Dataset name.",
     )
 
@@ -51,30 +52,19 @@ def _build_parser():
         default={},
         help="Config for the PEFT method.",
     )
-    parser.add_argument(
-        "--freeze-backbone",
-        action="store_true",
-        help="Don't train the backbone.",
-    )
-    parser.add_argument(
-        "--load-model-path",
-        type=str,
-        default=None,
-        help="Path to load model from.",
-    )
 
     # ----- Training -----
     parser.add_argument(
         "--batch-size",
         type=int,
         default=32,
-        help="Effective total batch size after gradient accumulation (gpu_batch_size × accumulation steps).",
+        help="Effective batch size after gradient accumulation.",
     )
     parser.add_argument(
         "--gpu-batch-size",
         type=int,
         default=8,
-        help="Mini-batch size processed per GPU step (before gradient accumulation).",
+        help="Mini-batch size processed per GPU step.",
     )
     parser.add_argument(
         "--epochs",
@@ -86,25 +76,25 @@ def _build_parser():
         "--patience",
         type=int,
         default=5,
-        help="Early stopping patience (epochs).",
+        help="Early stopping patience.",
     )
     parser.add_argument(
         "--min-epochs",
         type=int,
         default=25,
-        help="Min number of training epochs to wait before early stopping.",
+        help="Minimum number of epochs before early stopping.",
     )
     parser.add_argument(
         "--start-lr",
         type=float,
         default=1e-5,
-        help="Start training learning rate.",
+        help="Initial learning rate.",
     )
     parser.add_argument(
         "--ref-lr",
         type=float,
         default=1e-3,
-        help="Training learning rate.",
+        help="Reference learning rate.",
     )
     parser.add_argument(
         "--final-lr",
@@ -116,13 +106,13 @@ def _build_parser():
         "--ref-wd",
         type=float,
         default=1e-3,
-        help="Training weight decay.",
+        help="Reference weight decay.",
     )
     parser.add_argument(
         "--final-wd",
         type=float,
         default=1e-3,
-        help="Final training weight decay.",
+        help="Final weight decay.",
     )
     parser.add_argument(
         "--warmup-epochs",
@@ -133,41 +123,41 @@ def _build_parser():
     parser.add_argument(
         "--save-ckpt",
         action="store_true",
-        help="Whether to save model weights.",
+        help="Whether to save model weights during training.",
     )
     parser.add_argument(
         "--save-ckpt-interval",
         type=int,
         default=0,
-        help="Interval for saving intermediate checlpoints. 0 disables it.",
+        help="Intermediate checkpoint interval. 0 disables it.",
     )
     parser.add_argument(
         "--run-seeds",
         type=json.loads,
         default=[0],
-        help="List of seeds to run. Example: --seeds '[0, 1, 2]'",
+        help="List of seeds to run. Example: '[0, 1, 2]'.",
     )
     parser.add_argument(
         "--eval-on-test",
         action="store_true",
-        help="If set, also evaluate the model on the test set in addition to the validation set.",
+        help="Also evaluate on the test set after validation.",
     )
     parser.add_argument(
         "--bootstrap",
         action="store_true",
-        help="If set, also estimate bootstrap mean accuracy and confidence intervals during evaluation.",
+        help="Estimate bootstrap accuracy confidence intervals.",
     )
     parser.add_argument(
         "--bootstrap-num-samples",
         type=int,
         default=1000,
-        help="Number of bootstrap resamples to use when estimating evaluation confidence intervals.",
+        help="Number of bootstrap resamples.",
     )
     parser.add_argument(
         "--bootstrap-ci",
         type=float,
         default=95.0,
-        help="Bootstrap confidence interval level as a percentage (for example, 95.0 for a 95%% confidence interval).",
+        help="Bootstrap confidence interval percentage.",
     )
     parser.add_argument(
         "--early-stopping",
@@ -178,7 +168,7 @@ def _build_parser():
         "--device",
         type=str,
         default="cuda",
-        help=f"Compute device (default auto: cuda).",
+        help="Compute device.",
     )
 
     # ----- IO -----
@@ -186,26 +176,46 @@ def _build_parser():
         "--save-dir",
         type=str,
         default="experiments/",
-        help="Where to save outputs.",
+        help="Directory for experiment outputs.",
     )
     parser.add_argument(
         "--save-name",
         type=str,
         default=None,
-        help="Subdir where to save outputs.",
+        help="Experiment subdirectory name.",
     )
     parser.add_argument(
         "--override",
         action="store_true",
-        help="Run experiment even if it has already been executed before.",
+        help="Run experiment even if evaluation results already exist.",
     )
-
     return parser
 
 
 def _parse_args():
     parser = _build_parser()
     return parse_args_json(parser)
+
+
+def _validate_args(args):
+    if args.batch_size <= 0 or args.gpu_batch_size <= 0:
+        raise ValueError("Batch sizes must be positive.")
+
+    if args.batch_size % args.gpu_batch_size != 0:
+        raise ValueError("batch_size must be divisible by gpu_batch_size.")
+
+    if args.epochs <= 0:
+        raise ValueError("epochs must be positive.")
+
+    if (
+        not isinstance(args.run_seeds, list)
+        or not args.run_seeds
+        or any(
+            not isinstance(seed, int) or isinstance(seed, bool)
+            for seed in args.run_seeds
+        )
+    ):
+        raise ValueError("run_seeds must be a non-empty list of integers.")
 
 
 def _train_seed(args, run_seed: int):
@@ -216,79 +226,67 @@ def _train_seed(args, run_seed: int):
         if args.save_name is not None
         else f"seed-{run_seed}"
     )
+    run_dir = os.path.join(save_dir, save_name)
+    val_eval_path = os.path.join(run_dir, "val_acc_eval.json")
+    test_eval_path = os.path.join(run_dir, "test_acc_eval.json")
 
-    if not args.override:
-        eval_split = "test" if args.eval_on_test else "val"
-        eval_path = os.path.join(save_dir, save_name, f"{eval_split}_acc_eval.json")
+    if (
+        not args.override
+        and os.path.isfile(val_eval_path)
+        and (not args.eval_on_test or os.path.isfile(test_eval_path))
+    ):
+        print(f"Experiment already done: {run_dir}. Skipping.")
+        return
 
-        if os.path.exists(eval_path):
-            print(f"Experiment already done: found {eval_path}. Skipping.")
-            return
-
-    if args.batch_size < args.gpu_batch_size:
-        raise ValueError("batch_size should be >= gpu_batch_size")
-
-    if args.batch_size % args.gpu_batch_size != 0:
-        raise ValueError("batch_size should be divisable by gpu_batch_size")
-
+    # ----- Setup -----
     accum_steps = args.batch_size // args.gpu_batch_size
-
     set_seed(run_seed)
 
-    # ------- Dataloaders -------
-    img_size = datasets[args.dataset_name].IMG_SIZE
-    n_classes = datasets[args.dataset_name].N_CLASSES
+    # ----- Dataset metadata -----
+    dataset_cls = datasets[args.dataset_name]
+    img_size = dataset_cls.IMG_SIZE
+    n_classes = dataset_cls.N_CLASSES
 
+    # ----- Dataloaders -----
+    dataset = dataset_cls()
+
+    train_loader = dataset.get_dataloader(
+        split="train",
+        batch_size=args.gpu_batch_size,
+        worker_init_fn=seed_worker,
+    )
+    val_loader = dataset.get_dataloader(
+        split="val",
+        batch_size=args.gpu_batch_size,
+        worker_init_fn=seed_worker,
+    )
+
+    test_loader = None
     if args.eval_on_test:
-        train_ds = datasets[args.dataset_name](split="train+val")
-        train_loader = train_ds.get_dataloader(
+        test_loader = dataset.get_dataloader(
+            split="test",
             batch_size=args.gpu_batch_size,
             worker_init_fn=seed_worker,
         )
 
-        val_ds = None
-        val_loader = None
-
-        test_ds = datasets[args.dataset_name](split="test")
-        test_loader = test_ds.get_dataloader(
-            batch_size=args.gpu_batch_size,
-            worker_init_fn=seed_worker,
-        )
-    else:
-        train_ds = datasets[args.dataset_name](split="train")
-        train_loader = train_ds.get_dataloader(
-            batch_size=args.gpu_batch_size,
-            worker_init_fn=seed_worker,
-        )
-
-        val_ds = datasets[args.dataset_name](split="val")
-        val_loader = val_ds.get_dataloader(
-            batch_size=args.gpu_batch_size,
-            worker_init_fn=seed_worker,
-        )
-
-        test_ds = None
-        test_loader = None
+    # ----- Backbone -----
+    backbone = models[args.backbone_name]["backbone"](img_size=img_size)
+    backbone.freeze()
+    backbone.eval()
 
     # ----- PEFT model -----
     model = models[args.backbone_name][args.peft_name](
-        img_size=img_size,
+        backbone=backbone,
         n_classes=n_classes,
-        freeze_backbone=args.freeze_backbone,
         **args.peft_config,
     )
+    model = model.to(args.device)
 
-    if args.load_model_path:
-        model.load_state_dict(
-            torch.load(args.load_model_path, weights_only=True),
-            strict=False,
-        )
-
-    # ------- Optimizer -------
+    # ----- Optimizer and schedulers -----
     epoch_len = math.ceil(len(train_loader) / accum_steps)
     adamw = AdamW(
         models=model,
-        use_lr_scheduler=args.start_lr != args.ref_lr or args.ref_lr != args.final_lr,
+        use_lr_scheduler=(args.start_lr != args.ref_lr or args.ref_lr != args.final_lr),
         use_wd_scheduler=args.ref_wd != args.final_wd,
         warmup_steps=args.warmup_epochs * epoch_len,
         start_lr=args.start_lr,
@@ -302,31 +300,27 @@ def _train_seed(args, run_seed: int):
     lr_scheduler = adamw.get_lr_scheduler()
     wd_scheduler = adamw.get_wd_scheduler()
 
-    # ------- Trainer -------
+    # ----- Trainer -----
     trainer = SupervisedTrainer(
         model=model,
-        save_dir=os.path.join(save_dir, save_name),
+        save_dir=run_dir,
     )
 
-    # ------- Save config -------
+    # ----- Save config -----
     save_config(
         config={
             **vars(args),
-            **{
-                "run_seed": run_seed,
-                "train_ds": vars(train_ds),
-                "val_ds": vars(val_ds) if not args.eval_on_test else None,
-                "test_ds": vars(test_ds) if args.eval_on_test else None,
-                "model": vars(model),
-                "optimizer": vars(optimizer),
-                "trainer": vars(trainer),
-                "param_count": model.get_param_count(),
-            },
+            "run_seed": run_seed,
+            "dataset": vars(dataset),
+            "model": vars(model),
+            "optimizer": vars(optimizer),
+            "trainer": vars(trainer),
+            "param_count": model.get_param_count(),
         },
-        path=os.path.join(save_dir, save_name, "config.json"),
+        path=os.path.join(run_dir, "config.json"),
     )
 
-    # ------- Train -------
+    # ----- Train -----
     trainer.train(
         train_loader=train_loader,
         val_loader=val_loader,
@@ -343,11 +337,11 @@ def _train_seed(args, run_seed: int):
         save_ckpt_interval=args.save_ckpt_interval,
     )
 
-    # ------- Eval -------
+    # ----- Evaluate on validation -----
     trainer.evaluate_acc(
-        loader=test_loader if args.eval_on_test else val_loader,
+        loader=val_loader,
         topk=(1,),
-        save_name=f"{'test' if args.eval_on_test else 'val'}_acc_eval.json",
+        save_name="val_acc_eval.json",
         bootstrap=args.bootstrap,
         bootstrap_num_samples=args.bootstrap_num_samples,
         bootstrap_ci=args.bootstrap_ci,
@@ -355,10 +349,22 @@ def _train_seed(args, run_seed: int):
         device=args.device,
     )
 
-    # ------- Cleanup -------
-    del train_ds, val_ds, test_ds
+    # ----- Optionally evaluate on test -----
+    if args.eval_on_test:
+        trainer.evaluate_acc(
+            loader=test_loader,
+            topk=(1,),
+            save_name="test_acc_eval.json",
+            bootstrap=args.bootstrap,
+            bootstrap_num_samples=args.bootstrap_num_samples,
+            bootstrap_ci=args.bootstrap_ci,
+            bootstrap_seed=run_seed,
+            device=args.device,
+        )
+
+    # ----- Cleanup -----
     del train_loader, val_loader, test_loader
-    del model
+    del model, backbone
     del adamw, optimizer, lr_scheduler, wd_scheduler
     del trainer
 
@@ -369,13 +375,11 @@ def _train_seed(args, run_seed: int):
 
 def main():
     args = _parse_args()
+    _validate_args(args)
 
     for run_seed in args.run_seeds:
-        print(f"\n===== Training seed {run_seed} =====")
-        _train_seed(
-            args,
-            run_seed,
-        )
+        print(f"\n===== Running seed {run_seed} =====")
+        _train_seed(args, run_seed)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,10 @@
 import math
-from types import MethodType
 
 import torch
 import torch.nn as nn
 
-from ..peft_model import PEFTModel
-from .backbone import ViTB16Backbone
+from ...peft_model import PEFTModel
+from ..backbone import ViTB16Backbone
 
 
 class AdaptFormerAdapter(nn.Module):
@@ -46,9 +45,8 @@ class ViTB16AdaptFormer(PEFTModel):
 
     def __init__(
         self,
-        img_size: int,
+        backbone: ViTB16Backbone,
         n_classes: int,
-        freeze_backbone: bool = True,
         bottleneck_dim: int = 64,
         adapter_scale: float = 0.1,
         adapter_dropout: float = 0.1,
@@ -60,13 +58,8 @@ class ViTB16AdaptFormer(PEFTModel):
         if not 0.0 <= adapter_dropout < 1.0:
             raise ValueError("adapter_dropout must be in [0, 1)")
 
-        super().__init__(
-            backbone=ViTB16Backbone(img_size=img_size),
-            n_classes=n_classes,
-            freeze_backbone=freeze_backbone,
-        )
+        super().__init__(backbone=backbone, n_classes=n_classes)
 
-        self.img_size = img_size
         self.bottleneck_dim = bottleneck_dim
         self.adapter_scale = float(adapter_scale)
         self.adapter_dropout = float(adapter_dropout)
@@ -86,9 +79,6 @@ class ViTB16AdaptFormer(PEFTModel):
 
         self.init_peft()
 
-        if bottleneck_dim > 0:
-            self._patch_adaptformer_ffns()
-
     def init_peft(self, init_from: nn.ModuleList | None = None) -> None:
         if self.bottleneck_dim == 0:
             return
@@ -101,24 +91,35 @@ class ViTB16AdaptFormer(PEFTModel):
         for adapter in self.adapters:
             adapter.reset_parameters()
 
-    def _patch_adaptformer_ffns(self) -> None:
-        def make_forward(layer_idx, original_forward):
-            def forward(_, x):
-                return original_forward(x) + self.adapters[layer_idx](x)
+    def forward_features(self, x: torch.Tensor):
+        if self.bottleneck_dim == 0:
+            return self.backbone.forward_features(x)
 
-            return forward
+        batch_size = x.shape[0]
+        patch_tokens = self.backbone.get_patch_tokens(x)
+        cls_token = self.backbone.get_cls_token(batch_size)
+        cls_pos, patch_pos = self.backbone.get_positional_embeddings()
+        hidden = self.backbone.input_dropout(
+            torch.cat((cls_token + cls_pos, patch_tokens + patch_pos), dim=1)
+        )
 
         for layer_idx, block in enumerate(self.backbone.blocks):
-            block.ffn.forward = MethodType(
-                make_forward(layer_idx, block.ffn.forward), block.ffn
-            )
+            residual = hidden
+            hidden = block.attention_norm(hidden)
+            hidden, _ = block.attn(hidden)
+            hidden = residual + hidden
+
+            residual = hidden
+            hidden = block.ffn_norm(hidden)
+            hidden = residual + block.ffn(hidden) + self.adapters[layer_idx](hidden)
+
+        encoded = self.backbone.norm(hidden)
+        return {"cls": encoded[:, 0], "patch_tokens": encoded[:, 1:]}
 
     def save(self, path: str) -> None:
         state_dict = {
             key: value.detach().cpu()
             for key, value in self.state_dict().items()
-            if key.startswith("head.")
-            or key.startswith("adapters.")
-            or (not self.is_backbone_frozen and key.startswith("backbone."))
+            if key.startswith("head.") or key.startswith("adapters.")
         }
         torch.save(state_dict, path)

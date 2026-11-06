@@ -97,18 +97,3 @@ class ViTB16Backbone(TransformerBackbone):
         tokens = torch.cat((cls_token + cls_pos, patch_tokens + patch_pos), dim=1)
         encoded = self.encode_tokens(self.input_dropout(tokens))
         return {"cls": encoded[:, 0], "patch_tokens": encoded[:, 1:]}
-
-    def get_layerwise_features(self, x: torch.Tensor):
-        batch_size = x.shape[0]
-        patch_tokens = self.get_patch_tokens(x)
-        cls_token = self.get_cls_token(batch_size)
-        cls_pos, patch_pos = self.get_positional_embeddings()
-        hidden = self.input_dropout(
-            torch.cat((cls_token + cls_pos, patch_tokens + patch_pos), dim=1)
-        )
-        outputs = []
-        for block in self.blocks:
-            hidden, _ = block(hidden)
-            outputs.append(hidden)
-        outputs = torch.stack(outputs, dim=0)
-        return {"cls": outputs[:, :, 0], "patch_tokens": outputs[:, :, 1:]}

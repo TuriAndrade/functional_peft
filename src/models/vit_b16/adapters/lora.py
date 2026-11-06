@@ -1,12 +1,11 @@
 import math
-from types import MethodType
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..peft_model import PEFTModel
-from .backbone import ViTB16Backbone
+from ...peft_model import PEFTModel
+from ..backbone import ViTB16Backbone
 
 
 class ViTB16LoRA(PEFTModel):
@@ -14,9 +13,8 @@ class ViTB16LoRA(PEFTModel):
 
     def __init__(
         self,
-        img_size: int,
+        backbone: ViTB16Backbone,
         n_classes: int,
-        freeze_backbone: bool = True,
         rank: int = 8,
         lora_alpha: float | None = None,
         lora_targets=("query", "value"),
@@ -34,22 +32,16 @@ class ViTB16LoRA(PEFTModel):
         if rank > 0 and lora_alpha <= 0:
             raise ValueError("lora_alpha must be positive when rank > 0")
 
-        super().__init__(
-            backbone=ViTB16Backbone(img_size=img_size),
-            n_classes=n_classes,
-            freeze_backbone=freeze_backbone,
-        )
+        super().__init__(backbone=backbone, n_classes=n_classes)
 
-        self.img_size = img_size
         self.rank = rank
         self.lora_targets = lora_targets
         self.lora_alpha = lora_alpha
         self.lora_scaling = lora_alpha / rank if rank > 0 else 0.0
 
         if rank > 0:
-            reference = next(self.backbone.parameters())
             self.lora_A = nn.Parameter(
-                reference.new_empty(
+                torch.empty(
                     self.backbone.num_layers,
                     len(lora_targets),
                     rank,
@@ -57,7 +49,7 @@ class ViTB16LoRA(PEFTModel):
                 )
             )
             self.lora_B = nn.Parameter(
-                reference.new_empty(
+                torch.empty(
                     self.backbone.num_layers,
                     len(lora_targets),
                     self.backbone.embed_dim,
@@ -69,8 +61,6 @@ class ViTB16LoRA(PEFTModel):
             self.register_parameter("lora_B", None)
 
         self.init_peft()
-        if rank > 0:
-            self._patch_lora_projections()
 
     def init_peft(
         self, init_from: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -107,26 +97,55 @@ class ViTB16LoRA(PEFTModel):
             * self.lora_scaling
         )
 
-    def _patch_lora_projections(self) -> None:
-        def make_forward(layer_idx, target_idx, original_forward):
-            def forward(_, x):
-                return original_forward(x) + self._lora_delta(x, layer_idx, target_idx)
+    def forward_features(self, x: torch.Tensor):
+        if self.rank == 0:
+            return self.backbone.forward_features(x)
 
-            return forward
+        batch_size = x.shape[0]
+        patch_tokens = self.backbone.get_patch_tokens(x)
+        cls_token = self.backbone.get_cls_token(batch_size)
+        cls_pos, patch_pos = self.backbone.get_positional_embeddings()
+        hidden = self.backbone.input_dropout(
+            torch.cat((cls_token + cls_pos, patch_tokens + patch_pos), dim=1)
+        )
 
         for layer_idx, block in enumerate(self.backbone.blocks):
-            for target_idx, target_name in enumerate(self.lora_targets):
-                projection = getattr(block.attn, target_name)
-                projection.forward = MethodType(
-                    make_forward(layer_idx, target_idx, projection.forward), projection
+            residual = hidden
+            x = block.attention_norm(hidden)
+            attn = block.attn
+
+            projections = {
+                "query": attn.query(x),
+                "key": attn.key(x),
+                "value": attn.value(x),
+            }
+            for target_idx, name in enumerate(self.lora_targets):
+                projections[name] = projections[name] + self._lora_delta(
+                    x, layer_idx, target_idx
                 )
+
+            query = attn.transpose_for_scores(projections["query"])
+            key = attn.transpose_for_scores(projections["key"])
+            value = attn.transpose_for_scores(projections["value"])
+
+            scores = torch.matmul(query, key.transpose(-1, -2))
+            scores = scores / math.sqrt(attn.attention_head_size)
+            probs = attn.attn_dropout(attn.softmax(scores))
+
+            context = torch.matmul(probs, value)
+            context = context.permute(0, 2, 1, 3).contiguous()
+            context = context.view(batch_size, -1, attn.all_head_size)
+
+            hidden = residual + attn.proj_dropout(attn.out(context))
+            hidden = hidden + block.ffn(block.ffn_norm(hidden))
+
+        encoded = self.backbone.norm(hidden)
+        return {"cls": encoded[:, 0], "patch_tokens": encoded[:, 1:]}
 
     def save(self, path: str) -> None:
         state_dict = {
             key: value.detach().cpu()
             for key, value in self.state_dict().items()
-            if key.startswith("head.")
-            or key in {"lora_A", "lora_B"}
-            or (not self.is_backbone_frozen and key.startswith("backbone."))
+            if key.startswith("head.") or key in {"lora_A", "lora_B"}
         }
         torch.save(state_dict, path)

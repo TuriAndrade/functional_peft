@@ -18,33 +18,20 @@ class PEFTModel(nn.Module, ABC):
         self,
         backbone: TransformerBackbone,
         n_classes: int,
-        freeze_backbone: bool = True,
     ):
         if n_classes < 2:
             raise ValueError("n_classes must be >= 2")
         super().__init__()
         self.backbone = backbone
         self.n_classes = int(n_classes)
-        self.is_backbone_frozen = bool(freeze_backbone)
-        if freeze_backbone:
-            self.freeze_backbone()
         self.head = nn.Linear(self.backbone.embed_dim, n_classes)
         self.init_head()
 
-    def freeze_backbone(self) -> None:
-        self.backbone.freeze()
-        self.backbone.eval()
-        self.is_backbone_frozen = True
-
-    def unfreeze_backbone(self) -> None:
-        self.backbone.unfreeze()
-        self.backbone.train(self.training)
-        self.is_backbone_frozen = False
-
     def train(self, mode: bool = True):
-        super().train(mode)
-        if self.is_backbone_frozen:
-            self.backbone.eval()
+        self.training = mode
+        for name, module in self.named_children():
+            if name != "backbone":
+                module.train(mode)
         return self
 
     def eval(self):
@@ -74,9 +61,6 @@ class PEFTModel(nn.Module, ABC):
     def forward_features(self, x: torch.Tensor) -> Mapping[str, torch.Tensor]:
         return self.backbone.forward_features(x)
 
-    def get_layerwise_features(self, x: torch.Tensor) -> Mapping[str, torch.Tensor]:
-        return self.backbone.get_layerwise_features(x)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.forward_features(x)["cls"])
 
@@ -102,4 +86,7 @@ class PEFTModel(nn.Module, ABC):
     def save(self, path: str) -> None: ...
 
     def load_from_path(self, path: str, map_location="cpu") -> None:
-        self.load_state_dict(torch.load(path, map_location=map_location), strict=False)
+        self.load_state_dict(
+            torch.load(path, map_location=map_location),
+            strict=False,
+        )

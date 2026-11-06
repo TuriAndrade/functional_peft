@@ -1,10 +1,10 @@
-from types import MethodType
+import math
 
 import torch
 import torch.nn as nn
 
-from ..peft_model import PEFTModel
-from .backbone import ViTB16Backbone
+from ...peft_model import PEFTModel
+from ..backbone import ViTB16Backbone
 
 
 class ViTB16SSF(PEFTModel):
@@ -25,21 +25,9 @@ class ViTB16SSF(PEFTModel):
 
     def __init__(
         self,
-        img_size: int,
+        backbone: ViTB16Backbone,
         n_classes: int,
-        freeze_backbone: bool = True,
-        ssf_targets=(
-            "patch",
-            "attention_norm",
-            "query",
-            "key",
-            "value",
-            "attention_out",
-            "ffn_norm",
-            "fc1",
-            "fc2",
-            "final_norm",
-        ),
+        ssf_targets=_ALL_SSF_TARGETS,
     ):
         ssf_targets = tuple(ssf_targets)
         if len(set(ssf_targets)) != len(ssf_targets):
@@ -50,13 +38,8 @@ class ViTB16SSF(PEFTModel):
                 + ", ".join(repr(name) for name in self._ALL_SSF_TARGETS)
             )
 
-        super().__init__(
-            backbone=ViTB16Backbone(img_size=img_size),
-            n_classes=n_classes,
-            freeze_backbone=freeze_backbone,
-        )
+        super().__init__(backbone=backbone, n_classes=n_classes)
 
-        self.img_size = img_size
         self.ssf_targets = ssf_targets
         self.ssf_scale = nn.ParameterDict()
         self.ssf_shift = nn.ParameterDict()
@@ -73,15 +56,11 @@ class ViTB16SSF(PEFTModel):
             "fc2": (self.backbone.num_layers, self.backbone.embed_dim),
             "final_norm": (self.backbone.embed_dim,),
         }
-        reference = next(self.backbone.parameters())
         for name in ssf_targets:
-            self.ssf_scale[name] = nn.Parameter(reference.new_empty(shapes[name]))
-            self.ssf_shift[name] = nn.Parameter(reference.new_empty(shapes[name]))
+            self.ssf_scale[name] = nn.Parameter(torch.empty(shapes[name]))
+            self.ssf_shift[name] = nn.Parameter(torch.empty(shapes[name]))
 
         self.init_peft()
-
-        if ssf_targets:
-            self._patch_ssf_targets()
 
     def init_peft(
         self,
@@ -133,46 +112,70 @@ class ViTB16SSF(PEFTModel):
         name: str,
         layer_idx: int | None = None,
     ) -> torch.Tensor:
+        if name not in self.ssf_scale:
+            return x
         scale, shift = self.ssf_scale[name], self.ssf_shift[name]
         if layer_idx is not None:
             scale, shift = scale[layer_idx], shift[layer_idx]
         return self._apply_affine(x, scale, shift)
 
-    def _patch_ssf_targets(self) -> None:
-        def patch(module, name, layer_idx=None):
-            original_forward = module.forward
+    def forward_features(self, x: torch.Tensor):
+        if not self.ssf_targets:
+            return self.backbone.forward_features(x)
 
-            def forward(_, x):
-                return self._apply_ssf(original_forward(x), name, layer_idx)
+        batch_size = x.shape[0]
+        patch_tokens = self.backbone.embeddings.patch_embeddings(x)
+        patch_tokens = self._apply_ssf(patch_tokens, "patch")
+        patch_tokens = patch_tokens.flatten(2).transpose(-1, -2)
 
-            module.forward = MethodType(forward, module)
+        cls_token = self.backbone.get_cls_token(batch_size)
+        cls_pos, patch_pos = self.backbone.get_positional_embeddings()
+        hidden = self.backbone.input_dropout(
+            torch.cat((cls_token + cls_pos, patch_tokens + patch_pos), dim=1)
+        )
 
-        if "patch" in self.ssf_targets:
-            patch(self.backbone.embeddings.patch_embeddings, "patch")
-        layer_targets = {
-            "attention_norm": lambda block: block.attention_norm,
-            "query": lambda block: block.attn.query,
-            "key": lambda block: block.attn.key,
-            "value": lambda block: block.attn.value,
-            "attention_out": lambda block: block.attn.out,
-            "ffn_norm": lambda block: block.ffn_norm,
-            "fc1": lambda block: block.ffn.fc1,
-            "fc2": lambda block: block.ffn.fc2,
-        }
         for layer_idx, block in enumerate(self.backbone.blocks):
-            for name in self.ssf_targets:
-                if name in layer_targets:
-                    patch(layer_targets[name](block), name, layer_idx)
-        if "final_norm" in self.ssf_targets:
-            patch(self.backbone.norm, "final_norm")
+            residual = hidden
+            x = self._apply_ssf(
+                block.attention_norm(hidden), "attention_norm", layer_idx
+            )
+            attn = block.attn
+
+            query = self._apply_ssf(attn.query(x), "query", layer_idx)
+            key = self._apply_ssf(attn.key(x), "key", layer_idx)
+            value = self._apply_ssf(attn.value(x), "value", layer_idx)
+
+            query = attn.transpose_for_scores(query)
+            key = attn.transpose_for_scores(key)
+            value = attn.transpose_for_scores(value)
+
+            scores = torch.matmul(query, key.transpose(-1, -2))
+            scores = scores / math.sqrt(attn.attention_head_size)
+            probs = attn.attn_dropout(attn.softmax(scores))
+
+            context = torch.matmul(probs, value)
+            context = context.permute(0, 2, 1, 3).contiguous()
+            context = context.view(batch_size, -1, attn.all_head_size)
+
+            hidden = self._apply_ssf(attn.out(context), "attention_out", layer_idx)
+            hidden = residual + attn.proj_dropout(hidden)
+
+            residual = hidden
+            x = self._apply_ssf(block.ffn_norm(hidden), "ffn_norm", layer_idx)
+            ffn = block.ffn
+
+            x = self._apply_ssf(ffn.fc1(x), "fc1", layer_idx)
+            x = ffn.dropout(ffn.act_fn(x))
+            x = self._apply_ssf(ffn.fc2(x), "fc2", layer_idx)
+            hidden = residual + ffn.dropout(x)
+
+        encoded = self._apply_ssf(self.backbone.norm(hidden), "final_norm")
+        return {"cls": encoded[:, 0], "patch_tokens": encoded[:, 1:]}
 
     def save(self, path: str) -> None:
         state_dict = {
             key: value.detach().cpu()
             for key, value in self.state_dict().items()
-            if key.startswith("head.")
-            or key.startswith("ssf_scale.")
-            or key.startswith("ssf_shift.")
-            or (not self.is_backbone_frozen and key.startswith("backbone."))
+            if key.startswith(("head.", "ssf_scale.", "ssf_shift."))
         }
         torch.save(state_dict, path)

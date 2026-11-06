@@ -34,11 +34,6 @@ class TransformerBackbone(nn.Module, ABC):
         ...
 
     @abstractmethod
-    def get_layerwise_features(self, x: torch.Tensor) -> Mapping[str, torch.Tensor]:
-        """Return at least `cls: [L, B, embed_dim]`."""
-        ...
-
-    @abstractmethod
     def freeze(self) -> None: ...
 
     @abstractmethod

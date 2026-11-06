@@ -1,78 +1,53 @@
+import csv
 import json
+import math
 import os
 import shlex
-import csv
-import math
 import statistics
+
 
 # ======================================================================
 # DATASETS
 # ======================================================================
-VTAB_NATURAL = [
-    "vtab_caltech101",
-    "vtab_cifar100",
-    "vtab_dtd",
-    "vtab_flowers102",
-    "vtab_pets",
-    "vtab_sun397",
-    "vtab_svhn",
-]
-VTAB_SPECIALIZED = [
-    "vtab_eurosat",
-    "vtab_resisc45",
-    "vtab_patch_camelyon",
-    "vtab_retinopathy",
-]
-VTAB_STRUCTURED = [
-    "vtab_clevr_count",
-    "vtab_clevr_distance",
-    "vtab_dmlab",
-    "vtab_kitti_distance",
-    "vtab_dsprites_location",
-    "vtab_dsprites_orientation",
-    "vtab_smallnorb_azimuth",
-    "vtab_smallnorb_elevation",
-]
-VTAB = VTAB_NATURAL + VTAB_SPECIALIZED + VTAB_STRUCTURED
 
-FGVC = [
-    "fgvc_cub200",
-    "fgvc_nabirds",
-    "fgvc_oxford_flowers",
-    "fgvc_stanford_dogs",
-    "fgvc_stanford_cars",
+DATASETS = [
+    "cifar100",
+    "dtd",
+    "eurosat",
+    "food101",
+    "gtsrb",
+    "stanford_cars",
+    "svhn",
 ]
 
-
-DATASETS = VTAB + FGVC + ["imagenet_val"]
 DATASET_GROUPS = {
-    "vtab_natural": VTAB_NATURAL,
-    "vtab_specialized": VTAB_SPECIALIZED,
-    "vtab_structured": VTAB_STRUCTURED,
-    "vtab": VTAB,
-    "vtab+imagenet_val": VTAB + ["imagenet_val"],
-    "fgvc": FGVC,
     "all": DATASETS,
 }
+
 
 # ======================================================================
 # BACKBONES
 # ======================================================================
+
 BACKBONES = ["vit_b16"]
+
 BACKBONE_GROUPS = {
     "all": BACKBONES,
 }
 
+
 # ======================================================================
 # TUNING ARGS
 # ======================================================================
+
 TUNING_SEED = 0
+
 TUNING_ARGS = {
     "batch_size": 64,
     "gpu_batch_size": 8,
     "epochs": 100,
     "early_stopping": True,
-    "patience": 10,
+    "patience": 5,
     "start_lr": 1e-6,
     "final_lr": 1e-5,
     "warmup_epochs": 10,
@@ -82,30 +57,32 @@ TUNING_ARGS = {
     "bootstrap": False,
 }
 
+
 # ======================================================================
 # TUNING SEARCH GRIDS
 # ======================================================================
-# Search grids follow the CVPR 2025 unified vision-PEFT study; Full FT uses a
-# lower LR range because the PEFT LR grid was too large for full-backbone tuning,
-# with the reduced range guided by prior ViT/VTAB full fine-tuning settings.
-FULL_FT_LR_SEARCH = [1e-4, 5e-4, 1e-3]
-FULL_FT_WD_SEARCH = [0.0, 1e-3, 1e-2]
-PEFT_LR_SEARCH = [1e-3, 1e-2]
+
+PEFT_LR_SEARCH = [1e-4, 1e-3, 1e-2]
+
 PEFT_WD_SEARCH = [1e-4, 1e-3]
-VPT_SHALLOW_PROMPT_SEARCH = [5, 10, 50, 100, 200]
-VPT_DEEP_PROMPT_SEARCH = [5, 10, 50, 100]
-LORA_RANK_SEARCH = [1, 8, 16, 32]
+
+VPT_SHALLOW_PROMPT_SEARCH = [10, 50, 100]
+
+VPT_DEEP_PROMPT_SEARCH = [5, 10, 50]
+
+LORA_RANK_SEARCH = [8, 16, 32]
+
 ADAPTFORMER_BOTTLENECK_DIM_SEARCH = [4, 16, 32]
-ADAPTFORMER_SCALE_SEARCH = [0.05, 0.1, 0.2]
+
+ADAPTFORMER_SCALE_SEARCH = [0.1, 0.2]
 
 
 def linear_probe_args(lr, wd):
     return {
         **TUNING_ARGS,
-        "peft_name": "vpt",  # Any method works with peft deactivated
-        "freeze_backbone": True,
+        "peft_name": "vpt",
         "peft_config": {
-            "prompt_length": 0,  # Deactivates VPT
+            "prompt_length": 0,
         },
         "ref_lr": lr,
         "ref_wd": wd,
@@ -118,32 +95,10 @@ def linear_probe_search():
     return [linear_probe_args(lr, wd) for lr in PEFT_LR_SEARCH for wd in PEFT_WD_SEARCH]
 
 
-def full_ft_args(lr, wd):
-    return {
-        **TUNING_ARGS,
-        "peft_name": "vpt",  # Any method works with peft deactivated
-        "freeze_backbone": False,
-        "peft_config": {
-            "prompt_length": 0,  # Deactivates VPT
-        },
-        "ref_lr": lr,
-        "ref_wd": wd,
-        "final_wd": wd,
-        "save_name": f"lr-{lr}_wd-{wd}",
-    }
-
-
-def full_ft_search():
-    return [
-        full_ft_args(lr, wd) for lr in FULL_FT_LR_SEARCH for wd in FULL_FT_WD_SEARCH
-    ]
-
-
 def vpt_args(lr, wd, prompt_length, prompt_mode):
     return {
         **TUNING_ARGS,
         "peft_name": "vpt",
-        "freeze_backbone": True,
         "peft_config": {
             "prompt_length": prompt_length,
             "prompt_mode": prompt_mode,
@@ -178,7 +133,6 @@ def lora_args(lr, wd, rank):
     return {
         **TUNING_ARGS,
         "peft_name": "lora",
-        "freeze_backbone": True,
         "peft_config": {
             "rank": rank,
             "lora_alpha": None,
@@ -204,7 +158,6 @@ def adaptformer_args(lr, wd, bottleneck_dim, scale):
     return {
         **TUNING_ARGS,
         "peft_name": "adaptformer",
-        "freeze_backbone": True,
         "peft_config": {
             "bottleneck_dim": bottleneck_dim,
             "adapter_scale": scale,
@@ -219,11 +172,11 @@ def adaptformer_args(lr, wd, bottleneck_dim, scale):
 
 def adaptformer_search():
     return [
-        adaptformer_args(lr, wd, dim, s)
+        adaptformer_args(lr, wd, dim, scale)
         for lr in PEFT_LR_SEARCH
         for wd in PEFT_WD_SEARCH
         for dim in ADAPTFORMER_BOTTLENECK_DIM_SEARCH
-        for s in ADAPTFORMER_SCALE_SEARCH
+        for scale in ADAPTFORMER_SCALE_SEARCH
     ]
 
 
@@ -231,7 +184,6 @@ def ssf_args(lr, wd):
     return {
         **TUNING_ARGS,
         "peft_name": "ssf",
-        "freeze_backbone": True,
         "peft_config": {
             "ssf_targets": (
                 "patch",
@@ -264,11 +216,12 @@ PEFT_METHODS = {
     "ssf": ssf_search,
     "adaptformer": adaptformer_search,
 }
+
 FINETUNING_METHODS = {
     "linear_probe": linear_probe_search,
-    "full_ft": full_ft_search,
     **PEFT_METHODS,
 }
+
 FINETUNING_METHOD_GROUPS = {
     "peft": PEFT_METHODS,
     "all": FINETUNING_METHODS,
@@ -276,8 +229,51 @@ FINETUNING_METHOD_GROUPS = {
 
 
 # ======================================================================
+# HELPERS
+# ======================================================================
+
+
+def _resolve_names(name_or_group, groups, names, label):
+    if name_or_group in groups:
+        return list(groups[name_or_group])
+    if name_or_group in names:
+        return [name_or_group]
+    raise ValueError(f"Unknown {label} or group: {name_or_group}")
+
+
+def _resolve_methods(name_or_group):
+    if name_or_group in FINETUNING_METHOD_GROUPS:
+        return FINETUNING_METHOD_GROUPS[name_or_group]
+    if name_or_group in FINETUNING_METHODS:
+        return {name_or_group: FINETUNING_METHODS[name_or_group]}
+    raise ValueError(f"Unknown fine-tuning method or group: {name_or_group}")
+
+
+def _write_commands(commands, output_name, max_runs_per_file):
+    if max_runs_per_file < 0:
+        raise ValueError("max_runs_per_file must be non-negative")
+    output_dir = os.path.dirname(os.path.abspath(__file__))
+    if max_runs_per_file == 0:
+        chunks = [commands]
+    else:
+        chunks = [
+            commands[i : i + max_runs_per_file]
+            for i in range(0, len(commands), max_runs_per_file)
+        ]
+    for i, chunk in enumerate(chunks):
+        filename = (
+            f"{output_name}.txt" if max_runs_per_file == 0 else f"{output_name}_{i}.txt"
+        )
+        path = os.path.join(output_dir, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(chunk) + "\n")
+
+
+# ======================================================================
 # BUILD TUNING RUNS
 # ======================================================================
+
+
 def build_tuning_runs(
     dataset_name_or_group: str = "all",
     backbone_name_or_group: str = "all",
@@ -285,35 +281,15 @@ def build_tuning_runs(
     output_name: str = "top_1_acc_tuning",
     max_runs_per_file: int = 0,
 ):
-    if max_runs_per_file < 0:
-        raise ValueError("max_runs_per_file must be non-negative")
-
-    if dataset_name_or_group in DATASET_GROUPS:
-        dataset_names = DATASET_GROUPS[dataset_name_or_group]
-    elif dataset_name_or_group in DATASETS:
-        dataset_names = [dataset_name_or_group]
-    else:
-        raise ValueError(f"Unknown dataset or group: {dataset_name_or_group}")
-
-    if backbone_name_or_group in BACKBONE_GROUPS:
-        backbone_names = BACKBONE_GROUPS[backbone_name_or_group]
-    elif backbone_name_or_group in BACKBONES:
-        backbone_names = [backbone_name_or_group]
-    else:
-        raise ValueError(f"Unknown backbone or group: {backbone_name_or_group}")
-
-    if ft_name_or_group in FINETUNING_METHOD_GROUPS:
-        methods = FINETUNING_METHOD_GROUPS[ft_name_or_group]
-    elif ft_name_or_group in FINETUNING_METHODS:
-        methods = {ft_name_or_group: FINETUNING_METHODS[ft_name_or_group]}
-    else:
-        raise ValueError(f"Unknown fine-tuning method or group: {ft_name_or_group}")
-
+    dataset_names = _resolve_names(
+        dataset_name_or_group, DATASET_GROUPS, DATASETS, "dataset"
+    )
+    backbone_names = _resolve_names(
+        backbone_name_or_group, BACKBONE_GROUPS, BACKBONES, "backbone"
+    )
+    methods = _resolve_methods(ft_name_or_group)
     experiments_dir = os.environ.get("EXPERIMENTS_DIR", "./experiments")
-    output_dir = os.path.dirname(os.path.abspath(__file__))
-
     commands = []
-
     for backbone_name in backbone_names:
         for dataset_name in dataset_names:
             for ft_name, search_fn in methods.items():
@@ -324,7 +300,6 @@ def build_tuning_runs(
                     dataset_name,
                     ft_name,
                 )
-
                 for tuning_args in search_fn():
                     args = {
                         "dataset_name": dataset_name,
@@ -332,40 +307,25 @@ def build_tuning_runs(
                         **tuning_args,
                         "save_dir": save_dir,
                     }
-
                     args_json = json.dumps(args)
                     commands.append(
-                        f"python peft_train_exe.py --args-json {shlex.quote(args_json)}"
+                        f"python -m scripts.train_peft_model --args-json {shlex.quote(args_json)}"
                     )
-
-    if max_runs_per_file == 0:
-        chunks = [commands]
-    else:
-        chunks = [
-            commands[i : i + max_runs_per_file]
-            for i in range(0, len(commands), max_runs_per_file)
-        ]
-
-    for i, chunk in enumerate(chunks):
-        filename = (
-            f"{output_name}.txt" if max_runs_per_file == 0 else f"{output_name}_{i}.txt"
-        )
-
-        path = os.path.join(output_dir, filename)
-
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(chunk) + "\n")
+    _write_commands(commands, output_name, max_runs_per_file)
 
 
 # ======================================================================
 # EVAL ARGS
 # ======================================================================
+
 EVAL_SEEDS = [0, 1, 2]
 
 EVAL_ARGS = {
     "batch_size": 64,
     "gpu_batch_size": 8,
-    "early_stopping": False,
+    "epochs": 100,
+    "early_stopping": True,
+    "patience": 10,
     "start_lr": 1e-6,
     "final_lr": 1e-5,
     "warmup_epochs": 10,
@@ -375,45 +335,40 @@ EVAL_ARGS = {
     "bootstrap": False,
 }
 
+EVAL_CONFIG_KEYS = (
+    "peft_name",
+    "peft_config",
+    "ref_lr",
+    "ref_wd",
+    "final_wd",
+    "save_name",
+)
+
 
 # ======================================================================
 # BUILD EVAL RUNS
 # ======================================================================
+
+
 def _best_tuning_config(tuning_dir: str):
     best_acc = None
     best_config = None
-
     for run_name in sorted(os.listdir(tuning_dir)):
         run_dir = os.path.join(tuning_dir, run_name)
-
         if not os.path.isdir(run_dir):
             continue
-
         eval_path = os.path.join(run_dir, "val_acc_eval.json")
         config_path = os.path.join(run_dir, "config.json")
-        summary_path = os.path.join(run_dir, "train_summary.json")
-
-        if not all(
-            os.path.isfile(path) for path in (eval_path, config_path, summary_path)
-        ):
+        if not all(os.path.isfile(path) for path in (eval_path, config_path)):
             continue
-
         with open(eval_path, "r", encoding="utf-8") as f:
             acc = json.load(f)["accuracy"]["top1"]
-
         if best_acc is None or acc > best_acc:
             with open(config_path, "r", encoding="utf-8") as f:
                 best_config = json.load(f)
-
-            with open(summary_path, "r", encoding="utf-8") as f:
-                best_epoch = json.load(f)["best_epoch"]
-
-            best_config["epochs"] = best_epoch
             best_acc = acc
-
     if best_config is None:
         raise FileNotFoundError(f"No completed tuning runs found in: {tuning_dir}")
-
     return best_config
 
 
@@ -424,35 +379,15 @@ def build_eval_runs(
     output_name: str = "top_1_acc_eval",
     max_runs_per_file: int = 0,
 ):
-    if max_runs_per_file < 0:
-        raise ValueError("max_runs_per_file must be non-negative")
-
-    if dataset_name_or_group in DATASET_GROUPS:
-        dataset_names = DATASET_GROUPS[dataset_name_or_group]
-    elif dataset_name_or_group in DATASETS:
-        dataset_names = [dataset_name_or_group]
-    else:
-        raise ValueError(f"Unknown dataset or group: {dataset_name_or_group}")
-
-    if backbone_name_or_group in BACKBONE_GROUPS:
-        backbone_names = BACKBONE_GROUPS[backbone_name_or_group]
-    elif backbone_name_or_group in BACKBONES:
-        backbone_names = [backbone_name_or_group]
-    else:
-        raise ValueError(f"Unknown backbone or group: {backbone_name_or_group}")
-
-    if ft_name_or_group in FINETUNING_METHOD_GROUPS:
-        methods = FINETUNING_METHOD_GROUPS[ft_name_or_group]
-    elif ft_name_or_group in FINETUNING_METHODS:
-        methods = {ft_name_or_group: FINETUNING_METHODS[ft_name_or_group]}
-    else:
-        raise ValueError(f"Unknown fine-tuning method or group: {ft_name_or_group}")
-
+    dataset_names = _resolve_names(
+        dataset_name_or_group, DATASET_GROUPS, DATASETS, "dataset"
+    )
+    backbone_names = _resolve_names(
+        backbone_name_or_group, BACKBONE_GROUPS, BACKBONES, "backbone"
+    )
+    methods = _resolve_methods(ft_name_or_group)
     experiments_dir = os.environ.get("EXPERIMENTS_DIR", "./experiments")
-    output_dir = os.path.dirname(os.path.abspath(__file__))
-
     commands = []
-
     for backbone_name in backbone_names:
         for dataset_name in dataset_names:
             for ft_name in methods:
@@ -463,9 +398,7 @@ def build_eval_runs(
                     dataset_name,
                     ft_name,
                 )
-
                 best = _best_tuning_config(tuning_dir)
-
                 save_dir = os.path.join(
                     experiments_dir,
                     "top_1_acc_eval",
@@ -473,104 +406,68 @@ def build_eval_runs(
                     dataset_name,
                     ft_name,
                 )
-
                 args = {
                     "dataset_name": dataset_name,
                     "backbone_name": backbone_name,
+                    **{key: best[key] for key in EVAL_CONFIG_KEYS if key in best},
                     **EVAL_ARGS,
-                    "peft_name": best["peft_name"],
-                    "freeze_backbone": best["freeze_backbone"],
-                    "peft_config": best["peft_config"],
-                    "epochs": best["epochs"],
-                    "ref_lr": best["ref_lr"],
-                    "ref_wd": best["ref_wd"],
-                    "final_wd": best["final_wd"],
                     "save_dir": save_dir,
-                    "save_name": best["save_name"],
                 }
-
                 args_json = json.dumps(args)
                 commands.append(
-                    f"python peft_train_exe.py --args-json {shlex.quote(args_json)}"
+                    f"python -m scripts.train_peft_model "
+                    f"--args-json {shlex.quote(args_json)}"
                 )
-
-    if max_runs_per_file == 0:
-        chunks = [commands]
-    else:
-        chunks = [
-            commands[i : i + max_runs_per_file]
-            for i in range(0, len(commands), max_runs_per_file)
-        ]
-
-    for i, chunk in enumerate(chunks):
-        filename = (
-            f"{output_name}.txt" if max_runs_per_file == 0 else f"{output_name}_{i}.txt"
-        )
-
-        path = os.path.join(output_dir, filename)
-
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(chunk) + "\n")
+    _write_commands(commands, output_name, max_runs_per_file)
 
 
 # ======================================================================
 # AGGREGATE EVAL RESULTS
 # ======================================================================
+
+
 def aggregate_eval_results(
     dataset_name_or_group: str = "all",
     backbone_name_or_group: str = "all",
     ft_name_or_group: str = "all",
     output_name: str = "top_1_acc_eval_results",
+    split: str = "test",
 ):
-    if dataset_name_or_group in DATASET_GROUPS:
-        dataset_names = DATASET_GROUPS[dataset_name_or_group]
-    elif dataset_name_or_group in DATASETS:
-        dataset_names = [dataset_name_or_group]
-    else:
-        raise ValueError(f"Unknown dataset or group: {dataset_name_or_group}")
-
-    if backbone_name_or_group in BACKBONE_GROUPS:
-        backbone_names = BACKBONE_GROUPS[backbone_name_or_group]
-    elif backbone_name_or_group in BACKBONES:
-        backbone_names = [backbone_name_or_group]
-    else:
-        raise ValueError(f"Unknown backbone or group: {backbone_name_or_group}")
-
-    if ft_name_or_group in FINETUNING_METHOD_GROUPS:
-        method_names = list(FINETUNING_METHOD_GROUPS[ft_name_or_group])
-    elif ft_name_or_group in FINETUNING_METHODS:
-        method_names = [ft_name_or_group]
-    else:
-        raise ValueError(f"Unknown fine-tuning method or group: {ft_name_or_group}")
-
+    if split not in ("val", "test"):
+        raise ValueError("split must be 'val' or 'test'")
+    dataset_names = _resolve_names(
+        dataset_name_or_group, DATASET_GROUPS, DATASETS, "dataset"
+    )
+    backbone_names = _resolve_names(
+        backbone_name_or_group, BACKBONE_GROUPS, BACKBONES, "backbone"
+    )
+    method_names = list(_resolve_methods(ft_name_or_group))
     experiments_dir = os.environ.get("EXPERIMENTS_DIR", "./experiments")
-    output_dir = os.path.dirname(os.path.abspath(__file__))
+    output_dir = os.path.join(experiments_dir, "top_1_acc_eval")
 
     # Two-sided 95% Student-t critical value for n=3 (df=2).
     t_crit = 4.302652729911275
 
+    results = {
+        f"{backbone}_{method}": {}
+        for backbone in backbone_names
+        for method in method_names
+    }
     for backbone_name in backbone_names:
-        results = {method: {} for method in method_names}
-
         for dataset_name in dataset_names:
             for method_name in method_names:
                 eval_dir = os.path.join(
-                    experiments_dir,
-                    "top_1_acc_eval",
+                    output_dir,
                     backbone_name,
                     dataset_name,
                     method_name,
                 )
-
                 accuracies = {}
-
                 if os.path.isdir(eval_dir):
                     for run_name in sorted(os.listdir(eval_dir)):
                         run_dir = os.path.join(eval_dir, run_name)
-
                         if not os.path.isdir(run_dir):
                             continue
-
                         seed = next(
                             (
                                 seed
@@ -579,47 +476,36 @@ def aggregate_eval_results(
                             ),
                             None,
                         )
-
                         if seed is None:
                             continue
-
-                        eval_path = os.path.join(run_dir, "test_acc_eval.json")
-
+                        eval_path = os.path.join(run_dir, f"{split}_acc_eval.json")
                         if not os.path.isfile(eval_path):
                             continue
-
                         with open(eval_path, "r", encoding="utf-8") as f:
                             accuracies[seed] = json.load(f)["accuracy"]["top1"]
-
                 if set(accuracies) != set(EVAL_SEEDS):
                     missing = sorted(set(EVAL_SEEDS) - set(accuracies))
                     raise FileNotFoundError(
                         f"Missing eval seeds {missing} for "
                         f"{backbone_name}/{dataset_name}/{method_name}"
                     )
-
                 values = [accuracies[seed] for seed in EVAL_SEEDS]
                 mean = statistics.mean(values)
                 ci95 = t_crit * statistics.stdev(values) / math.sqrt(len(values))
-
-                results[method_name][dataset_name] = f"{mean:.2f} ± {ci95:.2f}"
-
-        output_path = os.path.join(
-            output_dir,
-            f"{output_name}.csv",
-        )
-
-        with open(output_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["method", *dataset_names])
-
+                results[f"{backbone_name}_{method_name}"][dataset_name] = (
+                    f"{mean:.2f} ± {ci95:.2f}"
+                )
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"{output_name}.csv")
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["method", *dataset_names])
+        for backbone_name in backbone_names:
             for method_name in method_names:
+                key = f"{backbone_name}_{method_name}"
                 writer.writerow(
                     [
-                        method_name,
-                        *[
-                            results[method_name][dataset_name]
-                            for dataset_name in dataset_names
-                        ],
+                        key,
+                        *[results[key][dataset] for dataset in dataset_names],
                     ]
                 )
