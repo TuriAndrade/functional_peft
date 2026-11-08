@@ -63,8 +63,9 @@ class SupervisedTrainer:
 
             n_batches = len(loader)
             for i, batch in enumerate(pbar):
-                x, y = batch[0].to(device, non_blocking=True), batch[1].to(
-                    device, non_blocking=True
+                x, y = (
+                    batch[0].to(device, non_blocking=True),
+                    batch[1].to(device, non_blocking=True),
                 )
 
                 logits, loss, loss_components = self.model.compute_loss(x, y)
@@ -309,24 +310,25 @@ class SupervisedTrainer:
             leave=False,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
         )
-        for x, y in pbar:
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            logits = self.model(x)  # (B, C)
-            max_k = max(ks)
-            max_k = min(max_k, logits.size(1))  # clamp k to num classes
-            _, pred = logits.topk(max_k, dim=1)  # (B, max_k)
-            pred = pred.t()  # (max_k, B)
-            correct_mat = pred.eq(y.view(1, -1))  # (max_k, B)
+        with torch.no_grad():
+            for x, y in pbar:
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+                logits = self.model(x)  # (B, C)
+                max_k = max(ks)
+                max_k = min(max_k, logits.size(1))  # clamp k to num classes
+                _, pred = logits.topk(max_k, dim=1)  # (B, max_k)
+                pred = pred.t()  # (max_k, B)
+                correct_mat = pred.eq(y.view(1, -1))  # (max_k, B)
 
-            bs = y.size(0)
-            n += bs
-            for k in ks:
-                k_eff = min(k, logits.size(1))
-                hits = correct_mat[:k_eff].any(dim=0).float()  # (B,)
-                correct[k] += hits.sum().item()
+                bs = y.size(0)
+                n += bs
+                for k in ks:
+                    k_eff = min(k, logits.size(1))
+                    hits = correct_mat[:k_eff].any(dim=0).float()  # (B,)
+                    correct[k] += hits.sum().item()
 
-                if bootstrap:
-                    bootstrap_hits[k].append(hits.detach().cpu())
+                    if bootstrap:
+                        bootstrap_hits[k].append(hits.detach().cpu())
 
         acc = {f"top{k}": (correct[k] / max(n, 1)) * 100.0 for k in ks}
         parts = [f"top{k}={acc[f'top{k}']:.2f}%" for k in ks]

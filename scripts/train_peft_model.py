@@ -227,7 +227,7 @@ def _train_seed(args, run_seed: int):
         else f"seed-{run_seed}"
     )
     run_dir = os.path.join(save_dir, save_name)
-    val_eval_path = os.path.join(run_dir, "val_acc_eval.json")
+    val_eval_path = os.path.join(run_dir, "train_summary.json")
     test_eval_path = os.path.join(run_dir, "test_acc_eval.json")
 
     if (
@@ -335,18 +335,6 @@ def _train_seed(args, run_seed: int):
         device=args.device,
         save_ckpt=args.save_ckpt,
         save_ckpt_interval=args.save_ckpt_interval,
-    )
-
-    # ----- Evaluate on validation -----
-    trainer.evaluate_acc(
-        loader=val_loader,
-        topk=(1,),
-        save_name="val_acc_eval.json",
-        bootstrap=args.bootstrap,
-        bootstrap_num_samples=args.bootstrap_num_samples,
-        bootstrap_ci=args.bootstrap_ci,
-        bootstrap_seed=run_seed,
-        device=args.device,
     )
 
     # ----- Optionally evaluate on test -----
