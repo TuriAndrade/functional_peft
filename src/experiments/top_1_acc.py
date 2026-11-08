@@ -44,10 +44,10 @@ TUNING_SEED = 0
 
 TUNING_ARGS = {
     "batch_size": 64,
-    "gpu_batch_size": 8,
+    "gpu_batch_size": 16,
     "epochs": 100,
     "early_stopping": True,
-    "patience": 5,
+    "patience": 1,
     "start_lr": 1e-6,
     "final_lr": 1e-5,
     "warmup_epochs": 10,
@@ -62,9 +62,9 @@ TUNING_ARGS = {
 # TUNING SEARCH GRIDS
 # ======================================================================
 
-PEFT_LR_SEARCH = [1e-4, 1e-3, 1e-2]
+PEFT_LR_SEARCH = [1e-3, 1e-2]
 
-PEFT_WD_SEARCH = [1e-4, 1e-3]
+PEFT_WD_SEARCH = [1e-4]
 
 VPT_SHALLOW_PROMPT_SEARCH = [10, 50, 100]
 
@@ -322,10 +322,10 @@ EVAL_SEEDS = [0, 1, 2]
 
 EVAL_ARGS = {
     "batch_size": 64,
-    "gpu_batch_size": 8,
+    "gpu_batch_size": 16,
     "epochs": 100,
     "early_stopping": True,
-    "patience": 10,
+    "patience": 5,
     "start_lr": 1e-6,
     "final_lr": 1e-5,
     "warmup_epochs": 10,
