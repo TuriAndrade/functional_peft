@@ -318,14 +318,14 @@ def build_tuning_runs(
 # EVAL ARGS
 # ======================================================================
 
-EVAL_SEEDS = [0, 1, 2]
+EVAL_SEEDS = [1, 2]
 
 EVAL_ARGS = {
     "batch_size": 64,
     "gpu_batch_size": 16,
     "epochs": 100,
     "early_stopping": True,
-    "patience": 5,
+    "patience": 3,
     "start_lr": 1e-6,
     "final_lr": 1e-5,
     "warmup_epochs": 10,
