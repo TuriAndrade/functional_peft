@@ -357,12 +357,12 @@ def _best_tuning_config(tuning_dir: str):
         run_dir = os.path.join(tuning_dir, run_name)
         if not os.path.isdir(run_dir):
             continue
-        eval_path = os.path.join(run_dir, "val_acc_eval.json")
+        eval_path = os.path.join(run_dir, "train_summary.json")
         config_path = os.path.join(run_dir, "config.json")
         if not all(os.path.isfile(path) for path in (eval_path, config_path)):
             continue
         with open(eval_path, "r", encoding="utf-8") as f:
-            acc = json.load(f)["accuracy"]["top1"]
+            acc = json.load(f)["best_val_acc"]
         if best_acc is None or acc > best_acc:
             with open(config_path, "r", encoding="utf-8") as f:
                 best_config = json.load(f)
@@ -509,3 +509,67 @@ def aggregate_eval_results(
                         *[results[key][dataset] for dataset in dataset_names],
                     ]
                 )
+
+
+# ======================================================================
+# HELPERS
+# ======================================================================
+
+
+def prune_finished_runs(
+    origin: str = "top_1_acc_tuning.txt",
+    destination: str = "top_1_acc_tuning_remaining.txt",
+    eval_on_test: bool = False,
+):
+    if os.path.abspath(origin) == os.path.abspath(destination):
+        raise ValueError("Origin and destination must differ.")
+
+    remaining = []
+    total = 0
+
+    with open(origin, "r", encoding="utf-8") as f:
+        for line in f:
+            command = line.strip().removesuffix("\\").strip()
+            if not command or command.startswith("#"):
+                continue
+
+            tokens = shlex.split(command)
+            idx = tokens.index("--args-json")
+            args = json.loads(tokens[idx + 1])
+
+            save_dir = args.get("save_dir", "experiments/")
+            save_name = args.get("save_name")
+            run_seeds = args.get("run_seeds", [0])
+
+            finished = True
+
+            for seed in run_seeds:
+                name = (
+                    f"{save_name}_seed-{seed}"
+                    if save_name is not None
+                    else f"seed-{seed}"
+                )
+                run_dir = os.path.join(save_dir, name)
+
+                train_done = os.path.isfile(os.path.join(run_dir, "train_summary.json"))
+                test_done = not eval_on_test or os.path.isfile(
+                    os.path.join(run_dir, "test_acc_eval.json")
+                )
+
+                if not (train_done and test_done):
+                    finished = False
+                    break
+
+            if not finished:
+                remaining.append(command)
+
+            total += 1
+
+    with open(destination, "w", encoding="utf-8") as f:
+        if remaining:
+            f.write("\n".join(remaining) + "\n")
+
+    print(f"Total commands: {total}")
+    print(f"Pruned: {total - len(remaining)}")
+    print(f"Remaining: {len(remaining)}")
+    print(f"Saved to: {destination}")
